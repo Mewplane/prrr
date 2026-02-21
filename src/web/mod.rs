@@ -1,0 +1,423 @@
+// FRD: specs/frds/FRD-P006.md, specs/frds/FRD-P007.md
+
+//! REST API backend and web frontend for VPN administration.
+//!
+//! Provides [`run_web_server`] to start an HTTP server on the admin
+//! port alongside the VPN server. Shares state with the VPN server via
+//! [`AppState`]. Serves the embedded SPA frontend at the root path.
+
+pub mod auth;
+pub mod errors;
+pub mod handlers;
+pub mod spa;
+pub mod state;
+
+pub use state::AppState;
+
+use std::net::SocketAddr;
+
+use axum::Router;
+use axum::routing::{get, post};
+use tower_http::cors::{Any, CorsLayer};
+
+/// API version prefix for all routes.
+const API_V1_PREFIX: &str = "/api/v1";
+
+/// Build the axum Router with all API routes.
+///
+/// Routes under `/api/v1/auth/*` are public.
+/// All other routes are protected by JWT Bearer token middleware.
+pub fn build_router(state: AppState) -> Router {
+    let auth_routes = Router::new().route("/auth/login", post(auth::login));
+
+    let protected_routes = Router::new()
+        .route("/server/status", get(handlers::server_status))
+        .route("/server/config", get(handlers::server_config))
+        .route("/clients", get(handlers::list_clients).post(handlers::create_client))
+        .route("/clients/{id}", get(handlers::get_client).delete(handlers::delete_client))
+        .route("/clients/{id}/suspend", post(handlers::suspend_client))
+        .route("/clients/{id}/resume", post(handlers::resume_client))
+        .route("/clients/{id}/config", get(handlers::get_client_config))
+        .route("/clients/{id}/qr", get(handlers::get_client_qr))
+        .route("/clients/{id}/config-url", post(handlers::create_config_url))
+        .route("/stats/overview", get(handlers::stats_overview))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), auth::require_auth));
+
+    let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
+
+    Router::new()
+        .route("/", get(spa::spa_handler))
+        .route("/c/{token}", get(handlers::get_config_by_token))
+        .nest(API_V1_PREFIX, auth_routes.merge(protected_routes))
+        .fallback(get(spa::spa_handler))
+        .layer(cors)
+        .with_state(state)
+}
+
+/// Start the web admin HTTP server.
+///
+/// Binds to `listen_addr` and serves the REST API.
+/// Runs until the cancellation token in `state` is triggered.
+pub async fn run_web_server(listen_addr: SocketAddr, state: AppState) -> anyhow::Result<()> {
+    let app = build_router(state.clone());
+    let cancel = state.cancel.clone();
+
+    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+    let local_addr = listener.local_addr()?;
+    tracing::info!("web admin listening on http://{local_addr}");
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move { cancel.cancelled().await })
+        .await?;
+
+    tracing::info!("web admin server stopped");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    // FRD: specs/frds/FRD-P006.md
+    use super::*;
+    use crate::config::DEFAULT_SESSION_TIMEOUT;
+    use crate::registry::ClientRegistry;
+    use crate::web::auth::LoginResponse;
+    use crate::web::handlers::{ClientListResponse, CreateClientResponse, ServerStatusResponse, StatusResponse};
+
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU32;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tokio::sync::Mutex;
+    use tokio_util::sync::CancellationToken;
+    use tower::ServiceExt;
+
+    fn test_password_hash() -> String {
+        use argon2::PasswordHasher;
+        let salt = argon2::password_hash::SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
+        argon2::Argon2::default()
+            .hash_password(b"admin-pass", &salt)
+            .expect("hash")
+            .to_string()
+    }
+
+    fn test_app_state() -> AppState {
+        use crate::distribution::{ConfigTokenStore, ServerContext};
+        use crate::web::handlers::ServerConfigResponse;
+        let registry = ClientRegistry::new("10.66.66.0/24").expect("valid subnet");
+        AppState {
+            registry: Arc::new(Mutex::new(registry)),
+            active_connections: Arc::new(AtomicU32::new(0)),
+            start_time: std::time::Instant::now(),
+            jwt_secret: Arc::from([0xABu8; 32].as_slice()),
+            session_timeout: DEFAULT_SESSION_TIMEOUT,
+            admin_password_hash: Arc::from(test_password_hash().as_str()),
+            cancel: CancellationToken::new(),
+            server_context: Arc::new(ServerContext {
+                endpoint: "127.0.0.1:443".to_string(),
+                noise_public_key: [0xAA; 32],
+                kem_public_key: vec![0xBB; 64],
+            }),
+            config_tokens: Arc::new(ConfigTokenStore::new()),
+            server_config: Arc::new(ServerConfigResponse {
+                listen_addr: "0.0.0.0:443".to_string(),
+                server_name: "www.google.com".to_string(),
+                subnet: "10.66.66.0/24".to_string(),
+                dns_servers: vec!["1.1.1.1".to_string()],
+                mtu: 1280,
+                max_clients: 100,
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                transport_protocol: "masque".to_string(),
+                obfuscation_enabled: false,
+                web_admin_enabled: true,
+                metrics_enabled: false,
+            }),
+        }
+    }
+
+    async fn parse_json<T: serde::de::DeserializeOwned>(response: axum::response::Response) -> T {
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1_048_576).await.expect("read body");
+        serde_json::from_slice(&body_bytes).expect("parse json")
+    }
+
+    async fn login_and_get_token(app: &Router, password: &str) -> String {
+        let body = serde_json::json!({"username": "admin", "password": password});
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/auth/login")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "login should succeed");
+        let login: LoginResponse = parse_json(resp).await;
+        login.token
+    }
+
+    fn authed_request(method: &str, uri: &str, token: &str, body: Option<serde_json::Value>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"));
+        if body.is_some() {
+            builder = builder.header("content-type", "application/json");
+        }
+        let body = body.map_or_else(Body::empty, |v| Body::from(serde_json::to_vec(&v).unwrap()));
+        builder.body(body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn full_crud_flow_through_router() {
+        let state = test_app_state();
+        let app = build_router(state);
+
+        // 1. Login
+        let token = login_and_get_token(&app, "admin-pass").await;
+
+        // 2. List clients — empty
+        let resp = app
+            .clone()
+            .oneshot(authed_request("GET", "/api/v1/clients", &token, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let list: ClientListResponse = parse_json(resp).await;
+        assert!(list.clients.is_empty());
+
+        // 3. Create client (auto-generate key)
+        let resp = app
+            .clone()
+            .oneshot(authed_request(
+                "POST",
+                "/api/v1/clients",
+                &token,
+                Some(serde_json::json!({"name": "alice"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: CreateClientResponse = parse_json(resp).await;
+        assert_eq!(created.name, "alice");
+        assert!(created.private_key.is_some());
+
+        // 4. Get client
+        let resp = app
+            .clone()
+            .oneshot(authed_request("GET", &format!("/api/v1/clients/{}", created.id), &token, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 5. Suspend client
+        let resp = app
+            .clone()
+            .oneshot(authed_request(
+                "POST",
+                &format!("/api/v1/clients/{}/suspend", created.id),
+                &token,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let status: StatusResponse = parse_json(resp).await;
+        assert_eq!(status.status, "suspended");
+
+        // 6. Resume client
+        let resp = app
+            .clone()
+            .oneshot(authed_request(
+                "POST",
+                &format!("/api/v1/clients/{}/resume", created.id),
+                &token,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let status: StatusResponse = parse_json(resp).await;
+        assert_eq!(status.status, "active");
+
+        // 7. Delete client
+        let resp = app
+            .clone()
+            .oneshot(authed_request("DELETE", &format!("/api/v1/clients/{}", created.id), &token, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let status: StatusResponse = parse_json(resp).await;
+        assert_eq!(status.status, "revoked");
+
+        // 8. Server status
+        let resp = app
+            .clone()
+            .oneshot(authed_request("GET", "/api/v1/server/status", &token, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let status: ServerStatusResponse = parse_json(resp).await;
+        assert_eq!(status.status, "running");
+    }
+
+    #[tokio::test]
+    async fn protected_routes_reject_without_auth() {
+        let state = test_app_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/server/status")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // AC-B20: GET /api/v1/server/config requires authentication
+    #[tokio::test]
+    async fn server_config_requires_auth() {
+        let state = test_app_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/server/config")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // AC-B19: GET /api/v1/server/config returns JSON with auth
+    #[tokio::test]
+    async fn server_config_returns_json_with_auth() {
+        use crate::web::handlers::ServerConfigResponse;
+
+        let state = test_app_state();
+        let app = build_router(state);
+        let token = login_and_get_token(&app, "admin-pass").await;
+
+        let resp = app
+            .clone()
+            .oneshot(authed_request("GET", "/api/v1/server/config", &token, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: ServerConfigResponse = parse_json(resp).await;
+        assert_eq!(body.server_name, "www.google.com");
+        assert_eq!(body.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_returns_headers() {
+        let state = test_app_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("OPTIONS")
+            .uri("/api/v1/server/status")
+            .header("origin", "http://localhost:3000")
+            .header("access-control-request-method", "GET")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().contains_key("access-control-allow-origin"));
+    }
+
+    #[tokio::test]
+    async fn server_graceful_shutdown() {
+        let state = test_app_state();
+        let cancel = state.cancel.clone();
+        let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let server_handle = tokio::spawn(run_web_server(listen_addr, state));
+
+        // Give server time to bind
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Cancel and verify clean shutdown
+        cancel.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), server_handle)
+            .await
+            .expect("server should stop within timeout")
+            .expect("join should succeed");
+        assert!(result.is_ok(), "server should shut down cleanly");
+    }
+
+    #[tokio::test]
+    async fn shared_active_count() {
+        let state = test_app_state();
+        // Simulate VPN server updating active connections
+        state.active_connections.store(7, std::sync::atomic::Ordering::Relaxed);
+
+        let app = build_router(state);
+        let token = login_and_get_token(&app, "admin-pass").await;
+
+        let resp = app
+            .clone()
+            .oneshot(authed_request("GET", "/api/v1/server/status", &token, None))
+            .await
+            .unwrap();
+        let status: ServerStatusResponse = parse_json(resp).await;
+        assert_eq!(status.connected_clients, 7);
+    }
+
+    // --- SPA routing integration tests (P-007) ---
+
+    #[tokio::test]
+    async fn spa_root_serves_html() {
+        let state = test_app_state();
+        let app = build_router(state);
+
+        let req = Request::builder().method("GET").uri("/").body(Body::empty()).unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .expect("content-type header")
+            .to_str()
+            .expect("valid header value");
+        assert!(content_type.contains("text/html"), "expected text/html, got {content_type}");
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_serves_html() {
+        let state = test_app_state();
+        let app = build_router(state);
+
+        let req = Request::builder().method("GET").uri("/clients").body(Body::empty()).unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .expect("content-type header")
+            .to_str()
+            .expect("valid header value");
+        assert!(content_type.contains("text/html"), "expected text/html, got {content_type}");
+    }
+
+    #[tokio::test]
+    async fn api_routes_not_captured_by_fallback() {
+        let state = test_app_state();
+        let app = build_router(state);
+
+        // API route without auth should return 401, not SPA HTML
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/server/status")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+}

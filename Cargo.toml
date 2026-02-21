@@ -1,0 +1,81 @@
+[package]
+name = "prrr"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Censorship-resistant VPN protocol with integrated messaging"
+license = "MIT"
+
+[[bin]]
+name = "prrr"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22.1"
+blake3 = "1.8.3"
+chacha20poly1305 = "0.10.1"
+clap = { version = "4.5", features = ["derive", "env"] }
+hkdf = "0.12.4"
+hmac = "0.12.1"
+ipnet = "2.11.0"
+md-5 = "0.10.6"
+ml-kem = "0.2.2"
+quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rand = "0.8.5"
+rcgen = "0.14.6"
+rustls = { version = "0.23.36", default-features = false, features = ["ring", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10.9"
+snow = "0.10.0"
+subtle = "2.6.1"
+thiserror = "2.0.18"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
+tokio-tun = "0.15.2"
+tokio-util = "0.7"
+toml = "1.0"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+zeroize = { version = "1.8.2", features = ["derive"] }
+
+# Web admin REST API (P-006)
+argon2 = "0.5"
+axum = "0.8"
+jsonwebtoken = "9"
+tower-http = { version = "0.6", features = ["cors"] }
+
+# Client distribution — QR code generation (P-009)
+qrcode = "0.14"
+
+# SQLite persistence & metrics (P-008)
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+hex-literal = "0.4.1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+
+[[bench]]
+name = "crypto_benchmarks"
+harness = false
+
+[[bench]]
+name = "handshake_benchmarks"
+harness = false
+
+[[bench]]
+name = "transport_benchmarks"
+harness = false
+
+[[bench]]
+name = "messaging_benchmarks"
+harness = false
+
+[lints.rust]
+unsafe_code = "deny"

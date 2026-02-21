@@ -1,0 +1,1338 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>prrr VPN - Admin</title>
+        <style>
+            :root {
+                --bg: #0f172a;
+                --surface: #1e293b;
+                --border: #334155;
+                --text: #f1f5f9;
+                --text-dim: #94a3b8;
+                --primary: #38bdf8;
+                --success: #22c55e;
+                --warning: #f59e0b;
+                --danger: #ef4444;
+                --radius: 8px;
+                --transition: 150ms ease;
+            }
+
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+
+            body {
+                font-family:
+                    -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+                    sans-serif;
+                background: var(--bg);
+                color: var(--text);
+                line-height: 1.6;
+                min-height: 100vh;
+            }
+
+            a {
+                color: var(--primary);
+                text-decoration: none;
+            }
+            a:hover {
+                text-decoration: underline;
+            }
+
+            /* Layout */
+            .layout {
+                display: flex;
+                min-height: 100vh;
+            }
+
+            .sidebar {
+                width: 220px;
+                background: var(--surface);
+                border-right: 1px solid var(--border);
+                padding: 1.5rem 0;
+                display: flex;
+                flex-direction: column;
+            }
+
+            .sidebar-brand {
+                padding: 0 1.5rem 1.5rem;
+                border-bottom: 1px solid var(--border);
+                font-size: 1.25rem;
+                font-weight: 700;
+                color: var(--primary);
+                letter-spacing: 0.05em;
+            }
+
+            .sidebar-nav {
+                flex: 1;
+                padding: 1rem 0;
+            }
+
+            .nav-item {
+                display: block;
+                padding: 0.625rem 1.5rem;
+                color: var(--text-dim);
+                cursor: pointer;
+                transition:
+                    background var(--transition),
+                    color var(--transition);
+                border: none;
+                background: none;
+                width: 100%;
+                text-align: left;
+                font-size: 0.875rem;
+                font-family: inherit;
+            }
+
+            .nav-item:hover {
+                background: rgba(56, 189, 248, 0.08);
+                color: var(--text);
+            }
+            .nav-item.active {
+                color: var(--primary);
+                background: rgba(56, 189, 248, 0.12);
+            }
+
+            .sidebar-footer {
+                padding: 1rem 1.5rem;
+                border-top: 1px solid var(--border);
+            }
+
+            .main-content {
+                flex: 1;
+                padding: 2rem;
+                overflow-y: auto;
+            }
+
+            /* Cards */
+            .card-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 1rem;
+                margin-bottom: 2rem;
+            }
+
+            .card {
+                background: var(--surface);
+                border: 1px solid var(--border);
+                border-radius: var(--radius);
+                padding: 1.25rem;
+            }
+
+            .card-label {
+                font-size: 0.75rem;
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+                color: var(--text-dim);
+                margin-bottom: 0.5rem;
+            }
+
+            .card-value {
+                font-size: 1.5rem;
+                font-weight: 700;
+            }
+
+            .card-value.success {
+                color: var(--success);
+            }
+            .card-value.primary {
+                color: var(--primary);
+            }
+            .card-value.warning {
+                color: var(--warning);
+            }
+
+            /* Tables */
+            .table-wrap {
+                background: var(--surface);
+                border: 1px solid var(--border);
+                border-radius: var(--radius);
+                overflow: hidden;
+            }
+
+            .table-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 1rem 1.25rem;
+                border-bottom: 1px solid var(--border);
+            }
+
+            .table-title {
+                font-size: 1rem;
+                font-weight: 600;
+            }
+
+            table {
+                width: 100%;
+                border-collapse: collapse;
+            }
+
+            th {
+                text-align: left;
+                padding: 0.75rem 1.25rem;
+                font-size: 0.75rem;
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+                color: var(--text-dim);
+                border-bottom: 1px solid var(--border);
+                font-weight: 600;
+            }
+
+            td {
+                padding: 0.75rem 1.25rem;
+                border-bottom: 1px solid var(--border);
+                font-size: 0.875rem;
+            }
+
+            tr:last-child td {
+                border-bottom: none;
+            }
+            tr:hover td {
+                background: rgba(56, 189, 248, 0.04);
+            }
+
+            /* Status badges */
+            .badge {
+                display: inline-block;
+                padding: 0.125rem 0.5rem;
+                border-radius: 9999px;
+                font-size: 0.75rem;
+                font-weight: 600;
+            }
+
+            .badge-active {
+                background: rgba(34, 197, 94, 0.15);
+                color: var(--success);
+            }
+            .badge-suspended {
+                background: rgba(245, 158, 11, 0.15);
+                color: var(--warning);
+            }
+            .badge-revoked {
+                background: rgba(239, 68, 68, 0.15);
+                color: var(--danger);
+            }
+
+            /* Buttons */
+            .btn {
+                display: inline-flex;
+                align-items: center;
+                gap: 0.375rem;
+                padding: 0.5rem 1rem;
+                border-radius: var(--radius);
+                font-size: 0.875rem;
+                font-weight: 500;
+                border: 1px solid var(--border);
+                background: var(--surface);
+                color: var(--text);
+                cursor: pointer;
+                transition:
+                    background var(--transition),
+                    border-color var(--transition);
+                font-family: inherit;
+            }
+
+            .btn:hover {
+                background: var(--border);
+            }
+            .btn:disabled {
+                opacity: 0.5;
+                cursor: not-allowed;
+            }
+
+            .btn-primary {
+                background: var(--primary);
+                border-color: var(--primary);
+                color: var(--bg);
+            }
+
+            .btn-primary:hover {
+                background: #7dd3fc;
+                border-color: #7dd3fc;
+            }
+
+            .btn-danger {
+                border-color: var(--danger);
+                color: var(--danger);
+            }
+
+            .btn-danger:hover {
+                background: rgba(239, 68, 68, 0.15);
+            }
+
+            .btn-sm {
+                padding: 0.25rem 0.625rem;
+                font-size: 0.75rem;
+            }
+
+            .btn-group {
+                display: flex;
+                gap: 0.375rem;
+            }
+
+            /* Forms */
+            .form-group {
+                margin-bottom: 1.25rem;
+            }
+
+            .form-label {
+                display: block;
+                font-size: 0.875rem;
+                font-weight: 500;
+                margin-bottom: 0.375rem;
+                color: var(--text-dim);
+            }
+
+            .form-input {
+                width: 100%;
+                padding: 0.625rem 0.875rem;
+                background: var(--bg);
+                border: 1px solid var(--border);
+                border-radius: var(--radius);
+                color: var(--text);
+                font-size: 0.875rem;
+                font-family: inherit;
+                transition: border-color var(--transition);
+            }
+
+            .form-input:focus {
+                outline: none;
+                border-color: var(--primary);
+            }
+
+            /* Modal */
+            .modal-overlay {
+                position: fixed;
+                inset: 0;
+                background: rgba(0, 0, 0, 0.6);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                z-index: 100;
+            }
+
+            .modal {
+                background: var(--surface);
+                border: 1px solid var(--border);
+                border-radius: var(--radius);
+                padding: 1.5rem;
+                width: 100%;
+                max-width: 480px;
+                max-height: 90vh;
+                overflow-y: auto;
+            }
+
+            .modal-title {
+                font-size: 1.125rem;
+                font-weight: 600;
+                margin-bottom: 1.25rem;
+            }
+
+            .modal-actions {
+                display: flex;
+                justify-content: flex-end;
+                gap: 0.75rem;
+                margin-top: 1.5rem;
+            }
+
+            /* Login */
+            .login-container {
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+
+            .login-box {
+                background: var(--surface);
+                border: 1px solid var(--border);
+                border-radius: var(--radius);
+                padding: 2rem;
+                width: 100%;
+                max-width: 380px;
+            }
+
+            .login-title {
+                text-align: center;
+                font-size: 1.5rem;
+                font-weight: 700;
+                color: var(--primary);
+                margin-bottom: 0.5rem;
+            }
+
+            .login-subtitle {
+                text-align: center;
+                color: var(--text-dim);
+                font-size: 0.875rem;
+                margin-bottom: 1.5rem;
+            }
+
+            /* Alert */
+            .alert {
+                padding: 0.75rem 1rem;
+                border-radius: var(--radius);
+                font-size: 0.875rem;
+                margin-bottom: 1rem;
+            }
+
+            .alert-error {
+                background: rgba(239, 68, 68, 0.15);
+                color: var(--danger);
+                border: 1px solid rgba(239, 68, 68, 0.3);
+            }
+
+            .alert-success {
+                background: rgba(34, 197, 94, 0.15);
+                color: var(--success);
+                border: 1px solid rgba(34, 197, 94, 0.3);
+            }
+
+            /* Result box (for created client details) */
+            .result-box {
+                background: var(--bg);
+                border: 1px solid var(--border);
+                border-radius: var(--radius);
+                padding: 1rem;
+                margin-top: 1rem;
+            }
+
+            .result-row {
+                display: flex;
+                justify-content: space-between;
+                padding: 0.375rem 0;
+                font-size: 0.875rem;
+            }
+
+            .result-label {
+                color: var(--text-dim);
+            }
+
+            .result-value {
+                font-family: "SF Mono", "Fira Code", monospace;
+                word-break: break-all;
+                max-width: 60%;
+                text-align: right;
+            }
+
+            /* Empty state */
+            .empty-state {
+                text-align: center;
+                padding: 3rem 1rem;
+                color: var(--text-dim);
+            }
+
+            /* Utility */
+            .text-dim {
+                color: var(--text-dim);
+            }
+            .text-sm {
+                font-size: 0.875rem;
+            }
+            .mt-1 {
+                margin-top: 0.5rem;
+            }
+            .mb-2 {
+                margin-bottom: 1rem;
+            }
+        </style>
+    </head>
+    <body>
+        <div id="app"></div>
+
+        <script type="module">
+            import {
+                h,
+                render,
+                Component,
+            } from "https://esm.sh/preact@10.25.4";
+            import htm from "https://esm.sh/htm@3.1.1";
+
+            const html = htm.bind(h);
+
+            // --- Constants ---
+            const TOKEN_STORAGE_KEY = "prrr_token";
+            const API_BASE = "/api/v1";
+            const REFRESH_INTERVAL_MS = 10000;
+            const SECONDS_PER_MINUTE = 60;
+            const SECONDS_PER_HOUR = 3600;
+            const SECONDS_PER_DAY = 86400;
+            const STATUS_ACTIVE = "active";
+            const STATUS_SUSPENDED = "suspended";
+
+            // --- API Client ---
+            const api = {
+                getToken() {
+                    return localStorage.getItem(TOKEN_STORAGE_KEY);
+                },
+                setToken(t) {
+                    localStorage.setItem(TOKEN_STORAGE_KEY, t);
+                },
+                clearToken() {
+                    localStorage.removeItem(TOKEN_STORAGE_KEY);
+                },
+
+                async request(endpoint, options = {}) {
+                    const headers = { "Content-Type": "application/json" };
+                    const token = this.getToken();
+                    if (token) {
+                        headers["Authorization"] = "Bearer " + token;
+                    }
+                    const res = await fetch(API_BASE + endpoint, {
+                        ...options,
+                        headers,
+                    });
+                    if (res.status === 401 && endpoint !== "/auth/login") {
+                        this.clearToken();
+                        window.location.hash = "#/login";
+                        throw new Error("Session expired");
+                    }
+                    if (!res.ok) {
+                        const body = await res
+                            .json()
+                            .catch(() => ({ error: res.statusText }));
+                        throw new Error(body.error || res.statusText);
+                    }
+                    return res.json();
+                },
+
+                login(username, password) {
+                    return this.request("/auth/login", {
+                        method: "POST",
+                        body: JSON.stringify({ username, password }),
+                    });
+                },
+                getStatus() {
+                    return this.request("/server/status");
+                },
+                getClients() {
+                    return this.request("/clients");
+                },
+                getClient(id) {
+                    return this.request("/clients/" + id);
+                },
+                createClient(name) {
+                    return this.request("/clients", {
+                        method: "POST",
+                        body: JSON.stringify({ name }),
+                    });
+                },
+                deleteClient(id) {
+                    return this.request("/clients/" + id, { method: "DELETE" });
+                },
+                suspendClient(id) {
+                    return this.request("/clients/" + id + "/suspend", {
+                        method: "POST",
+                    });
+                },
+                resumeClient(id) {
+                    return this.request("/clients/" + id + "/resume", {
+                        method: "POST",
+                    });
+                },
+                getStats() {
+                    return this.request("/stats/overview");
+                },
+                getServerConfig() {
+                    return this.request("/server/config");
+                },
+                async getClientQr(id) {
+                    const token = this.getToken();
+                    const headers = {};
+                    if (token) {
+                        headers["Authorization"] = "Bearer " + token;
+                    }
+                    const res = await fetch(
+                        API_BASE + "/clients/" + id + "/qr",
+                        { headers },
+                    );
+                    if (!res.ok) {
+                        throw new Error("Failed to fetch QR code");
+                    }
+                    return res.text();
+                },
+                async getClientConfig(id) {
+                    const token = this.getToken();
+                    const headers = {};
+                    if (token) {
+                        headers["Authorization"] = "Bearer " + token;
+                    }
+                    const res = await fetch(
+                        API_BASE + "/clients/" + id + "/config",
+                        { headers },
+                    );
+                    if (!res.ok) {
+                        throw new Error("Failed to fetch config");
+                    }
+                    return res.text();
+                },
+                createConfigUrl(id) {
+                    return this.request("/clients/" + id + "/config-url", {
+                        method: "POST",
+                    });
+                },
+            };
+
+            // --- Utilities ---
+            function formatUptime(seconds) {
+                const days = Math.floor(seconds / SECONDS_PER_DAY);
+                const hours = Math.floor(
+                    (seconds % SECONDS_PER_DAY) / SECONDS_PER_HOUR,
+                );
+                const mins = Math.floor(
+                    (seconds % SECONDS_PER_HOUR) / SECONDS_PER_MINUTE,
+                );
+                const parts = [];
+                if (days > 0) parts.push(days + "d");
+                if (hours > 0) parts.push(hours + "h");
+                parts.push(mins + "m");
+                return parts.join(" ");
+            }
+
+            function formatDate(unixTimestamp) {
+                if (!unixTimestamp) return "\u2014";
+                return new Date(unixTimestamp * 1000).toLocaleString();
+            }
+
+            function getRoute() {
+                return window.location.hash.slice(1) || "/";
+            }
+
+            // --- Components ---
+
+            class LoginPage extends Component {
+                state = {
+                    username: "",
+                    password: "",
+                    error: null,
+                    loading: false,
+                };
+
+                onSubmit = async (e) => {
+                    e.preventDefault();
+                    this.setState({ loading: true, error: null });
+                    try {
+                        const { username, password } = this.state;
+                        const data = await api.login(username, password);
+                        api.setToken(data.token);
+                        this.props.onLogin();
+                    } catch (err) {
+                        this.setState({ error: err.message, loading: false });
+                    }
+                };
+
+                render(_, { username, password, error, loading }) {
+                    return html`
+                        <div class="login-container">
+                            <div class="login-box">
+                                <div class="login-title">prrr</div>
+                                <div class="login-subtitle">
+                                    VPN Server Administration
+                                </div>
+                                ${error &&
+                                html`<div class="alert alert-error">
+                                    ${error}
+                                </div>`}
+                                <form onSubmit=${this.onSubmit}>
+                                    <div class="form-group">
+                                        <label class="form-label"
+                                            >Username</label
+                                        >
+                                        <input
+                                            class="form-input"
+                                            type="text"
+                                            value=${username}
+                                            onInput=${(e) =>
+                                                this.setState({
+                                                    username: e.target.value,
+                                                })}
+                                            autocomplete="username"
+                                            required
+                                        />
+                                    </div>
+                                    <div class="form-group">
+                                        <label class="form-label"
+                                            >Password</label
+                                        >
+                                        <input
+                                            class="form-input"
+                                            type="password"
+                                            value=${password}
+                                            onInput=${(e) =>
+                                                this.setState({
+                                                    password: e.target.value,
+                                                })}
+                                            autocomplete="current-password"
+                                            required
+                                        />
+                                    </div>
+                                    <button
+                                        class="btn btn-primary"
+                                        style="width:100%"
+                                        type="submit"
+                                        disabled=${loading}
+                                    >
+                                        ${loading ? "Signing in..." : "Sign In"}
+                                    </button>
+                                </form>
+                            </div>
+                        </div>
+                    `;
+                }
+            }
+
+            class AddClientModal extends Component {
+                state = {
+                    name: "",
+                    loading: false,
+                    error: null,
+                    result: null,
+                    qrSvg: null,
+                    shareUrl: null,
+                    qrLoading: false,
+                    urlLoading: false,
+                };
+
+                onSubmit = async (e) => {
+                    e.preventDefault();
+                    this.setState({ loading: true, error: null });
+                    try {
+                        const result = await api.createClient(this.state.name);
+                        this.setState({ result, loading: false });
+                        this.props.onCreated();
+                    } catch (err) {
+                        this.setState({ error: err.message, loading: false });
+                    }
+                };
+
+                onShowQr = async () => {
+                    this.setState({ qrLoading: true });
+                    try {
+                        const svg = await api.getClientQr(this.state.result.id);
+                        this.setState({ qrSvg: svg, qrLoading: false });
+                    } catch (err) {
+                        this.setState({ error: err.message, qrLoading: false });
+                    }
+                };
+
+                onShareUrl = async () => {
+                    this.setState({ urlLoading: true });
+                    try {
+                        const data = await api.createConfigUrl(
+                            this.state.result.id,
+                        );
+                        this.setState({
+                            shareUrl: data.url,
+                            urlLoading: false,
+                        });
+                    } catch (err) {
+                        this.setState({
+                            error: err.message,
+                            urlLoading: false,
+                        });
+                    }
+                };
+
+                onDownloadConfig = async () => {
+                    try {
+                        const config = await api.getClientConfig(
+                            this.state.result.id,
+                        );
+                        const blob = new Blob([config], { type: "text/plain" });
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement("a");
+                        a.href = url;
+                        a.download = this.state.result.name + ".toml";
+                        a.click();
+                        URL.revokeObjectURL(url);
+                    } catch (err) {
+                        this.setState({ error: err.message });
+                    }
+                };
+
+                render(
+                    _,
+                    {
+                        name,
+                        loading,
+                        error,
+                        result,
+                        qrSvg,
+                        shareUrl,
+                        qrLoading,
+                        urlLoading,
+                    },
+                ) {
+                    const { onClose } = this.props;
+                    return html`
+                        <div
+                            class="modal-overlay"
+                            onClick=${(e) => {
+                                if (e.target === e.currentTarget) onClose();
+                            }}
+                        >
+                            <div class="modal">
+                                <div class="modal-title">
+                                    ${result ? "Client Created" : "Add Client"}
+                                </div>
+                                ${error &&
+                                html`<div class="alert alert-error">
+                                    ${error}
+                                </div>`}
+                                ${result
+                                    ? html`
+                                          <div class="alert alert-success">
+                                              Client "${result.name}" created.
+                                          </div>
+                                          <div class="result-box">
+                                              <div class="result-row">
+                                                  <span class="result-label"
+                                                      >Name</span
+                                                  >
+                                                  <span class="result-value"
+                                                      >${result.name}</span
+                                                  >
+                                              </div>
+                                              <div class="result-row">
+                                                  <span class="result-label"
+                                                      >IP Address</span
+                                                  >
+                                                  <span class="result-value"
+                                                      >${result.ip_address}</span
+                                                  >
+                                              </div>
+                                              <div class="result-row">
+                                                  <span class="result-label"
+                                                      >Public Key</span
+                                                  >
+                                                  <span class="result-value"
+                                                      >${result.public_key}</span
+                                                  >
+                                              </div>
+                                              ${result.private_key &&
+                                              html`
+                                                  <div class="result-row">
+                                                      <span class="result-label"
+                                                          >Private Key</span
+                                                      >
+                                                      <span class="result-value"
+                                                          >${result.private_key}</span
+                                                      >
+                                                  </div>
+                                              `}
+                                          </div>
+                                          ${result.private_key &&
+                                          html`
+                                              <div
+                                                  class="alert alert-error mt-1"
+                                              >
+                                                  Save the private key now. It
+                                                  will not be shown again.
+                                              </div>
+                                          `}
+                                          <div
+                                              class="btn-group mt-1"
+                                              style="flex-wrap:wrap"
+                                          >
+                                              <button
+                                                  class="btn btn-sm"
+                                                  onClick=${this.onShowQr}
+                                                  disabled=${qrLoading}
+                                              >
+                                                  ${qrLoading
+                                                      ? "Loading..."
+                                                      : "Show QR Code"}
+                                              </button>
+                                              <button
+                                                  class="btn btn-sm"
+                                                  onClick=${this.onShareUrl}
+                                                  disabled=${urlLoading}
+                                              >
+                                                  ${urlLoading
+                                                      ? "Loading..."
+                                                      : "Share URL"}
+                                              </button>
+                                              <button
+                                                  class="btn btn-sm"
+                                                  onClick=${this
+                                                      .onDownloadConfig}
+                                              >
+                                                  Download Config
+                                              </button>
+                                          </div>
+                                          ${qrSvg &&
+                                          html`
+                                              <div
+                                                  class="result-box mt-1"
+                                                  style="text-align:center"
+                                                  dangerouslySetInnerHTML=${{
+                                                      __html: qrSvg,
+                                                  }}
+                                              />
+                                          `}
+                                          ${shareUrl &&
+                                          html`
+                                              <div class="result-box mt-1">
+                                                  <div class="result-row">
+                                                      <span class="result-label"
+                                                          >Share URL</span
+                                                      >
+                                                      <span class="result-value"
+                                                          >${window.location
+                                                              .origin}${shareUrl}</span
+                                                      >
+                                                  </div>
+                                                  <div
+                                                      class="text-sm text-dim mt-1"
+                                                  >
+                                                      Link expires in 24 hours.
+                                                      No authentication
+                                                      required.
+                                                  </div>
+                                              </div>
+                                          `}
+                                          <div class="modal-actions">
+                                              <button
+                                                  class="btn btn-primary"
+                                                  onClick=${onClose}
+                                              >
+                                                  Done
+                                              </button>
+                                          </div>
+                                      `
+                                    : html`
+                                          <form onSubmit=${this.onSubmit}>
+                                              <div class="form-group">
+                                                  <label class="form-label"
+                                                      >Client Name</label
+                                                  >
+                                                  <input
+                                                      class="form-input"
+                                                      type="text"
+                                                      value=${name}
+                                                      onInput=${(e) =>
+                                                          this.setState({
+                                                              name: e.target
+                                                                  .value,
+                                                          })}
+                                                      placeholder="e.g. laptop-fedora"
+                                                      required
+                                                  />
+                                              </div>
+                                              <div
+                                                  class="text-sm text-dim mb-2"
+                                              >
+                                                  Keys will be auto-generated
+                                                  for the new client.
+                                              </div>
+                                              <div class="modal-actions">
+                                                  <button
+                                                      class="btn"
+                                                      type="button"
+                                                      onClick=${onClose}
+                                                  >
+                                                      Cancel
+                                                  </button>
+                                                  <button
+                                                      class="btn btn-primary"
+                                                      type="submit"
+                                                      disabled=${loading}
+                                                  >
+                                                      ${loading
+                                                          ? "Creating..."
+                                                          : "Create"}
+                                                  </button>
+                                              </div>
+                                          </form>
+                                      `}
+                            </div>
+                        </div>
+                    `;
+                }
+            }
+
+            class SettingsPage extends Component {
+                state = { config: null, error: null, loading: true };
+
+                componentDidMount() {
+                    this.loadConfig();
+                }
+
+                async loadConfig() {
+                    try {
+                        const config = await api.getServerConfig();
+                        this.setState({ config, loading: false, error: null });
+                    } catch (err) {
+                        this.setState({ error: err.message, loading: false });
+                    }
+                }
+
+                render(_, { config, error, loading }) {
+                    if (loading) {
+                        return html`<div>
+                            <h2 style="margin-bottom:1.5rem">Settings</h2>
+                            <p class="text-dim">Loading...</p>
+                        </div>`;
+                    }
+                    if (error) {
+                        return html`<div>
+                            <h2 style="margin-bottom:1.5rem">Settings</h2>
+                            <div class="alert alert-error">${error}</div>
+                        </div>`;
+                    }
+                    const items = [
+                        ["Listen Address", config.listen_addr],
+                        ["Server Name", config.server_name],
+                        ["Subnet", config.subnet],
+                        ["DNS Servers", config.dns_servers.join(", ")],
+                        ["MTU", String(config.mtu)],
+                        ["Max Clients", String(config.max_clients)],
+                        ["Version", config.version],
+                        ["Transport", config.transport_protocol],
+                        [
+                            "Obfuscation",
+                            config.obfuscation_enabled ? "Enabled" : "Disabled",
+                        ],
+                        [
+                            "Web Admin",
+                            config.web_admin_enabled ? "Enabled" : "Disabled",
+                        ],
+                        [
+                            "Metrics",
+                            config.metrics_enabled ? "Enabled" : "Disabled",
+                        ],
+                    ];
+                    return html`
+                        <div>
+                            <h2 style="margin-bottom:1.5rem">Settings</h2>
+                            <div
+                                class="card-grid"
+                                style="grid-template-columns:repeat(auto-fit,minmax(250px,1fr))"
+                            >
+                                ${items.map(
+                                    ([label, value]) => html`
+                                        <div class="card" key=${label}>
+                                            <div class="card-label">
+                                                ${label}
+                                            </div>
+                                            <div
+                                                class="card-value text-dim"
+                                                style="font-size:1rem;word-break:break-all"
+                                            >
+                                                ${value}
+                                            </div>
+                                        </div>
+                                    `,
+                                )}
+                            </div>
+                        </div>
+                    `;
+                }
+            }
+
+            class Dashboard extends Component {
+                state = {
+                    status: null,
+                    clients: [],
+                    stats: null,
+                    error: null,
+                    showAdd: false,
+                };
+                _interval = null;
+
+                componentDidMount() {
+                    this.loadData();
+                    this._interval = setInterval(
+                        () => this.loadData(),
+                        REFRESH_INTERVAL_MS,
+                    );
+                }
+                componentWillUnmount() {
+                    if (this._interval) clearInterval(this._interval);
+                }
+
+                async loadData() {
+                    try {
+                        const [status, clientData, stats] = await Promise.all([
+                            api.getStatus(),
+                            api.getClients(),
+                            api.getStats(),
+                        ]);
+                        this.setState({
+                            status,
+                            clients: clientData.clients,
+                            stats,
+                            error: null,
+                        });
+                    } catch (err) {
+                        this.setState({ error: err.message });
+                    }
+                }
+
+                onAction = async (id, action) => {
+                    try {
+                        if (action === "delete") {
+                            await api.deleteClient(id);
+                        } else if (action === "suspend") {
+                            await api.suspendClient(id);
+                        } else if (action === "resume") {
+                            await api.resumeClient(id);
+                        }
+                        await this.loadData();
+                    } catch (err) {
+                        this.setState({ error: err.message });
+                    }
+                };
+
+                render(_, { status, clients, stats, error, showAdd }) {
+                    return html`
+                        <div>
+                            <h2 style="margin-bottom: 1.5rem;">Dashboard</h2>
+                            ${error &&
+                            html`<div class="alert alert-error">${error}</div>`}
+
+                            <div class="card-grid">
+                                <div class="card">
+                                    <div class="card-label">Status</div>
+                                    <div class="card-value success">
+                                        ${status ? status.status : "..."}
+                                    </div>
+                                </div>
+                                <div class="card">
+                                    <div class="card-label">
+                                        Connected / Total
+                                    </div>
+                                    <div class="card-value primary">
+                                        ${status
+                                            ? status.connected_clients +
+                                              " / " +
+                                              status.total_clients
+                                            : "..."}
+                                    </div>
+                                </div>
+                                <div class="card">
+                                    <div class="card-label">Uptime</div>
+                                    <div class="card-value">
+                                        ${status
+                                            ? formatUptime(
+                                                  status.uptime_seconds,
+                                              )
+                                            : "..."}
+                                    </div>
+                                </div>
+                                <div class="card">
+                                    <div class="card-label">Version</div>
+                                    <div
+                                        class="card-value text-dim"
+                                        style="font-size:1rem;"
+                                    >
+                                        ${status ? status.version : "..."}
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="table-wrap">
+                                <div class="table-header">
+                                    <span class="table-title">Clients</span>
+                                    <button
+                                        class="btn btn-primary btn-sm"
+                                        onClick=${() =>
+                                            this.setState({ showAdd: true })}
+                                    >
+                                        + Add Client
+                                    </button>
+                                </div>
+                                ${clients.length === 0
+                                    ? html`
+                                          <div class="empty-state">
+                                              No clients registered yet.
+                                          </div>
+                                      `
+                                    : html`
+                                          <table>
+                                              <thead>
+                                                  <tr>
+                                                      <th>Name</th>
+                                                      <th>IP Address</th>
+                                                      <th>Status</th>
+                                                      <th>Last Seen</th>
+                                                      <th>Actions</th>
+                                                  </tr>
+                                              </thead>
+                                              <tbody>
+                                                  ${clients.map(
+                                                      (c) => html`
+                                                          <tr key=${c.id}>
+                                                              <td>${c.name}</td>
+                                                              <td
+                                                                  style="font-family:monospace"
+                                                              >
+                                                                  ${c.ip_address}
+                                                              </td>
+                                                              <td>
+                                                                  <span
+                                                                      class="badge badge-${c.status}"
+                                                                  >
+                                                                      ${c.status}
+                                                                  </span>
+                                                              </td>
+                                                              <td
+                                                                  class="text-dim text-sm"
+                                                              >
+                                                                  ${formatDate(
+                                                                      c.last_seen,
+                                                                  )}
+                                                              </td>
+                                                              <td>
+                                                                  <div
+                                                                      class="btn-group"
+                                                                  >
+                                                                      ${c.status ===
+                                                                          STATUS_ACTIVE &&
+                                                                      html`
+                                                                          <button
+                                                                              class="btn btn-sm"
+                                                                              onClick=${() =>
+                                                                                  this.onAction(
+                                                                                      c.id,
+                                                                                      "suspend",
+                                                                                  )}
+                                                                          >
+                                                                              Suspend
+                                                                          </button>
+                                                                      `}
+                                                                      ${c.status ===
+                                                                          STATUS_SUSPENDED &&
+                                                                      html`
+                                                                          <button
+                                                                              class="btn btn-sm"
+                                                                              onClick=${() =>
+                                                                                  this.onAction(
+                                                                                      c.id,
+                                                                                      "resume",
+                                                                                  )}
+                                                                          >
+                                                                              Resume
+                                                                          </button>
+                                                                      `}
+                                                                      <button
+                                                                          class="btn btn-sm btn-danger"
+                                                                          onClick=${() => {
+                                                                              if (
+                                                                                  confirm(
+                                                                                      'Delete client "' +
+                                                                                          c.name +
+                                                                                          '"?',
+                                                                                  )
+                                                                              ) {
+                                                                                  this.onAction(
+                                                                                      c.id,
+                                                                                      "delete",
+                                                                                  );
+                                                                              }
+                                                                          }}
+                                                                      >
+                                                                          Delete
+                                                                      </button>
+                                                                  </div>
+                                                              </td>
+                                                          </tr>
+                                                      `,
+                                                  )}
+                                              </tbody>
+                                          </table>
+                                      `}
+                            </div>
+
+                            ${showAdd &&
+                            html`
+                                <${AddClientModal}
+                                    onClose=${() =>
+                                        this.setState({ showAdd: false })}
+                                    onCreated=${() => this.loadData()}
+                                />
+                            `}
+                        </div>
+                    `;
+                }
+            }
+
+            class App extends Component {
+                state = { route: getRoute(), loggedIn: !!api.getToken() };
+
+                componentDidMount() {
+                    window.addEventListener("hashchange", () => {
+                        this.setState({ route: getRoute() });
+                    });
+                }
+
+                onLogin = () => {
+                    this.setState({ loggedIn: true });
+                    window.location.hash = "#/";
+                };
+
+                onLogout = () => {
+                    api.clearToken();
+                    this.setState({ loggedIn: false });
+                    window.location.hash = "#/login";
+                };
+
+                render(_, { loggedIn, route }) {
+                    if (!loggedIn || route === "/login") {
+                        return html`<${LoginPage} onLogin=${this.onLogin} />`;
+                    }
+
+                    return html`
+                        <div class="layout">
+                            <nav class="sidebar">
+                                <div class="sidebar-brand">prrr</div>
+                                <div class="sidebar-nav">
+                                    <button
+                                        class="nav-item ${route === "/"
+                                            ? "active"
+                                            : ""}"
+                                        onClick=${() => {
+                                            window.location.hash = "#/";
+                                        }}
+                                    >
+                                        Dashboard
+                                    </button>
+                                    <button
+                                        class="nav-item ${route === "/settings"
+                                            ? "active"
+                                            : ""}"
+                                        onClick=${() => {
+                                            window.location.hash = "#/settings";
+                                        }}
+                                    >
+                                        Settings
+                                    </button>
+                                </div>
+                                <div class="sidebar-footer">
+                                    <button
+                                        class="btn btn-sm"
+                                        style="width:100%"
+                                        onClick=${this.onLogout}
+                                    >
+                                        Sign Out
+                                    </button>
+                                </div>
+                            </nav>
+                            <main class="main-content">
+                                ${route === "/settings"
+                                    ? html`<${SettingsPage} />`
+                                    : html`<${Dashboard} />`}
+                            </main>
+                        </div>
+                    `;
+                }
+            }
+
+            render(html`<${App} />`, document.getElementById("app"));
+        </script>
+    </body>
+</html>
