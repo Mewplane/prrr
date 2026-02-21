@@ -1,0 +1,1427 @@
+// FRD: specs/frds/FRD-P001.md
+
+//! CLI argument parsing and TOML configuration for the `prrr` binary.
+//!
+//! Provides [`Cli`] (clap top-level), [`ServerArgs`], [`ClientArgs`],
+//! [`ServerConfig`] for server TOML configuration, and [`ClientConfigFile`]
+//! for client TOML configuration.
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use clap::{Parser, Subcommand};
+use serde::Deserialize;
+
+use crate::crypto::hybrid_kex::KEM_ENCAPSULATION_KEY_LEN;
+use crate::handshake::noise_ik::PUBLIC_KEY_LEN;
+
+// ---------------------------------------------------------------------------
+// Default constants — server
+// ---------------------------------------------------------------------------
+
+/// Default listen address for the server.
+pub const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:443";
+
+/// Default log level when none is specified.
+pub const DEFAULT_LOG_LEVEL: &str = "info";
+
+/// Default TLS server name for SNI.
+pub const DEFAULT_SERVER_NAME: &str = "www.google.com";
+
+/// Default maximum number of concurrent VPN clients.
+pub const DEFAULT_MAX_CLIENTS: u32 = 100;
+
+/// Default server data directory.
+pub const DEFAULT_DATA_DIR: &str = "/var/lib/prrr";
+
+/// Default VPN client subnet (CIDR).
+pub const DEFAULT_SUBNET: &str = "10.66.66.0/24";
+
+/// Default DNS servers for VPN clients.
+pub const DEFAULT_DNS_SERVERS: &[&str] = &["1.1.1.1", "8.8.8.8"];
+
+/// Default tunnel MTU.
+pub const DEFAULT_MTU: u16 = 1280;
+
+/// Default path for server X25519 identity key.
+pub const DEFAULT_IDENTITY_KEY_PATH: &str = "/etc/prrr/keys/server_identity.key";
+
+/// Default path for server ML-KEM-768 post-quantum key.
+pub const DEFAULT_PQ_KEY_PATH: &str = "/etc/prrr/keys/server_pq.key";
+
+/// Default rekey interval in seconds.
+pub const DEFAULT_REKEY_INTERVAL: u64 = 3600;
+
+/// Default transport protocol.
+pub const DEFAULT_TRANSPORT_PROTOCOL: &str = "masque";
+
+/// Default QUIC max idle timeout in seconds.
+pub const DEFAULT_MAX_IDLE_TIMEOUT: u64 = 300;
+
+/// Default QUIC keep-alive interval in seconds.
+pub const DEFAULT_KEEP_ALIVE: u64 = 25;
+
+/// Default padding strategy for traffic obfuscation.
+pub const DEFAULT_PADDING_STRATEGY: &str = "power-of-two";
+
+/// Default max timing jitter in milliseconds.
+pub const DEFAULT_TIMING_JITTER_MS: u64 = 50;
+
+/// Default TLS fingerprint mimicry profile.
+pub const DEFAULT_TLS_PROFILE: &str = "chrome";
+
+/// Default probe resistance tokens per second.
+pub const DEFAULT_PROBE_RESIST_TOKENS_PER_SEC: u64 = 20;
+
+/// Default probe resistance burst capacity.
+pub const DEFAULT_PROBE_RESIST_BURST: u64 = 5;
+
+/// Default web admin listen address.
+pub const DEFAULT_WEB_ADMIN_ADDR: &str = "0.0.0.0:8443";
+
+/// Default web admin session timeout in seconds.
+pub const DEFAULT_SESSION_TIMEOUT: u64 = 3600;
+
+/// Default messaging relay mode.
+pub const DEFAULT_RELAY_MODE: &str = "server";
+
+/// Default maximum message size in bytes (10 MiB).
+pub const DEFAULT_MAX_MESSAGE_SIZE: u64 = 10_485_760;
+
+/// Default message retention in days.
+pub const DEFAULT_RETENTION_DAYS: u32 = 30;
+
+/// Default Prometheus metrics port.
+pub const DEFAULT_PROMETHEUS_PORT: u16 = 9090;
+
+/// Default log rotation strategy.
+pub const DEFAULT_LOG_ROTATION: &str = "daily";
+
+/// Default log retention in days.
+pub const DEFAULT_LOG_RETENTION_DAYS: u32 = 7;
+
+// ---------------------------------------------------------------------------
+// CLI (P-009B: nested subcommands for client management)
+// ---------------------------------------------------------------------------
+
+/// PRRR — censorship-resistant VPN protocol.
+#[derive(Parser, Debug)]
+#[command(name = "prrr", version, about = "Censorship-resistant VPN protocol")]
+pub struct Cli {
+    /// Subcommand to execute.
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+/// Available subcommands.
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Start VPN server or manage clients.
+    Server(ServerArgs),
+    /// Connect to VPN server or import configuration.
+    Client(ClientArgs),
+}
+
+/// Arguments for the `prrr server` subcommand.
+///
+/// When no subcommand is provided, starts the VPN server.
+/// Use `prrr server client <action>` to manage clients.
+#[derive(clap::Args, Debug)]
+pub struct ServerArgs {
+    /// Address to listen on.
+    #[arg(long, default_value = DEFAULT_LISTEN_ADDR, env = "PRRR_LISTEN")]
+    pub listen: SocketAddr,
+
+    /// Log level (trace, debug, info, warn, error).
+    #[arg(long, default_value = DEFAULT_LOG_LEVEL, env = "PRRR_LOG_LEVEL")]
+    pub log_level: String,
+
+    /// Optional TOML configuration file.
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+
+    /// TLS server name (SNI).
+    #[arg(long, default_value = DEFAULT_SERVER_NAME)]
+    pub server_name: String,
+
+    /// Server management subcommand.
+    #[command(subcommand)]
+    pub subcommand: Option<ServerSubcommand>,
+}
+
+/// Server management subcommands.
+#[derive(Subcommand, Debug)]
+pub enum ServerSubcommand {
+    /// Manage VPN clients.
+    Client(ServerClientArgs),
+    /// Run server diagnostic checks.
+    Doctor,
+}
+
+/// Arguments for `prrr server client <action>`.
+#[derive(clap::Args, Debug)]
+pub struct ServerClientArgs {
+    /// Client management action.
+    #[command(subcommand)]
+    pub action: ServerClientAction,
+}
+
+/// Client management actions.
+#[derive(Subcommand, Debug)]
+pub enum ServerClientAction {
+    /// Register a new VPN client.
+    Add {
+        /// Client name (must be unique among active clients).
+        name: String,
+    },
+    /// List all registered clients.
+    List,
+    /// Revoke a client by name.
+    Remove {
+        /// Client name to revoke.
+        name: String,
+    },
+    /// Export client configuration.
+    Export {
+        /// Client name to export.
+        name: String,
+        /// Output QR code (SVG) instead of TOML config.
+        #[arg(long)]
+        qr: bool,
+        /// Write output to file instead of stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+}
+
+/// Arguments for the `prrr client` subcommand.
+///
+/// When no subcommand is provided, connects to the VPN server
+/// (requires `--server`). Use `prrr client import <source>` to
+/// import a configuration file.
+#[derive(clap::Args, Debug)]
+pub struct ClientArgs {
+    /// Server address to connect to (required for connect mode).
+    #[arg(long)]
+    pub server: Option<SocketAddr>,
+
+    /// Log level (trace, debug, info, warn, error).
+    #[arg(long, default_value = DEFAULT_LOG_LEVEL, env = "PRRR_LOG_LEVEL")]
+    pub log_level: String,
+
+    /// Optional TOML configuration file.
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+
+    /// TLS server name (SNI).
+    #[arg(long, default_value = DEFAULT_SERVER_NAME)]
+    pub server_name: String,
+
+    /// Server Noise IK public key (base64-encoded, 32 bytes decoded).
+    #[arg(long)]
+    pub server_public_key: Option<String>,
+
+    /// Server ML-KEM-768 public key (base64-encoded, 1184 bytes decoded).
+    #[arg(long)]
+    pub server_pq_public_key: Option<String>,
+
+    /// Client management subcommand.
+    #[command(subcommand)]
+    pub subcommand: Option<ClientSubcommand>,
+}
+
+/// Client subcommands.
+#[derive(Subcommand, Debug)]
+pub enum ClientSubcommand {
+    /// Import client configuration from file or prrr:// URL.
+    Import {
+        /// File path or prrr://import URL to import configuration from.
+        source: String,
+    },
+    /// Run client diagnostic checks.
+    Doctor,
+}
+
+/// Error message when --server is required but not provided.
+pub const ERR_MISSING_SERVER_ADDR: &str = "server address required: use --server <ADDR> or prrr client import <source>";
+
+// ---------------------------------------------------------------------------
+// Server TOML configuration (SPEC.md §1.2)
+// ---------------------------------------------------------------------------
+
+/// Full server configuration from TOML file.
+///
+/// All sections are optional. Missing sections use defaults.
+/// Unknown fields are silently ignored for forward compatibility.
+#[derive(Debug, Deserialize, Default, PartialEq)]
+pub struct ServerConfig {
+    /// Core server settings.
+    pub server: Option<ServerSection>,
+    /// Virtual network settings.
+    pub network: Option<NetworkSection>,
+    /// Cryptographic key paths and intervals.
+    pub crypto: Option<CryptoSection>,
+    /// QUIC/MASQUE transport settings.
+    pub transport: Option<TransportSection>,
+    /// Traffic obfuscation and anti-censorship settings.
+    pub obfuscation: Option<ObfuscationSection>,
+    /// Web administration interface settings.
+    pub web_admin: Option<WebAdminSection>,
+    /// Whisper messaging service settings.
+    pub messaging: Option<MessagingSection>,
+    /// Monitoring and observability settings.
+    pub monitoring: Option<MonitoringSection>,
+}
+
+/// `[server]` section — core server parameters.
+#[derive(Debug, Deserialize, Default, PartialEq)]
+pub struct ServerSection {
+    /// Address to listen on (e.g. `"0.0.0.0:443"`).
+    pub listen_addr: Option<String>,
+    /// Maximum number of concurrent VPN clients.
+    pub max_clients: Option<u32>,
+    /// Log level directive.
+    pub log_level: Option<String>,
+    /// Server data directory for persistent state.
+    pub data_dir: Option<String>,
+    /// TLS server name for SNI.
+    pub server_name: Option<String>,
+}
+
+/// `[network]` section — virtual network for clients.
+#[derive(Debug, Deserialize, Default, PartialEq)]
+pub struct NetworkSection {
+    /// Client subnet in CIDR notation (e.g. `"10.66.66.0/24"`).
+    pub subnet: Option<String>,
+    /// DNS servers pushed to clients.
+    pub dns_servers: Option<Vec<String>>,
+    /// Tunnel MTU.
+    pub mtu: Option<u16>,
+}
+
+/// `[crypto]` section — key storage and rotation.
+#[derive(Debug, Deserialize, Default, PartialEq)]
+pub struct CryptoSection {
+    /// Path to X25519 identity key file.
+    pub identity_key_path: Option<String>,
+    /// Path to ML-KEM-768 post-quantum key file.
+    pub pq_key_path: Option<String>,
+    /// Rekey interval in seconds.
+    pub rekey_interval: Option<u64>,
+}
+
+/// `[transport]` section — QUIC/MASQUE settings.
+#[derive(Debug, Deserialize, Default, PartialEq)]
+pub struct TransportSection {
+    /// Transport protocol (`"masque"`).
+    pub protocol: Option<String>,
+    /// Max idle timeout in seconds before connection close.
+    pub max_idle_timeout: Option<u64>,
+    /// Keep-alive interval in seconds.
+    pub keep_alive: Option<u64>,
+}
+
+/// `[obfuscation]` section — traffic shaping and anti-censorship.
+#[derive(Debug, Deserialize, Default, PartialEq)]
+pub struct ObfuscationSection {
+    /// Whether obfuscation is enabled.
+    pub enabled: Option<bool>,
+    /// Padding strategy: `"power-of-two"`, `"http-sizes"`, `"fixed-mtu:<N>"`, `"none"`.
+    pub padding_strategy: Option<String>,
+    /// Maximum timing jitter per packet in milliseconds.
+    pub timing_jitter_ms: Option<u64>,
+    /// TLS fingerprint profile: `"chrome"`, `"firefox"`, `"default"`.
+    pub tls_profile: Option<String>,
+    /// Active probing resistance sub-section.
+    pub probe_resist: Option<ProbeResistSection>,
+}
+
+/// `[obfuscation.probe_resist]` section — active probing resistance.
+#[derive(Debug, Deserialize, Default, PartialEq)]
+pub struct ProbeResistSection {
+    /// Whether probe resistance is enabled.
+    pub enabled: Option<bool>,
+    /// Pre-shared key for token generation (base64).
+    pub psk: Option<String>,
+    /// Rate limit tokens per second per IP.
+    pub tokens_per_second: Option<u64>,
+    /// Token bucket burst capacity.
+    pub burst_capacity: Option<u64>,
+}
+
+/// `[web_admin]` section — web management interface.
+#[derive(Debug, Deserialize, Default, PartialEq)]
+pub struct WebAdminSection {
+    /// Whether web admin is enabled.
+    pub enabled: Option<bool>,
+    /// Listen address (e.g. `"0.0.0.0:8443"`).
+    pub listen_addr: Option<String>,
+    /// Path to TLS certificate file.
+    pub tls_cert: Option<String>,
+    /// Path to TLS private key file.
+    pub tls_key: Option<String>,
+    /// Argon2id hash of admin password.
+    pub admin_password_hash: Option<String>,
+    /// Session timeout in seconds.
+    pub session_timeout: Option<u64>,
+}
+
+/// `[messaging]` section — Whisper messaging service.
+#[derive(Debug, Deserialize, Default, PartialEq)]
+pub struct MessagingSection {
+    /// Whether messaging is enabled.
+    pub enabled: Option<bool>,
+    /// Relay mode: `"server"`, `"distributed"`, `"hybrid"`.
+    pub relay_mode: Option<String>,
+    /// Maximum message size in bytes.
+    pub max_message_size: Option<u64>,
+    /// Message retention in days.
+    pub retention_days: Option<u32>,
+}
+
+/// `[monitoring]` section — Prometheus metrics and logging.
+#[derive(Debug, Deserialize, Default, PartialEq)]
+pub struct MonitoringSection {
+    /// Whether Prometheus metrics are enabled.
+    pub metrics_enabled: Option<bool>,
+    /// Port for the Prometheus metrics endpoint.
+    pub prometheus_port: Option<u16>,
+    /// Path to log file (structured JSON when set).
+    pub log_file: Option<String>,
+    /// Log rotation strategy: `"daily"`, `"hourly"`, `"size:<bytes>"`.
+    pub log_rotation: Option<String>,
+    /// Log retention in days.
+    pub log_retention_days: Option<u32>,
+}
+
+// ---------------------------------------------------------------------------
+// Client TOML configuration (SPEC.md §2.2)
+// ---------------------------------------------------------------------------
+
+/// Full client configuration from TOML file.
+///
+/// All sections are optional. Missing sections use defaults.
+#[derive(Debug, Deserialize, Default, PartialEq)]
+pub struct ClientConfigFile {
+    /// Client identity settings.
+    pub client: Option<ClientSection>,
+    /// Server connection settings.
+    pub server: Option<ClientServerSection>,
+    /// Local interface and key settings.
+    pub interface: Option<InterfaceSection>,
+    /// Routing rules.
+    pub routing: Option<RoutingSection>,
+    /// Transport settings.
+    pub transport: Option<ClientTransportSection>,
+    /// Obfuscation settings.
+    pub obfuscation: Option<ClientObfuscationSection>,
+    /// Messaging settings.
+    pub messaging: Option<ClientMessagingSection>,
+}
+
+/// `[client]` section — client identity.
+#[derive(Debug, Deserialize, Default, PartialEq)]
+pub struct ClientSection {
+    /// Human-readable client name.
+    pub name: Option<String>,
+    /// Whether to auto-connect on startup.
+    pub auto_connect: Option<bool>,
+    /// Log level directive.
+    pub log_level: Option<String>,
+}
+
+/// `[server]` section in client config — server connection details.
+#[derive(Debug, Deserialize, Default, PartialEq)]
+pub struct ClientServerSection {
+    /// Server endpoint address (e.g. `"vpn.example.com:443"`).
+    pub endpoint: Option<String>,
+    /// TLS Server Name (SNI)
+    pub server_name: Option<String>,
+    /// Server X25519 public key (base64).
+    pub public_key: Option<String>,
+    /// Server ML-KEM-768 public key (base64).
+    pub pq_public_key: Option<String>,
+}
+
+/// `[interface]` section — local tunnel interface.
+#[derive(Debug, Deserialize, Default, PartialEq)]
+pub struct InterfaceSection {
+    /// Path to client X25519 private key.
+    pub private_key_path: Option<String>,
+    /// Path to client ML-KEM-768 private key.
+    pub pq_private_key_path: Option<String>,
+    /// Assigned IP address (CIDR, e.g. `"10.66.66.2/32"`).
+    pub address: Option<String>,
+    /// DNS servers.
+    pub dns: Option<Vec<String>>,
+    /// Tunnel MTU.
+    pub mtu: Option<u16>,
+}
+
+/// `[routing]` section — traffic routing rules.
+#[derive(Debug, Deserialize, Default, PartialEq)]
+pub struct RoutingSection {
+    /// Route all traffic through VPN.
+    pub all_traffic: Option<bool>,
+    /// Allowed destination CIDRs.
+    pub allowed_ips: Option<Vec<String>>,
+    /// Excluded destination CIDRs.
+    pub excluded_ips: Option<Vec<String>>,
+}
+
+/// `[transport]` section in client config.
+#[derive(Debug, Deserialize, Default, PartialEq)]
+pub struct ClientTransportSection {
+    /// Transport protocol.
+    pub protocol: Option<String>,
+    /// Keep-alive interval in seconds.
+    pub keep_alive: Option<u64>,
+}
+
+/// `[obfuscation]` section in client config.
+#[derive(Debug, Deserialize, Default, PartialEq)]
+pub struct ClientObfuscationSection {
+    /// Whether obfuscation is enabled.
+    pub enabled: Option<bool>,
+}
+
+/// `[messaging]` section in client config.
+#[derive(Debug, Deserialize, Default, PartialEq)]
+pub struct ClientMessagingSection {
+    /// Whether Whisper messaging is enabled.
+    pub enabled: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
+// Key resolution helpers (P-003)
+// ---------------------------------------------------------------------------
+
+/// Error message when neither CLI flag nor config provides a server noise key.
+const ERR_MISSING_NOISE_KEY: &str = "server Noise public key required: use --server-public-key or set [server].public_key in config";
+
+/// Error message when neither CLI flag nor config provides a server KEM key.
+const ERR_MISSING_KEM_KEY: &str = "server KEM public key required: use --server-pq-public-key or set [server].pq_public_key in config";
+
+/// Error message prefix for invalid base64 in a key value.
+const ERR_INVALID_BASE64: &str = "invalid base64 in server public key";
+
+/// Error message prefix for wrong key length.
+const ERR_WRONG_NOISE_KEY_LEN: &str = "server Noise public key must be exactly";
+
+/// Error message prefix for wrong KEM key length.
+const ERR_WRONG_KEM_KEY_LEN: &str = "server KEM public key must be exactly";
+
+/// Resolve the server's Noise IK public key from CLI flag or config file.
+///
+/// Priority: `cli_flag` > `config_value`. Both are base64-encoded.
+/// Returns the decoded 32-byte public key, or an error if missing/invalid.
+pub fn resolve_server_noise_key(cli_flag: Option<&str>, config_value: Option<&str>) -> anyhow::Result<[u8; PUBLIC_KEY_LEN]> {
+    let b64 = cli_flag.or(config_value).ok_or_else(|| anyhow::anyhow!(ERR_MISSING_NOISE_KEY))?;
+
+    let bytes = BASE64_STANDARD
+        .decode(b64)
+        .map_err(|e| anyhow::anyhow!("{ERR_INVALID_BASE64}: {e}"))?;
+
+    let key: [u8; PUBLIC_KEY_LEN] = bytes
+        .try_into()
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("{ERR_WRONG_NOISE_KEY_LEN} {PUBLIC_KEY_LEN} bytes, got {}", v.len()))?;
+
+    Ok(key)
+}
+
+/// Resolve the server's ML-KEM-768 encapsulation key from CLI flag or config file.
+///
+/// Priority: `cli_flag` > `config_value`. Both are base64-encoded.
+/// Returns the decoded 1184-byte encapsulation key, or an error if missing/invalid.
+pub fn resolve_server_kem_key(cli_flag: Option<&str>, config_value: Option<&str>) -> anyhow::Result<Vec<u8>> {
+    let b64 = cli_flag.or(config_value).ok_or_else(|| anyhow::anyhow!(ERR_MISSING_KEM_KEY))?;
+
+    let bytes = BASE64_STANDARD
+        .decode(b64)
+        .map_err(|e| anyhow::anyhow!("{ERR_INVALID_BASE64}: {e}"))?;
+
+    if bytes.len() != KEM_ENCAPSULATION_KEY_LEN {
+        anyhow::bail!("{ERR_WRONG_KEM_KEY_LEN} {KEM_ENCAPSULATION_KEY_LEN} bytes, got {}", bytes.len());
+    }
+
+    Ok(bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Config loading
+// ---------------------------------------------------------------------------
+
+/// Load and parse a server TOML configuration file.
+///
+/// Returns `ServerConfig::default()` if the path is `None`.
+/// Returns `Err` if the file does not exist or cannot be parsed.
+pub fn load_server_config(path: Option<&PathBuf>) -> anyhow::Result<ServerConfig> {
+    let Some(path) = path else {
+        return Ok(ServerConfig::default());
+    };
+
+    if !path.exists() {
+        anyhow::bail!("config file not found: {}", path.display());
+    }
+
+    let text = std::fs::read_to_string(path)?;
+    let config: ServerConfig = toml::from_str(&text)?;
+    Ok(config)
+}
+
+/// Load and parse a client TOML configuration file.
+///
+/// Returns `ClientConfigFile::default()` if the path is `None`.
+/// Returns `Err` if the file does not exist or cannot be parsed.
+pub fn load_client_config(path: Option<&PathBuf>) -> anyhow::Result<ClientConfigFile> {
+    let Some(path) = path else {
+        return Ok(ClientConfigFile::default());
+    };
+
+    if !path.exists() {
+        anyhow::bail!("config file not found: {}", path.display());
+    }
+
+    let text = std::fs::read_to_string(path)?;
+    let config: ClientConfigFile = toml::from_str(&text)?;
+    Ok(config)
+}
+
+/// Initialize the tracing subscriber with the given log level directive.
+///
+/// Falls back to `RUST_LOG` environment variable if set. Otherwise uses
+/// the provided `level` string (e.g. "info", "debug", "trace").
+///
+/// When `log_file` is `Some`, adds a JSON-formatted file layer for
+/// structured logging alongside the compact console layer on stderr.
+pub fn init_tracing(level: &str, log_file: Option<&str>) {
+    use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+
+    let console_layer = fmt::layer().with_target(true).compact();
+
+    match log_file {
+        Some(path) => {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap_or_else(|e| panic!("failed to open log file {path}: {e}"));
+            let json_layer = fmt::layer().json().with_writer(std::sync::Mutex::new(file));
+            tracing_subscriber::registry()
+                .with(console_layer)
+                .with(json_layer)
+                .with(filter)
+                .init();
+        }
+        None => {
+            tracing_subscriber::registry().with(console_layer).with(filter).init();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // FRD: specs/frds/FRD-P001.md, specs/frds/FRD-P009B.md
+    use super::*;
+    use clap::Parser;
+    use std::path::Path;
+
+    // -----------------------------------------------------------------------
+    // CLI tests (P-009B: nested subcommands)
+    // -----------------------------------------------------------------------
+
+    // T-1: CLI parses server subcommand with defaults (backward compat)
+    #[test]
+    fn cli_parses_server_defaults() {
+        let cli = Cli::parse_from(["prrr", "server"]);
+        match cli.command {
+            Command::Server(args) => {
+                assert_eq!(args.listen, DEFAULT_LISTEN_ADDR.parse::<SocketAddr>().expect("valid addr"));
+                assert_eq!(args.log_level, DEFAULT_LOG_LEVEL);
+                assert_eq!(args.server_name, DEFAULT_SERVER_NAME);
+                assert!(args.config.is_none());
+                assert!(args.subcommand.is_none(), "no subcommand = start server");
+            }
+            Command::Client(_) => panic!("expected Server command"),
+        }
+    }
+
+    // T-2: CLI parses client subcommand with --server (backward compat)
+    #[test]
+    fn cli_parses_client_with_server() {
+        let cli = Cli::parse_from(["prrr", "client", "--server", "10.0.0.1:443"]);
+        match cli.command {
+            Command::Client(args) => {
+                let expected_addr: SocketAddr = "10.0.0.1:443".parse().expect("valid addr");
+                assert_eq!(args.server, Some(expected_addr));
+                assert_eq!(args.log_level, DEFAULT_LOG_LEVEL);
+                assert_eq!(args.server_name, DEFAULT_SERVER_NAME);
+                assert!(args.config.is_none());
+                assert!(args.server_public_key.is_none());
+                assert!(args.server_pq_public_key.is_none());
+                assert!(args.subcommand.is_none(), "no subcommand = connect mode");
+            }
+            Command::Server(_) => panic!("expected Client command"),
+        }
+    }
+
+    // T-P003-1: Client CLI parses server public key flags
+    #[test]
+    fn cli_client_public_key_flags() {
+        let noise_b64 = "dGVzdC1ub2lzZS1wdWJsaWMta2V5LTMyYnl0ZXM=";
+        let kem_b64 = "dGVzdC1rZW0tcHVibGljLWtleQ==";
+        let cli = Cli::parse_from([
+            "prrr",
+            "client",
+            "--server",
+            "10.0.0.1:443",
+            "--server-public-key",
+            noise_b64,
+            "--server-pq-public-key",
+            kem_b64,
+        ]);
+        match cli.command {
+            Command::Client(args) => {
+                assert_eq!(args.server_public_key.as_deref(), Some(noise_b64));
+                assert_eq!(args.server_pq_public_key.as_deref(), Some(kem_b64));
+            }
+            Command::Server(_) => panic!("expected Client command"),
+        }
+    }
+
+    // T-2b: Client subcommand without --server parses (validation at runtime)
+    #[test]
+    fn cli_client_without_server_parses() {
+        let cli = Cli::parse_from(["prrr", "client"]);
+        match cli.command {
+            Command::Client(args) => {
+                assert!(args.server.is_none(), "--server is optional at parse time");
+                assert!(args.subcommand.is_none());
+            }
+            Command::Server(_) => panic!("expected Client command"),
+        }
+    }
+
+    // T-1b: Server subcommand with custom flags
+    #[test]
+    fn cli_server_custom_flags() {
+        let cli = Cli::parse_from([
+            "prrr",
+            "server",
+            "--listen",
+            "127.0.0.1:8443",
+            "--log-level",
+            "debug",
+            "--server-name",
+            "vpn.example.com",
+            "--config",
+            "/etc/prrr.toml",
+        ]);
+        match cli.command {
+            Command::Server(args) => {
+                let expected_addr: SocketAddr = "127.0.0.1:8443".parse().expect("valid addr");
+                assert_eq!(args.listen, expected_addr);
+                assert_eq!(args.log_level, "debug");
+                assert_eq!(args.server_name, "vpn.example.com");
+                assert_eq!(args.config, Some(PathBuf::from("/etc/prrr.toml")));
+            }
+            Command::Client(_) => panic!("expected Server command"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // P-009B: Nested subcommand parsing tests
+    // -----------------------------------------------------------------------
+
+    // AC-B5: prrr server client add alice
+    #[test]
+    fn cli_server_client_add_parses() {
+        let cli = Cli::parse_from(["prrr", "server", "client", "add", "alice"]);
+        match cli.command {
+            Command::Server(args) => match args.subcommand {
+                Some(ServerSubcommand::Client(sc)) => match sc.action {
+                    ServerClientAction::Add { ref name } => assert_eq!(name, "alice"),
+                    _ => panic!("expected Add action"),
+                },
+                _ => panic!("expected Client subcommand"),
+            },
+            _ => panic!("expected Server command"),
+        }
+    }
+
+    // AC-B6: prrr server client list
+    #[test]
+    fn cli_server_client_list_parses() {
+        let cli = Cli::parse_from(["prrr", "server", "client", "list"]);
+        match cli.command {
+            Command::Server(args) => match args.subcommand {
+                Some(ServerSubcommand::Client(sc)) => {
+                    assert!(matches!(sc.action, ServerClientAction::List));
+                }
+                _ => panic!("expected Client subcommand"),
+            },
+            _ => panic!("expected Server command"),
+        }
+    }
+
+    // AC-B7: prrr server client remove alice
+    #[test]
+    fn cli_server_client_remove_parses() {
+        let cli = Cli::parse_from(["prrr", "server", "client", "remove", "alice"]);
+        match cli.command {
+            Command::Server(args) => match args.subcommand {
+                Some(ServerSubcommand::Client(sc)) => match sc.action {
+                    ServerClientAction::Remove { ref name } => assert_eq!(name, "alice"),
+                    _ => panic!("expected Remove action"),
+                },
+                _ => panic!("expected Client subcommand"),
+            },
+            _ => panic!("expected Server command"),
+        }
+    }
+
+    // AC-B8: prrr server client export alice --qr
+    #[test]
+    fn cli_server_client_export_parses() {
+        let cli = Cli::parse_from(["prrr", "server", "client", "export", "alice", "--qr"]);
+        match cli.command {
+            Command::Server(args) => match args.subcommand {
+                Some(ServerSubcommand::Client(sc)) => match sc.action {
+                    ServerClientAction::Export { ref name, qr, ref output } => {
+                        assert_eq!(name, "alice");
+                        assert!(qr);
+                        assert!(output.is_none());
+                    }
+                    _ => panic!("expected Export action"),
+                },
+                _ => panic!("expected Client subcommand"),
+            },
+            _ => panic!("expected Server command"),
+        }
+    }
+
+    // AC-B8b: prrr server client export alice --output /tmp/client.toml
+    #[test]
+    fn cli_server_client_export_output_parses() {
+        let cli = Cli::parse_from(["prrr", "server", "client", "export", "alice", "--output", "/tmp/client.toml"]);
+        match cli.command {
+            Command::Server(args) => match args.subcommand {
+                Some(ServerSubcommand::Client(sc)) => match sc.action {
+                    ServerClientAction::Export { ref name, qr, ref output } => {
+                        assert_eq!(name, "alice");
+                        assert!(!qr);
+                        assert_eq!(output.as_deref(), Some(Path::new("/tmp/client.toml")));
+                    }
+                    _ => panic!("expected Export action"),
+                },
+                _ => panic!("expected Client subcommand"),
+            },
+            _ => panic!("expected Server command"),
+        }
+    }
+
+    // AC-B9: prrr client import /path/to/config.toml
+    #[test]
+    fn cli_client_import_parses() {
+        let cli = Cli::parse_from(["prrr", "client", "import", "/tmp/client.toml"]);
+        match cli.command {
+            Command::Client(args) => match args.subcommand {
+                Some(ClientSubcommand::Import { ref source }) => {
+                    assert_eq!(source, "/tmp/client.toml");
+                }
+                _ => panic!("expected Import subcommand"),
+            },
+            _ => panic!("expected Client command"),
+        }
+    }
+
+    // AC-B9b: prrr client import with prrr:// URL
+    #[test]
+    fn cli_client_import_url_parses() {
+        let url = "prrr://import?config=dGVzdA";
+        let cli = Cli::parse_from(["prrr", "client", "import", url]);
+        match cli.command {
+            Command::Client(args) => match args.subcommand {
+                Some(ClientSubcommand::Import { ref source }) => {
+                    assert_eq!(source, url);
+                }
+                _ => panic!("expected Import subcommand"),
+            },
+            _ => panic!("expected Client command"),
+        }
+    }
+
+    // AC-B4: prrr server (no subcommand) = start server (backward compat)
+    #[test]
+    fn cli_server_no_subcommand_starts_server() {
+        let cli = Cli::parse_from(["prrr", "server", "--listen", "0.0.0.0:443"]);
+        match cli.command {
+            Command::Server(args) => {
+                assert!(args.subcommand.is_none());
+                assert_eq!(args.listen.to_string(), "0.0.0.0:443");
+            }
+            _ => panic!("expected Server command"),
+        }
+    }
+
+    // AC-B10: prrr client --server <ADDR> (no subcommand) = connect (backward compat)
+    #[test]
+    fn cli_client_connect_backward_compat() {
+        let cli = Cli::parse_from(["prrr", "client", "--server", "10.0.0.1:443"]);
+        match cli.command {
+            Command::Client(args) => {
+                assert!(args.subcommand.is_none());
+                assert_eq!(args.server, Some("10.0.0.1:443".parse().expect("valid addr")));
+            }
+            _ => panic!("expected Client command"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // ServerConfig tests (FRD-P001)
+    // -----------------------------------------------------------------------
+
+    // AC-1: Empty TOML parses to ServerConfig::default()
+    #[test]
+    fn server_config_empty_toml() {
+        let config: ServerConfig = toml::from_str("").expect("parse empty toml");
+        assert_eq!(config, ServerConfig::default());
+    }
+
+    // AC-2: Full TOML with all sections parses correctly
+    #[test]
+    fn server_config_full_toml() {
+        let toml_str = r#"
+[server]
+listen_addr = "0.0.0.0:443"
+max_clients = 100
+log_level = "info"
+data_dir = "/var/lib/prrr"
+server_name = "www.google.com"
+
+[network]
+subnet = "10.66.66.0/24"
+dns_servers = ["1.1.1.1", "8.8.8.8"]
+mtu = 1280
+
+[crypto]
+identity_key_path = "/etc/prrr/keys/server_identity.key"
+pq_key_path = "/etc/prrr/keys/server_pq.key"
+rekey_interval = 3600
+
+[transport]
+protocol = "masque"
+max_idle_timeout = 300
+keep_alive = 25
+
+[obfuscation]
+enabled = true
+padding_strategy = "power-of-two"
+timing_jitter_ms = 50
+tls_profile = "chrome"
+
+[obfuscation.probe_resist]
+enabled = true
+psk = ""
+tokens_per_second = 20
+burst_capacity = 5
+
+[web_admin]
+enabled = true
+listen_addr = "0.0.0.0:8443"
+tls_cert = "/etc/prrr/tls/server.crt"
+tls_key = "/etc/prrr/tls/server.key"
+admin_password_hash = "$argon2id$..."
+session_timeout = 3600
+
+[messaging]
+enabled = true
+relay_mode = "server"
+max_message_size = 10485760
+retention_days = 30
+
+[monitoring]
+metrics_enabled = true
+prometheus_port = 9090
+log_file = "/var/log/prrr/server.log"
+log_rotation = "daily"
+log_retention_days = 7
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).expect("parse full toml");
+
+        let srv = config.server.expect("server section");
+        assert_eq!(srv.listen_addr.as_deref(), Some(DEFAULT_LISTEN_ADDR));
+        assert_eq!(srv.max_clients, Some(DEFAULT_MAX_CLIENTS));
+        assert_eq!(srv.log_level.as_deref(), Some(DEFAULT_LOG_LEVEL));
+        assert_eq!(srv.data_dir.as_deref(), Some(DEFAULT_DATA_DIR));
+        assert_eq!(srv.server_name.as_deref(), Some(DEFAULT_SERVER_NAME));
+
+        let net = config.network.expect("network section");
+        assert_eq!(net.subnet.as_deref(), Some(DEFAULT_SUBNET));
+        assert_eq!(
+            net.dns_servers.as_deref(),
+            Some(&["1.1.1.1".to_string(), "8.8.8.8".to_string()][..])
+        );
+        assert_eq!(net.mtu, Some(DEFAULT_MTU));
+
+        let crypto = config.crypto.expect("crypto section");
+        assert_eq!(crypto.identity_key_path.as_deref(), Some(DEFAULT_IDENTITY_KEY_PATH));
+        assert_eq!(crypto.pq_key_path.as_deref(), Some(DEFAULT_PQ_KEY_PATH));
+        assert_eq!(crypto.rekey_interval, Some(DEFAULT_REKEY_INTERVAL));
+
+        let transport = config.transport.expect("transport section");
+        assert_eq!(transport.protocol.as_deref(), Some(DEFAULT_TRANSPORT_PROTOCOL));
+        assert_eq!(transport.max_idle_timeout, Some(DEFAULT_MAX_IDLE_TIMEOUT));
+        assert_eq!(transport.keep_alive, Some(DEFAULT_KEEP_ALIVE));
+
+        let obfs = config.obfuscation.expect("obfuscation section");
+        assert_eq!(obfs.enabled, Some(true));
+        assert_eq!(obfs.padding_strategy.as_deref(), Some(DEFAULT_PADDING_STRATEGY));
+        assert_eq!(obfs.timing_jitter_ms, Some(DEFAULT_TIMING_JITTER_MS));
+        assert_eq!(obfs.tls_profile.as_deref(), Some(DEFAULT_TLS_PROFILE));
+
+        let pr = obfs.probe_resist.expect("probe_resist sub-section");
+        assert_eq!(pr.enabled, Some(true));
+        assert_eq!(pr.psk.as_deref(), Some(""));
+        assert_eq!(pr.tokens_per_second, Some(DEFAULT_PROBE_RESIST_TOKENS_PER_SEC));
+        assert_eq!(pr.burst_capacity, Some(DEFAULT_PROBE_RESIST_BURST));
+
+        let web = config.web_admin.expect("web_admin section");
+        assert_eq!(web.enabled, Some(true));
+        assert_eq!(web.listen_addr.as_deref(), Some(DEFAULT_WEB_ADMIN_ADDR));
+        assert_eq!(web.tls_cert.as_deref(), Some("/etc/prrr/tls/server.crt"));
+        assert_eq!(web.tls_key.as_deref(), Some("/etc/prrr/tls/server.key"));
+        assert_eq!(web.admin_password_hash.as_deref(), Some("$argon2id$..."));
+        assert_eq!(web.session_timeout, Some(DEFAULT_SESSION_TIMEOUT));
+
+        let msg = config.messaging.expect("messaging section");
+        assert_eq!(msg.enabled, Some(true));
+        assert_eq!(msg.relay_mode.as_deref(), Some(DEFAULT_RELAY_MODE));
+        assert_eq!(msg.max_message_size, Some(DEFAULT_MAX_MESSAGE_SIZE));
+        assert_eq!(msg.retention_days, Some(DEFAULT_RETENTION_DAYS));
+
+        let mon = config.monitoring.expect("monitoring section");
+        assert_eq!(mon.metrics_enabled, Some(true));
+        assert_eq!(mon.prometheus_port, Some(DEFAULT_PROMETHEUS_PORT));
+        assert_eq!(mon.log_file.as_deref(), Some("/var/log/prrr/server.log"));
+        assert_eq!(mon.log_rotation.as_deref(), Some(DEFAULT_LOG_ROTATION));
+        assert_eq!(mon.log_retention_days, Some(DEFAULT_LOG_RETENTION_DAYS));
+    }
+
+    // AC-3: Partial TOML (only [server] section) — other sections are None
+    #[test]
+    fn server_config_partial() {
+        let toml_str = r#"
+[server]
+max_clients = 50
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).expect("parse partial toml");
+        let srv = config.server.expect("server section present");
+        assert_eq!(srv.max_clients, Some(50));
+        assert!(srv.listen_addr.is_none());
+        assert!(config.network.is_none());
+        assert!(config.crypto.is_none());
+        assert!(config.transport.is_none());
+        assert!(config.obfuscation.is_none());
+        assert!(config.web_admin.is_none());
+        assert!(config.messaging.is_none());
+        assert!(config.monitoring.is_none());
+    }
+
+    // AC-4: Unknown fields in TOML are silently ignored
+    #[test]
+    fn server_config_unknown_fields() {
+        let toml_str = r#"
+[server]
+listen_addr = "0.0.0.0:443"
+some_future_field = true
+
+[future_section]
+foo = "bar"
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).expect("unknown fields ignored");
+        let srv = config.server.expect("server section");
+        assert_eq!(srv.listen_addr.as_deref(), Some(DEFAULT_LISTEN_ADDR));
+    }
+
+    // AC-5: Old minimal flat TOML no longer maps to ServerConfig.server section
+    // (the old flat format is intentionally not backward-compatible at the
+    //  struct level — callers that used TomlConfig must migrate to ServerConfig)
+    #[test]
+    fn server_config_flat_fields_ignored() {
+        let toml_str = r#"
+listen = "0.0.0.0:8443"
+log_level = "debug"
+"#;
+        // Flat fields are unknown at the top level and silently ignored
+        let config: ServerConfig = toml::from_str(toml_str).expect("flat fields ignored");
+        assert_eq!(config, ServerConfig::default());
+    }
+
+    // -----------------------------------------------------------------------
+    // ClientConfigFile tests (FRD-P001)
+    // -----------------------------------------------------------------------
+
+    // AC-6: Empty TOML parses to ClientConfigFile::default()
+    #[test]
+    fn client_config_empty_toml() {
+        let config: ClientConfigFile = toml::from_str("").expect("parse empty toml");
+        assert_eq!(config, ClientConfigFile::default());
+    }
+
+    // AC-7: Full client TOML parses correctly
+    #[test]
+    fn client_config_full_toml() {
+        let toml_str = r#"
+[client]
+name = "laptop-fedora"
+auto_connect = false
+log_level = "info"
+
+[server]
+endpoint = "vpn.example.com:443"
+public_key = "wG5kaFGLAHzkdKr/8LLXu0K1NhVYYQ3dqp7A3Qwxj3k="
+pq_public_key = "AQIDBA=="
+
+[interface]
+private_key_path = "/home/user/.local/share/prrr/keys/client.key"
+pq_private_key_path = "/home/user/.local/share/prrr/keys/client_pq.key"
+address = "10.66.66.2/32"
+dns = ["1.1.1.1", "8.8.8.8"]
+mtu = 1280
+
+[routing]
+all_traffic = true
+allowed_ips = ["0.0.0.0/0", "::/0"]
+excluded_ips = ["192.168.0.0/16", "10.0.0.0/8"]
+
+[transport]
+protocol = "masque"
+keep_alive = 25
+
+[obfuscation]
+enabled = true
+
+[messaging]
+enabled = true
+"#;
+        let config: ClientConfigFile = toml::from_str(toml_str).expect("parse full client toml");
+
+        let client = config.client.expect("client section");
+        assert_eq!(client.name.as_deref(), Some("laptop-fedora"));
+        assert_eq!(client.auto_connect, Some(false));
+        assert_eq!(client.log_level.as_deref(), Some(DEFAULT_LOG_LEVEL));
+
+        let srv = config.server.expect("server section");
+        assert_eq!(srv.endpoint.as_deref(), Some("vpn.example.com:443"));
+        assert!(srv.public_key.is_some());
+        assert!(srv.pq_public_key.is_some());
+
+        let iface = config.interface.expect("interface section");
+        assert!(iface.private_key_path.is_some());
+        assert!(iface.pq_private_key_path.is_some());
+        assert_eq!(iface.address.as_deref(), Some("10.66.66.2/32"));
+        assert_eq!(iface.mtu, Some(DEFAULT_MTU));
+
+        let routing = config.routing.expect("routing section");
+        assert_eq!(routing.all_traffic, Some(true));
+        assert!(routing.allowed_ips.is_some());
+        assert!(routing.excluded_ips.is_some());
+
+        let transport = config.transport.expect("transport section");
+        assert_eq!(transport.protocol.as_deref(), Some(DEFAULT_TRANSPORT_PROTOCOL));
+        assert_eq!(transport.keep_alive, Some(DEFAULT_KEEP_ALIVE));
+
+        let obfs = config.obfuscation.expect("obfuscation section");
+        assert_eq!(obfs.enabled, Some(true));
+
+        let msg = config.messaging.expect("messaging section");
+        assert_eq!(msg.enabled, Some(true));
+    }
+
+    // AC-7b: Partial client TOML
+    #[test]
+    fn client_config_partial() {
+        let toml_str = r#"
+[server]
+endpoint = "10.0.0.1:443"
+"#;
+        let config: ClientConfigFile = toml::from_str(toml_str).expect("parse partial");
+        assert!(config.client.is_none());
+        let srv = config.server.expect("server section");
+        assert_eq!(srv.endpoint.as_deref(), Some("10.0.0.1:443"));
+        assert!(config.interface.is_none());
+    }
+
+    // AC-7c: Client config with unknown fields
+    #[test]
+    fn client_config_unknown_fields() {
+        let toml_str = r#"
+[client]
+name = "test"
+future_flag = true
+
+[unknown_section]
+x = 1
+"#;
+        let config: ClientConfigFile = toml::from_str(toml_str).expect("unknown fields ignored");
+        let client = config.client.expect("client section");
+        assert_eq!(client.name.as_deref(), Some("test"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Config loading tests (FRD-P001)
+    // -----------------------------------------------------------------------
+
+    // AC-8: load_server_config(None) returns default
+    #[test]
+    fn load_server_config_none() {
+        let config = load_server_config(None).expect("should succeed");
+        assert_eq!(config, ServerConfig::default());
+    }
+
+    // AC-9: load_server_config with nonexistent path returns error
+    #[test]
+    fn load_server_config_missing_file() {
+        let path = PathBuf::from("/nonexistent/server.toml");
+        let result = load_server_config(Some(&path));
+        assert!(result.is_err());
+    }
+
+    // AC-10: load_server_config with valid file
+    #[test]
+    fn load_server_config_valid() {
+        let dir = std::env::temp_dir().join("prrr-test-server-config");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("server.toml");
+        std::fs::write(&path, "[server]\nmax_clients = 200\n").expect("write file");
+
+        let config = load_server_config(Some(&path)).expect("should succeed");
+        let srv = config.server.expect("server section");
+        assert_eq!(srv.max_clients, Some(200));
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    // AC-12: load_client_config with valid file
+    #[test]
+    fn load_client_config_valid() {
+        let dir = std::env::temp_dir().join("prrr-test-client-config");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("client.toml");
+        std::fs::write(&path, "[client]\nname = \"test-client\"\n").expect("write file");
+
+        let config = load_client_config(Some(&path)).expect("should succeed");
+        let client = config.client.expect("client section");
+        assert_eq!(client.name.as_deref(), Some("test-client"));
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    // AC-12b: load_client_config(None) returns default
+    #[test]
+    fn load_client_config_none() {
+        let config = load_client_config(None).expect("should succeed");
+        assert_eq!(config, ClientConfigFile::default());
+    }
+
+    // AC-12c: load_client_config with nonexistent path returns error
+    #[test]
+    fn load_client_config_missing_file() {
+        let path = PathBuf::from("/nonexistent/client.toml");
+        let result = load_client_config(Some(&path));
+        assert!(result.is_err());
+    }
+
+    // AC-11: All default constants match SPEC.md values
+    #[test]
+    fn defaults_match_spec() {
+        assert_eq!(DEFAULT_LISTEN_ADDR, "0.0.0.0:443");
+        assert_eq!(DEFAULT_LOG_LEVEL, "info");
+        assert_eq!(DEFAULT_SERVER_NAME, "www.google.com");
+        assert_eq!(DEFAULT_MAX_CLIENTS, 100);
+        assert_eq!(DEFAULT_DATA_DIR, "/var/lib/prrr");
+        assert_eq!(DEFAULT_SUBNET, "10.66.66.0/24");
+        assert_eq!(DEFAULT_DNS_SERVERS, &["1.1.1.1", "8.8.8.8"]);
+        assert_eq!(DEFAULT_MTU, 1280);
+        assert_eq!(DEFAULT_IDENTITY_KEY_PATH, "/etc/prrr/keys/server_identity.key");
+        assert_eq!(DEFAULT_PQ_KEY_PATH, "/etc/prrr/keys/server_pq.key");
+        assert_eq!(DEFAULT_REKEY_INTERVAL, 3600);
+        assert_eq!(DEFAULT_TRANSPORT_PROTOCOL, "masque");
+        assert_eq!(DEFAULT_MAX_IDLE_TIMEOUT, 300);
+        assert_eq!(DEFAULT_KEEP_ALIVE, 25);
+        assert_eq!(DEFAULT_PADDING_STRATEGY, "power-of-two");
+        assert_eq!(DEFAULT_TIMING_JITTER_MS, 50);
+        assert_eq!(DEFAULT_TLS_PROFILE, "chrome");
+        assert_eq!(DEFAULT_PROBE_RESIST_TOKENS_PER_SEC, 20);
+        assert_eq!(DEFAULT_PROBE_RESIST_BURST, 5);
+        assert_eq!(DEFAULT_WEB_ADMIN_ADDR, "0.0.0.0:8443");
+        assert_eq!(DEFAULT_SESSION_TIMEOUT, 3600);
+        assert_eq!(DEFAULT_RELAY_MODE, "server");
+        assert_eq!(DEFAULT_MAX_MESSAGE_SIZE, 10_485_760);
+        assert_eq!(DEFAULT_RETENTION_DAYS, 30);
+        assert_eq!(DEFAULT_PROMETHEUS_PORT, 9090);
+        assert_eq!(DEFAULT_LOG_ROTATION, "daily");
+        assert_eq!(DEFAULT_LOG_RETENTION_DAYS, 7);
+    }
+
+    // -----------------------------------------------------------------------
+    // Key resolution tests (FRD-P003)
+    // -----------------------------------------------------------------------
+
+    // T-P003-2: Resolve noise key from CLI flag
+    #[test]
+    fn client_resolve_noise_key_from_flag() {
+        let key_bytes = [0xABu8; PUBLIC_KEY_LEN];
+        let b64 = BASE64_STANDARD.encode(key_bytes);
+        let result = resolve_server_noise_key(Some(&b64), None).expect("should decode");
+        assert_eq!(result, key_bytes);
+    }
+
+    // T-P003-3: Resolve noise key from config (fallback)
+    #[test]
+    fn client_resolve_noise_key_from_config() {
+        let key_bytes = [0xCDu8; PUBLIC_KEY_LEN];
+        let b64 = BASE64_STANDARD.encode(key_bytes);
+        let result = resolve_server_noise_key(None, Some(&b64)).expect("should decode");
+        assert_eq!(result, key_bytes);
+    }
+
+    // T-P003-4: CLI flag takes priority over config for noise key
+    #[test]
+    fn client_resolve_noise_key_flag_priority() {
+        let flag_bytes = [0x01u8; PUBLIC_KEY_LEN];
+        let config_bytes = [0x02u8; PUBLIC_KEY_LEN];
+        let flag_b64 = BASE64_STANDARD.encode(flag_bytes);
+        let config_b64 = BASE64_STANDARD.encode(config_bytes);
+        let result = resolve_server_noise_key(Some(&flag_b64), Some(&config_b64)).expect("should decode");
+        assert_eq!(result, flag_bytes);
+    }
+
+    // T-P003-5: Missing noise key returns error
+    #[test]
+    fn client_missing_noise_key_error() {
+        let err = resolve_server_noise_key(None, None).unwrap_err();
+        assert!(
+            err.to_string().contains(ERR_MISSING_NOISE_KEY),
+            "error should mention missing key: {err}"
+        );
+    }
+
+    // T-P003-6: Invalid base64 noise key returns error
+    #[test]
+    fn client_invalid_base64_noise_error() {
+        let err = resolve_server_noise_key(Some("not-valid-base64!!!"), None).unwrap_err();
+        assert!(
+            err.to_string().contains(ERR_INVALID_BASE64),
+            "error should mention invalid base64: {err}"
+        );
+    }
+
+    // T-P003-7: Wrong-length noise key returns error
+    #[test]
+    fn client_wrong_noise_key_length_error() {
+        let short_bytes = [0xAAu8; 16]; // 16 bytes, not 32
+        let b64 = BASE64_STANDARD.encode(short_bytes);
+        let err = resolve_server_noise_key(Some(&b64), None).unwrap_err();
+        assert!(
+            err.to_string().contains(ERR_WRONG_NOISE_KEY_LEN),
+            "error should mention wrong length: {err}"
+        );
+    }
+
+    // T-P003-8: Resolve KEM key from CLI flag
+    #[test]
+    fn client_resolve_kem_key_from_flag() {
+        let key_bytes = vec![0xBBu8; KEM_ENCAPSULATION_KEY_LEN];
+        let b64 = BASE64_STANDARD.encode(&key_bytes);
+        let result = resolve_server_kem_key(Some(&b64), None).expect("should decode");
+        assert_eq!(result, key_bytes);
+    }
+
+    // T-P003-9: Resolve KEM key from config (fallback)
+    #[test]
+    fn client_resolve_kem_key_from_config() {
+        let key_bytes = vec![0xDDu8; KEM_ENCAPSULATION_KEY_LEN];
+        let b64 = BASE64_STANDARD.encode(&key_bytes);
+        let result = resolve_server_kem_key(None, Some(&b64)).expect("should decode");
+        assert_eq!(result, key_bytes);
+    }
+
+    // T-P003-10: CLI flag takes priority over config for KEM key
+    #[test]
+    fn client_resolve_kem_key_flag_priority() {
+        let flag_bytes = vec![0x01u8; KEM_ENCAPSULATION_KEY_LEN];
+        let config_bytes = vec![0x02u8; KEM_ENCAPSULATION_KEY_LEN];
+        let flag_b64 = BASE64_STANDARD.encode(&flag_bytes);
+        let config_b64 = BASE64_STANDARD.encode(&config_bytes);
+        let result = resolve_server_kem_key(Some(&flag_b64), Some(&config_b64)).expect("should decode");
+        assert_eq!(result, flag_bytes);
+    }
+
+    // T-P003-11: Missing KEM key returns error
+    #[test]
+    fn client_missing_kem_key_error() {
+        let err = resolve_server_kem_key(None, None).unwrap_err();
+        assert!(
+            err.to_string().contains(ERR_MISSING_KEM_KEY),
+            "error should mention missing key: {err}"
+        );
+    }
+
+    // T-P003-12: Invalid base64 KEM key returns error
+    #[test]
+    fn client_invalid_base64_kem_error() {
+        let err = resolve_server_kem_key(Some("not-valid-base64!!!"), None).unwrap_err();
+        assert!(
+            err.to_string().contains(ERR_INVALID_BASE64),
+            "error should mention invalid base64: {err}"
+        );
+    }
+
+    // T-P003-13: Wrong-length KEM key returns error
+    #[test]
+    fn client_wrong_kem_key_length_error() {
+        let short_bytes = [0xAAu8; 64]; // 64 bytes, not 1184
+        let b64 = BASE64_STANDARD.encode(short_bytes);
+        let err = resolve_server_kem_key(Some(&b64), None).unwrap_err();
+        assert!(
+            err.to_string().contains(ERR_WRONG_KEM_KEY_LEN),
+            "error should mention wrong length: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // P-010: Doctor subcommand parsing tests
+    // -----------------------------------------------------------------------
+
+    // AC-21: prrr server doctor
+    #[test]
+    fn cli_server_doctor_parses() {
+        let cli = Cli::parse_from(["prrr", "server", "doctor"]);
+        match cli.command {
+            Command::Server(args) => {
+                assert!(matches!(args.subcommand, Some(ServerSubcommand::Doctor)));
+            }
+            _ => panic!("expected Server command"),
+        }
+    }
+
+    // AC-22: prrr client doctor
+    #[test]
+    fn cli_client_doctor_parses() {
+        let cli = Cli::parse_from(["prrr", "client", "doctor"]);
+        match cli.command {
+            Command::Client(args) => {
+                assert!(matches!(args.subcommand, Some(ClientSubcommand::Doctor)));
+            }
+            _ => panic!("expected Client command"),
+        }
+    }
+}

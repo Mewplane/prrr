@@ -1,0 +1,66 @@
+[package]
+name = "prrr-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.prrr]
+path = ".."
+
+[workspace]
+members = ["."]
+
+# Prevent this from interfering with workspaces
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "fuzz_wire_message"
+path = "fuzz_targets/fuzz_wire_message.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_encrypted_envelope"
+path = "fuzz_targets/fuzz_encrypted_envelope.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_message_header"
+path = "fuzz_targets/fuzz_message_header.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_encrypted_channel_recv"
+path = "fuzz_targets/fuzz_encrypted_channel_recv.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_varint_decode"
+path = "fuzz_targets/fuzz_varint_decode.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_deframe_datagram"
+path = "fuzz_targets/fuzz_deframe_datagram.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_traffic_unpad"
+path = "fuzz_targets/fuzz_traffic_unpad.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_auth_token_validate"
+path = "fuzz_targets/fuzz_auth_token_validate.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_aead_decrypt"
+path = "fuzz_targets/fuzz_aead_decrypt.rs"
+doc = false

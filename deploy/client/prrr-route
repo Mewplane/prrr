@@ -1,0 +1,165 @@
+#!/bin/bash
+# prrr-route: Set up / tear down VPN routing and DNS
+# Usage: prrr-route up|down
+#
+# Configuration is read from /etc/prrr/client.toml or environment variables:
+#   PRRR_CONFIG      - path to client config (default: /etc/prrr/client.toml)
+#   PRRR_ALL_TRAFFIC - route all traffic through VPN (default: false)
+
+set -euo pipefail
+
+PRRR_CONFIG="${PRRR_CONFIG:-/etc/prrr/client.toml}"
+PRRR_DEVICE="prrr0"
+STATE_DIR="/run/prrr"
+
+# Parse minimal config values from TOML
+parse_config() {
+    local config_file="$1"
+    if [[ ! -f "$config_file" ]]; then
+        echo "Error: config file not found: $config_file" >&2
+        exit 1
+    fi
+
+    # Extract interface address (strip /32 CIDR if present)
+    CLIENT_IP=$(grep -E '^\s*address\s*=' "$config_file" | head -1 | sed 's/.*=\s*"\?\([^"/]*\).*/\1/')
+    # Extract server endpoint (IP or hostname, without port)
+    SERVER_ENDPOINT=$(grep -E '^\s*endpoint\s*=' "$config_file" | head -1 | sed 's/.*=\s*"\?\([^"]*\)"\?/\1/' | cut -d: -f1)
+    # Extract DNS servers
+    DNS_SERVERS=$(grep -E '^\s*dns\s*=' "$config_file" | head -1 | sed 's/.*\[//;s/\].*//;s/"//g;s/,/ /g')
+    # Extract all_traffic
+    ALL_TRAFFIC=$(grep -E '^\s*all_traffic\s*=' "$config_file" | head -1 | sed 's/.*=\s*//' || echo "false")
+
+    # Derive gateway from client IP
+    local octets
+    IFS='.' read -ra octets <<< "$CLIENT_IP"
+    GATEWAY_IP="${octets[0]}.${octets[1]}.${octets[2]}.1"
+}
+
+# Detect how to reach the prrr server right now (before we change routing).
+# This finds the current route to the server — could be direct, via another VPN, etc.
+detect_server_route() {
+    parse_config "$PRRR_CONFIG"
+
+    # `ip route get` tells us exactly how the kernel would route to the server right now
+    local route_info
+    route_info=$(ip route get "$SERVER_ENDPOINT" 2>/dev/null | head -1)
+
+    CURRENT_GW=$(echo "$route_info" | grep -oP 'via \K[0-9.]+' || true)
+    CURRENT_IF=$(echo "$route_info" | grep -oP 'dev \K\S+' || true)
+
+    if [[ -z "$CURRENT_IF" ]]; then
+        echo "Warning: could not determine route to $SERVER_ENDPOINT" >&2
+    fi
+}
+
+do_up() {
+    detect_server_route
+
+    mkdir -p "$STATE_DIR"
+
+    # Save how the server is currently reached (for teardown)
+    echo "$CURRENT_GW" > "$STATE_DIR/current_gw"
+    echo "$CURRENT_IF" > "$STATE_DIR/current_if"
+
+    # Wait for the TUN device to come up (ExecStartPost runs after ExecStart forks)
+    local tries=0
+    while ! ip link show "$PRRR_DEVICE" &>/dev/null; do
+        sleep 0.5
+        tries=$((tries + 1))
+        if [[ $tries -ge 20 ]]; then
+            echo "Error: TUN device $PRRR_DEVICE did not appear within 10s" >&2
+            exit 1
+        fi
+    done
+
+    # Override ALL_TRAFFIC from env if set
+    ALL_TRAFFIC="${PRRR_ALL_TRAFFIC:-$ALL_TRAFFIC}"
+
+    if [[ "$ALL_TRAFFIC" == "true" ]]; then
+        # Check if another VPN is already handling default traffic
+        if ip route show default | grep -q 'dev tun'; then
+            echo "Warning: another VPN is active (tun device detected)." >&2
+            echo "Full-tunnel mode will route traffic through prrr instead." >&2
+            echo "The prrr QUIC connection itself will continue through the existing VPN." >&2
+        fi
+
+        echo "Setting up full-tunnel routing..."
+
+        # 1. Pin the VPN server's IP to go through the CURRENT path.
+        #    This uses `ip route get` result — if another VPN is active,
+        #    the server route goes through that VPN. This prevents the
+        #    prrr QUIC connection from looping into its own tunnel.
+        if [[ -n "$CURRENT_GW" ]]; then
+            ip route add "$SERVER_ENDPOINT" via "$CURRENT_GW" dev "$CURRENT_IF" 2>/dev/null || true
+        else
+            ip route add "$SERVER_ENDPOINT" dev "$CURRENT_IF" 2>/dev/null || true
+        fi
+        echo "$SERVER_ENDPOINT" > "$STATE_DIR/server_route"
+
+        # 2. Add two /1 routes that are more specific than any default route.
+        #    This is the same technique used by WireGuard and OpenVPN.
+        #    0.0.0.0/1 covers 0.0.0.0-127.255.255.255
+        #    128.0.0.0/1 covers 128.0.0.0-255.255.255.255
+        #    Together they cover all IPs but are more specific than 0.0.0.0/0.
+        ip route add 0.0.0.0/1 via "$GATEWAY_IP" dev "$PRRR_DEVICE" 2>/dev/null || true
+        ip route add 128.0.0.0/1 via "$GATEWAY_IP" dev "$PRRR_DEVICE" 2>/dev/null || true
+
+        echo "full-tunnel" > "$STATE_DIR/mode"
+    else
+        echo "Setting up split-tunnel routing (VPN subnet only)..."
+        # Only the VPN subnet is routed through the tunnel (default from TUN setup)
+        echo "split-tunnel" > "$STATE_DIR/mode"
+    fi
+
+    # Set up DNS if servers are configured
+    if [[ -n "$DNS_SERVERS" ]]; then
+        if command -v resolvectl &>/dev/null; then
+            # shellcheck disable=SC2086
+            resolvectl dns "$PRRR_DEVICE" $DNS_SERVERS 2>/dev/null || true
+            resolvectl domain "$PRRR_DEVICE" "~." 2>/dev/null || true
+            echo "DNS set via resolvectl: $DNS_SERVERS"
+        fi
+    fi
+
+    echo "prrr VPN routing is UP"
+}
+
+do_down() {
+    echo "Tearing down prrr VPN routing..."
+
+    # Read saved state
+    local mode="split-tunnel"
+    [[ -f "$STATE_DIR/mode" ]] && mode=$(cat "$STATE_DIR/mode")
+
+    if [[ "$mode" == "full-tunnel" ]]; then
+        # Remove the /1 tunnel routes
+        ip route del 0.0.0.0/1 dev "$PRRR_DEVICE" 2>/dev/null || true
+        ip route del 128.0.0.0/1 dev "$PRRR_DEVICE" 2>/dev/null || true
+
+        # Remove the pinned server route
+        if [[ -f "$STATE_DIR/server_route" ]]; then
+            local server_ip
+            server_ip=$(cat "$STATE_DIR/server_route")
+            ip route del "$server_ip" 2>/dev/null || true
+        fi
+    fi
+
+    # Reset DNS
+    if command -v resolvectl &>/dev/null; then
+        resolvectl revert "$PRRR_DEVICE" 2>/dev/null || true
+    fi
+
+    # Clean up state
+    rm -rf "$STATE_DIR"
+
+    echo "prrr VPN routing is DOWN"
+}
+
+case "${1:-}" in
+    up)   do_up ;;
+    down) do_down ;;
+    *)
+        echo "Usage: prrr-route up|down" >&2
+        exit 1
+        ;;
+esac

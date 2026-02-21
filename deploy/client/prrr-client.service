@@ -1,0 +1,19 @@
+[Unit]
+Description=prrr VPN Client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/prrr client --config /etc/prrr/client.toml
+ExecStartPost=/usr/local/bin/prrr-route up
+ExecStopPost=/usr/local/bin/prrr-route down
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=65535
+
+# Needs root for TUN device creation
+AmbientCapabilities=CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target

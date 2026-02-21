@@ -1,0 +1,36 @@
+#cloud-config
+# FRD: specs/frds/FRD-P012.md
+# SPEC.md §5.2 — Cloud-init bootstrap for prrr VPN server
+#
+# Template variables (injected by Terraform templatefile):
+#   - admin_password : Web admin password
+#   - domain         : Domain name (may be empty)
+#   - max_clients    : Maximum concurrent clients
+#   - dns_servers    : Comma-separated DNS server list
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - curl
+  - ufw
+
+write_files:
+  - path: /tmp/install_prrr.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -e
+
+      # Install prrr VPN server via bootstrap script
+      curl -fsSL https://install.prrr.dev/server | bash -s -- \
+        --admin-pass "${admin_password}" \
+        --domain "${domain}" \
+        --max-clients ${max_clients} \
+        --dns ${dns_servers}
+
+runcmd:
+  - /tmp/install_prrr.sh
+  - rm -f /tmp/install_prrr.sh
+
+final_message: "prrr VPN server is ready after $UPTIME seconds"
