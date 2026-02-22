@@ -36,8 +36,12 @@ resource "digitalocean_droplet" "prrr_vpn" {
   user_data = templatefile("${path.module}/templates/cloud-init.yml", {
     admin_password = var.admin_password
     domain         = var.domain
+    admin_domain   = var.admin_subdomain != "" ? "${var.admin_subdomain}.${var.domain}" : "admin.${var.domain}"
+    vpn_port       = var.vpn_port
+    admin_port     = var.admin_https_port
     max_clients    = var.max_clients
     dns_servers    = join(",", var.dns_servers)
+    certbot_email  = var.certbot_email
   })
 
   tags = ["prrr-vpn", var.environment]
@@ -65,10 +69,17 @@ resource "digitalocean_firewall" "prrr_vpn" {
     source_addresses = ["0.0.0.0/0", "::/0"]
   }
 
-  # Web Admin — restricted to admin IPs
+  # Let's Encrypt HTTP-01 validation
   inbound_rule {
     protocol         = "tcp"
-    port_range       = "8443"
+    port_range       = "80"
+    source_addresses = ["0.0.0.0/0", "::/0"]
+  }
+
+  # Web Admin HTTPS — restricted to admin IPs
+  inbound_rule {
+    protocol         = "tcp"
+    port_range       = var.admin_https_port
     source_addresses = var.admin_ip_addresses
   }
 
@@ -107,6 +118,15 @@ resource "digitalocean_record" "prrr_vpn_a" {
   domain = digitalocean_domain.prrr_vpn[0].id
   type   = "A"
   name   = "@"
+  value  = digitalocean_droplet.prrr_vpn.ipv4_address
+  ttl    = 300
+}
+
+resource "digitalocean_record" "prrr_admin_a" {
+  count  = var.domain != "" ? 1 : 0
+  domain = digitalocean_domain.prrr_vpn[0].id
+  type   = "A"
+  name   = var.admin_subdomain != "" ? var.admin_subdomain : "admin"
   value  = digitalocean_droplet.prrr_vpn.ipv4_address
   ttl    = 300
 }

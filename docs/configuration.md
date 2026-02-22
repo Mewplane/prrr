@@ -16,7 +16,7 @@ General server settings.
 | `max_clients` | u32 | `100` | Maximum concurrent client connections |
 | `log_level` | String | `"info"` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
 | `data_dir` | String | `"/var/lib/prrr"` | Directory for database and runtime files |
-| `server_name` | String | `"www.google.com"` | TLS server name (SNI) |
+| `server_name` | String | `"localhost"` | TLS server name (SNI) — set to your server's actual domain in production |
 
 ### `[network]`
 

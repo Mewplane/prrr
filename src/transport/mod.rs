@@ -6,6 +6,8 @@ pub mod encrypted_channel;
 pub mod masque;
 /// QUIC client and server transport (quinn-based).
 pub mod quic;
+/// Shared TLS certificate verification.
+pub(crate) mod tls;
 
 /// Errors produced by transport-layer operations.
 #[derive(Debug, thiserror::Error)]

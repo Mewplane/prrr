@@ -43,7 +43,31 @@ variable "admin_password" {
 }
 
 variable "domain" {
-  description = "Domain name for DNS A record (leave empty to skip DNS setup)"
+  description = "Domain name for DNS A record and Let's Encrypt certificates. Required for DPI-resistant deployments — bare IP addresses and self-signed certs are detectable. Leave empty to skip DNS setup (development only)."
+  type        = string
+  default     = ""
+}
+
+variable "admin_subdomain" {
+  description = "Subdomain for admin panel (e.g., 'admin' for admin.example.com)"
+  type        = string
+  default     = "admin"
+}
+
+variable "vpn_port" {
+  description = "VPN listen port (UDP)"
+  type        = number
+  default     = 443
+}
+
+variable "admin_https_port" {
+  description = "HTTPS admin panel port (TCP, served by nginx)"
+  type        = number
+  default     = 9443
+}
+
+variable "certbot_email" {
+  description = "Email for Let's Encrypt certificate notifications (optional)"
   type        = string
   default     = ""
 }

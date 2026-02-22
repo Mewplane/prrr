@@ -120,6 +120,10 @@ subnet = "10.66.66.0/24"
 dns_servers = ["1.1.1.1", "8.8.8.8"]
 mtu = 1280
 
+[transport]
+tls_cert = "/etc/letsencrypt/live/vpn.example.com/fullchain.pem"
+tls_key = "/etc/letsencrypt/live/vpn.example.com/privkey.pem"
+
 [crypto]
 identity_key_path = "/etc/prrr/keys/server_identity.key"
 pq_key_path = "/etc/prrr/keys/server_pq.key"
@@ -128,6 +132,8 @@ pq_key_path = "/etc/prrr/keys/server_pq.key"
 All fields are optional. Missing values use built-in defaults. See [Configuration Reference](configuration.md) for the complete list.
 
 **Important:** Set `server_name` to your server's public IP or domain name. This value is used in exported client configs as the connection endpoint. If left as `localhost`, clients won't be able to connect remotely.
+
+**TLS Certificates:** The `[transport]` section configures the QUIC/MASQUE transport layer. When `tls_cert` and `tls_key` are set, the server presents a CA-signed certificate to clients. This is critical for production deployments — without a real certificate, DPI systems can detect the self-signed fallback as anomalous traffic. See [Deployment Guide](deployment.md) for Let's Encrypt setup.
 
 Start the server:
 
@@ -176,6 +182,10 @@ server_name = "YOUR_SERVER_PUBLIC_IP"
 subnet = "10.66.66.0/24"
 dns_servers = ["1.1.1.1", "8.8.8.8"]
 mtu = 1280
+
+[transport]
+tls_cert = "/etc/letsencrypt/live/YOUR_DOMAIN/fullchain.pem"
+tls_key = "/etc/letsencrypt/live/YOUR_DOMAIN/privkey.pem"
 
 [crypto]
 identity_key_path = "/etc/prrr/keys/server_identity.key"
@@ -423,32 +433,56 @@ prrr server --config /etc/prrr/server.toml client remove alice
 
 This revokes the client and releases its IP address. The client can no longer authenticate.
 
-## Enabling the Web Admin
+## Web Admin Panel
 
-Add the `[web_admin]` section to your server config:
+The web admin provides:
+- Real-time dashboard with connection stats
+- Client management (add, remove, view status)
+- Config export with QR codes
+- Server settings view
+
+For production deployments, use HTTPS with Let's Encrypt (automated by the installation script). For manual setup, see the [Deployment Guide](deployment.md#https-admin-panel-with-lets-encrypt).
+
+### Quick Start (Development Only)
+
+For local testing without HTTPS, add to your server config:
 
 ```toml
 [web_admin]
 enabled = true
-listen_addr = "0.0.0.0:8443"
+listen = "127.0.0.1:8443"
 admin_password_hash = '$argon2id$v=19$m=4096,t=3,p=1$...'
-session_timeout = 3600
 ```
 
 Generate the password hash:
 
 ```bash
-# Install argon2 if needed
 sudo apt-get install -y argon2    # Ubuntu/Debian
 sudo dnf install -y argon2        # Fedora
-
-# Generate hash
-echo -n "your-password" | argon2 $(openssl rand -base64 16) -id -e
+echo -n "your-password" | argon2 $(openssl rand -base64 16) -id -t 3 -m 16 -p 1 -e
 ```
 
-**Important:** The web admin serves plain HTTP (not HTTPS). Access it at `http://<server-ip>:8443`. If you need HTTPS, configure `tls_cert` and `tls_key` in the `[web_admin]` section or put a reverse proxy (nginx, caddy) in front.
+Access at `http://127.0.0.1:8443` (HTTP only, not suitable for remote access).
 
-The web admin provides a dashboard, client management, config distribution (QR codes, shareable URLs), and a read-only server settings view.
+### Production Setup (HTTPS)
+
+Use the installation script for automatic HTTPS setup:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/prrr-vpn/prrr/main/deploy/scripts/install-server.sh | sudo bash -s -- \
+  --domain prrr.example.com \
+  --admin-pass "your-secure-password"
+```
+
+This configures:
+- Let's Encrypt certificates for your domain
+- Nginx reverse proxy with TLS on port 9443
+- Automatic certificate renewal
+- Firewall rules (UDP 443, TCP 80, TCP 9443)
+
+Access at `https://admin.prrr.example.com:9443` with credentials `admin` / `your-secure-password`.
+
+For manual HTTPS setup, see the [Deployment Guide](deployment.md).
 
 ## Enabling Monitoring
 
@@ -526,11 +560,11 @@ sudo /home/youruser/.cargo/bin/prrr client --config ...
 
 ### SSL_ERROR_RX_RECORD_TOO_LONG on web admin
 
-You are accessing the web admin with `https://` but it serves plain HTTP. Use `http://` instead:
+The web admin is serving HTTP but you're accessing with HTTPS. Solutions:
 
-```
-http://your-server:8443
-```
+1. **Recommended**: Use the installation script to set up nginx with Let's Encrypt HTTPS
+2. **Development only**: Access via HTTP at `http://localhost:8443`
+3. **Manual**: Follow the [HTTPS setup guide](deployment.md#https-admin-panel-with-lets-encrypt)
 
 ### Stale clients warning
 
@@ -544,7 +578,28 @@ Check connectivity before connecting:
 prrr client --config ~/.config/prrr/client.toml doctor
 ```
 
-This verifies key presence, configuration validity, and server reachability.
+This verifies key presence, configuration validity, SNI configuration, and server reachability. The doctor will warn if `server_name` is not set or uses a suspicious value like `www.google.com`.
+
+### TLS certificate verification errors
+
+By default, the client verifies the server's TLS certificate against Mozilla's CA root store. If you see certificate errors during development with self-signed certificates, use the `--insecure` flag:
+
+```bash
+sudo $(which prrr) client --config ~/.config/prrr/client.toml --insecure
+```
+
+Or set in the client config file:
+
+```toml
+[transport]
+insecure_skip_verify = true
+```
+
+**WARNING:** Never use `--insecure` in production. It disables TLS certificate verification, making connections vulnerable to man-in-the-middle attacks. For production, configure a CA-signed certificate on the server (see [Deployment Guide](deployment.md)).
+
+### Missing server_name
+
+The client requires `server_name` (TLS SNI) to be set, either via `--server-name` on the CLI or `[server].server_name` in the config file. If missing, the client exits with an error. The exported config from `prrr server client export` includes the server's configured `server_name` automatically.
 
 ## Next Steps
 

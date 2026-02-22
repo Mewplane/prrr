@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FRD: specs/frds/FRD-M014-android-internal-testing.md -->
+<resources>
+    <color name="ic_launcher_background">#00897B</color>
+</resources>

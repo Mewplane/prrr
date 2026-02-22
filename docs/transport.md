@@ -122,6 +122,24 @@ let mut channel = EncryptedChannel::with_config(
 - `DEFAULT_REKEY_THRESHOLD = 4294967296` — Default rekey at 2^32 packets.
 - `DEFAULT_REPLAY_WINDOW_SIZE = 64` — Default replay window.
 
+### `transport::tls` — Shared TLS Certificate Verification
+
+Internal module providing shared TLS certificate verification for all
+QUIC/MASQUE client connections. Provides `build_cert_verifier(insecure)` which
+returns either a production verifier backed by the Mozilla CA root store
+(`webpki-roots`), or a dev/test `SkipServerVerification` that accepts any
+certificate.
+
+**Types:**
+- `SkipServerVerification` — `ServerCertVerifier` that accepts any certificate (dev/test only).
+
+**Functions:**
+- `build_cert_verifier(insecure: bool) -> Arc<dyn ServerCertVerifier>` — Build a certificate verifier. When `insecure=false`, verifies against Mozilla CA roots. When `insecure=true`, accepts any certificate.
+- `skip_server_verification() -> Arc<dyn ServerCertVerifier>` — Create an Arc-wrapped `SkipServerVerification` (convenience wrapper, equivalent to `build_cert_verifier(true)`).
+- `load_pem_cert_and_key(cert_path, key_path) -> Result<(Vec<CertificateDer>, PrivateKeyDer), TransportError>` — Load a PEM certificate chain and private key from disk. Returns the full chain for use with server builders. Errors on missing files, corrupt PEM, or missing key. Uses `rustls-pemfile` for parsing.
+
+**Visibility:** `pub(crate)` — internal to the prrr crate.
+
 ### `transport::quic` — QUIC Client & Server
 
 QUIC transport layer using the `quinn` crate (v0.11.9) over TLS 1.3 (via
@@ -268,8 +286,8 @@ handshake indistinguishable from standard HTTP/3 traffic.
 - `MasqueProxy::send_datagram(payload) -> Result<()>` — Send UDP datagram through tunnel.
 - `MasqueProxy::recv_datagram() -> Result<Vec<u8>>` — Receive UDP datagram from tunnel.
 - `MasqueProxy::max_datagram_size() -> Option<usize>` — Query max payload size.
-- `build_masque_server_config(cert, key) -> Result<ServerConfig>` — Server config with ALPN=h3 and datagrams.
-- `build_masque_client_config() -> Result<ClientConfig>` — Client config with ALPN=h3 and datagrams.
+- `build_masque_server_config(cert_chain, key, keep_alive, max_idle) -> Result<ServerConfig>` — Server config with ALPN=h3 and datagrams. Accepts a full `Vec<CertificateDer>` certificate chain.
+- `build_masque_client_config(keep_alive, max_idle_timeout, insecure) -> Result<ClientConfig>` — Client config with ALPN=h3 and datagrams. When `insecure=false`, verifies server certificates against Mozilla CA roots.
 - `datagram_transport_config() -> TransportConfig` — Transport config with datagrams enabled.
 - `varint_encode(value, buf) -> Result<usize>` — Encode QUIC varint (RFC 9000 §16).
 - `varint_decode(buf) -> Result<(u64, usize)>` — Decode QUIC varint.
