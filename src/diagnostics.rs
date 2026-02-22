@@ -98,6 +98,21 @@ const CHECK_CLIENT_CONFIG: &str = "Configuration valid";
 /// Check name: server reachable.
 const CHECK_SERVER_REACHABLE: &str = "Server reachable";
 
+/// Check name: SNI configuration.
+const CHECK_SNI_CONFIG: &str = "SNI configuration";
+
+/// Check name: MTU configuration.
+const CHECK_MTU_CONFIG: &str = "MTU configuration";
+
+/// Dangerous legacy default SNI that causes DPI detection.
+const DANGEROUS_SNI_VALUE: &str = "www.google.com";
+
+/// Check name: TLS certificate.
+const CHECK_TLS_CERT: &str = "TLS certificate";
+
+/// Number of days before cert expiry to warn.
+const CERT_EXPIRY_WARN_DAYS: i64 = 30;
+
 /// Diagnostic header printed before checks.
 const HEADER_MESSAGE: &str = "Running diagnostics...";
 
@@ -236,6 +251,12 @@ pub fn run_server_doctor(config: &ServerConfig, listen_addr: SocketAddr) -> Diag
     let db_path = Path::new(data_dir).join(crate::registry::DATABASE_FILENAME);
     checks.push(check_stale_clients(subnet, &db_path));
 
+    // 7. TLS certificate
+    let tls_cert = config.transport.as_ref().and_then(|t| t.tls_cert.as_deref());
+    let tls_key = config.transport.as_ref().and_then(|t| t.tls_key.as_deref());
+    let server_name = config.server.as_ref().and_then(|s| s.server_name.as_deref());
+    checks.push(check_tls_cert(tls_cert, tls_key, server_name));
+
     // Build recommendations from check results
     for check in &checks {
         match check.status {
@@ -253,6 +274,16 @@ pub fn run_server_doctor(config: &ServerConfig, listen_addr: SocketAddr) -> Diag
             }
             CheckStatus::Warn if check.name == CHECK_STALE_CLIENTS => {
                 recommendations.push("Remove inactive clients to free IP addresses".to_string());
+            }
+            CheckStatus::Fail if check.name == CHECK_TLS_CERT => {
+                recommendations.push(
+                    "Fix TLS certificate configuration: ensure tls_cert and tls_key paths are correct and files are valid PEM".to_string(),
+                );
+            }
+            CheckStatus::Warn if check.name == CHECK_TLS_CERT => {
+                recommendations.push(
+                    "Configure TLS certificate for production: set transport.tls_cert and transport.tls_key in server config".to_string(),
+                );
             }
             _ => {}
         }
@@ -584,6 +615,14 @@ pub fn run_client_doctor(config: &ClientConfigFile) -> DiagnosticReport {
         checks.push(check_server_reachable(endpoint));
     }
 
+    // 4. SNI configuration
+    let server_name = config.server.as_ref().and_then(|s| s.server_name.as_deref());
+    checks.push(check_sni_config(server_name));
+
+    // 5. MTU configuration
+    let configured_mtu = config.interface.as_ref().and_then(|i| i.mtu);
+    checks.push(check_mtu_config(configured_mtu));
+
     // Build recommendations
     for check in &checks {
         match check.status {
@@ -596,6 +635,17 @@ pub fn run_client_doctor(config: &ClientConfigFile) -> DiagnosticReport {
             CheckStatus::Fail if check.name == CHECK_SERVER_REACHABLE => {
                 recommendations.push("Check if server is running".to_string());
                 recommendations.push("Verify firewall allows UDP port 443".to_string());
+            }
+            CheckStatus::Warn if check.name == CHECK_SNI_CONFIG => {
+                recommendations.push(
+                    "Set [server].server_name in client config to your server's actual domain (e.g., \"vpn.example.com\")".to_string(),
+                );
+            }
+            CheckStatus::Warn if check.name == CHECK_MTU_CONFIG => {
+                recommendations.push(format!(
+                    "Lower [interface].mtu to {} (default) to avoid QUIC datagram drops",
+                    crate::tunnel::tun_device::DEFAULT_TUNNEL_MTU
+                ));
             }
             _ => {}
         }
@@ -651,6 +701,227 @@ pub fn check_client_config(config: &ClientConfigFile) -> CheckResult {
             status: CheckStatus::Fail,
             message: "Server endpoint not configured".to_string(),
         }
+    }
+}
+
+/// Check that the client SNI (server_name) is configured and looks valid.
+///
+/// Warns if:
+/// - `server_name` is not configured (will fail at connection time)
+/// - `server_name` is the dangerous legacy default `"www.google.com"`
+/// - `server_name` doesn't look like a valid domain (no dot or contains whitespace)
+pub fn check_sni_config(server_name: Option<&str>) -> CheckResult {
+    match server_name {
+        None => CheckResult {
+            name: CHECK_SNI_CONFIG,
+            status: CheckStatus::Warn,
+            message: "server_name not configured — connection will require --server-name CLI flag".to_string(),
+        },
+        Some(name) if name == DANGEROUS_SNI_VALUE => CheckResult {
+            name: CHECK_SNI_CONFIG,
+            status: CheckStatus::Warn,
+            message: format!("server_name is '{DANGEROUS_SNI_VALUE}' — this causes SNI/IP mismatch detectable by DPI"),
+        },
+        Some(name) if !looks_like_valid_domain(name) => CheckResult {
+            name: CHECK_SNI_CONFIG,
+            status: CheckStatus::Warn,
+            message: format!("server_name '{name}' does not look like a valid domain"),
+        },
+        Some(_) => CheckResult {
+            name: CHECK_SNI_CONFIG,
+            status: CheckStatus::Pass,
+            message: CHECK_SNI_CONFIG.to_string(),
+        },
+    }
+}
+
+/// Check that the configured MTU won't cause QUIC datagram drops.
+///
+/// The TUN MTU plus encryption and MASQUE framing overhead must fit within
+/// the QUIC datagram size limit. Since the exact QUIC max datagram size
+/// depends on path MTU discovery at runtime, this check warns when the
+/// configured MTU exceeds the safe default (1280), which is known to work
+/// on all paths.
+pub fn check_mtu_config(configured_mtu: Option<u16>) -> CheckResult {
+    let default_mtu = crate::tunnel::tun_device::DEFAULT_TUNNEL_MTU;
+
+    match configured_mtu {
+        None => CheckResult {
+            name: CHECK_MTU_CONFIG,
+            status: CheckStatus::Pass,
+            message: CHECK_MTU_CONFIG.to_string(),
+        },
+        Some(mtu) if mtu <= default_mtu => CheckResult {
+            name: CHECK_MTU_CONFIG,
+            status: CheckStatus::Pass,
+            message: if mtu == default_mtu {
+                CHECK_MTU_CONFIG.to_string()
+            } else {
+                format!("{CHECK_MTU_CONFIG} (mtu={mtu})")
+            },
+        },
+        Some(mtu) => {
+            let overhead = crate::client::TUNNEL_OVERHEAD_BYTES;
+            CheckResult {
+                name: CHECK_MTU_CONFIG,
+                status: CheckStatus::Warn,
+                message: format!(
+                    "MTU {mtu} exceeds safe default {default_mtu} — packets over {} bytes \
+                     (after {overhead}-byte overhead) may be dropped by QUIC",
+                    mtu as usize + overhead
+                ),
+            }
+        }
+    }
+}
+
+/// Heuristic check: a valid domain contains at least one dot and no whitespace.
+fn looks_like_valid_domain(name: &str) -> bool {
+    !name.is_empty() && name.contains('.') && !name.chars().any(char::is_whitespace)
+}
+
+/// Check the server's TLS certificate configuration.
+///
+/// Validates file existence, PEM parsing, expiry, and SAN matching.
+/// When no TLS cert is configured, warns about self-signed fallback.
+pub fn check_tls_cert(tls_cert_path: Option<&str>, tls_key_path: Option<&str>, server_name: Option<&str>) -> CheckResult {
+    let cert_path = match tls_cert_path {
+        None => {
+            return CheckResult {
+                name: CHECK_TLS_CERT,
+                status: CheckStatus::Warn,
+                message: "No TLS certificate configured (will use self-signed, detectable by DPI)".to_string(),
+            };
+        }
+        Some(p) => p,
+    };
+
+    // Check cert file exists
+    if !Path::new(cert_path).exists() {
+        return CheckResult {
+            name: CHECK_TLS_CERT,
+            status: CheckStatus::Fail,
+            message: format!("TLS cert file not found: {cert_path}"),
+        };
+    }
+
+    // Check key file configured and exists
+    match tls_key_path {
+        None => {
+            return CheckResult {
+                name: CHECK_TLS_CERT,
+                status: CheckStatus::Fail,
+                message: "tls_cert is set but tls_key is missing".to_string(),
+            };
+        }
+        Some(key_path) if !Path::new(key_path).exists() => {
+            return CheckResult {
+                name: CHECK_TLS_CERT,
+                status: CheckStatus::Fail,
+                message: format!("TLS key file not found: {key_path}"),
+            };
+        }
+        _ => {}
+    }
+
+    // Try to load and parse the PEM cert
+    let load_result = crate::transport::tls::load_pem_cert_and_key(Path::new(cert_path), Path::new(tls_key_path.expect("checked above")));
+    let (certs, _key) = match load_result {
+        Ok(pair) => pair,
+        Err(e) => {
+            return CheckResult {
+                name: CHECK_TLS_CERT,
+                status: CheckStatus::Fail,
+                message: format!("Failed to parse TLS certificate: {e}"),
+            };
+        }
+    };
+
+    // Parse the leaf certificate with x509-parser
+    let leaf_der = &certs[0];
+    let (_, x509) = match x509_parser::parse_x509_certificate(leaf_der.as_ref()) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            return CheckResult {
+                name: CHECK_TLS_CERT,
+                status: CheckStatus::Fail,
+                message: format!("Failed to parse X.509 certificate: {e}"),
+            };
+        }
+    };
+
+    // Check expiry
+    let not_after = x509.validity().not_after;
+    let now = x509_parser::time::ASN1Time::now();
+    if now > not_after {
+        return CheckResult {
+            name: CHECK_TLS_CERT,
+            status: CheckStatus::Fail,
+            message: "TLS certificate has expired".to_string(),
+        };
+    }
+
+    // Check if expiring within CERT_EXPIRY_WARN_DAYS
+    let seconds_per_day: i64 = 86400;
+    let warn_threshold = CERT_EXPIRY_WARN_DAYS * seconds_per_day;
+    let warn_offset = match x509_parser::time::ASN1Time::from_timestamp(now.timestamp() + warn_threshold) {
+        Ok(t) => t,
+        Err(_) => {
+            return CheckResult {
+                name: CHECK_TLS_CERT,
+                status: CheckStatus::Pass,
+                message: CHECK_TLS_CERT.to_string(),
+            };
+        }
+    };
+    if warn_offset > not_after {
+        return CheckResult {
+            name: CHECK_TLS_CERT,
+            status: CheckStatus::Warn,
+            message: format!("TLS certificate expires within {CERT_EXPIRY_WARN_DAYS} days"),
+        };
+    }
+
+    // Check SAN matching if server_name is configured
+    if let Some(name) = server_name {
+        let san_matched = x509
+            .subject_alternative_name()
+            .ok()
+            .flatten()
+            .map(|san| {
+                san.value.general_names.iter().any(|gn| match gn {
+                    x509_parser::extensions::GeneralName::DNSName(dns) => *dns == name,
+                    x509_parser::extensions::GeneralName::IPAddress(ip_bytes) => match ip_bytes.len() {
+                        4 => {
+                            let ip = std::net::Ipv4Addr::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
+                            ip.to_string() == name
+                        }
+                        16 => {
+                            let mut octets = [0u8; 16];
+                            octets.copy_from_slice(ip_bytes);
+                            let ip = std::net::Ipv6Addr::from(octets);
+                            ip.to_string() == name
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                })
+            })
+            .unwrap_or(false);
+
+        if !san_matched {
+            return CheckResult {
+                name: CHECK_TLS_CERT,
+                status: CheckStatus::Warn,
+                message: format!("server_name '{name}' not found in certificate SANs"),
+            };
+        }
+    }
+
+    CheckResult {
+        name: CHECK_TLS_CERT,
+        status: CheckStatus::Pass,
+        message: CHECK_TLS_CERT.to_string(),
     }
 }
 
@@ -1322,14 +1593,15 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
         let report = run_server_doctor(&config, addr);
 
-        // Should have 6 checks
-        assert_eq!(report.checks.len(), 6);
+        // Should have 7 checks (config, keys, port, disk, memory, stale clients, TLS cert)
+        assert_eq!(report.checks.len(), 7);
         assert_eq!(report.checks[0].name, CHECK_CONFIG_VALID);
         assert_eq!(report.checks[1].name, CHECK_KEYS_PRESENT);
         assert_eq!(report.checks[2].name, CHECK_PORT_AVAILABLE);
         assert_eq!(report.checks[3].name, CHECK_DISK_SPACE);
         assert_eq!(report.checks[4].name, CHECK_MEMORY);
         assert_eq!(report.checks[5].name, CHECK_STALE_CLIENTS);
+        assert_eq!(report.checks[6].name, CHECK_TLS_CERT);
     }
 
     // -----------------------------------------------------------------------
@@ -1341,14 +1613,16 @@ mod tests {
         let config = ClientConfigFile::default();
         let report = run_client_doctor(&config);
 
-        // Should have 2 checks (keys + config; no server reachable since no endpoint)
-        assert_eq!(report.checks.len(), 2);
+        // Should have 4 checks (keys + config + SNI + MTU; no server reachable since no endpoint)
+        assert_eq!(report.checks.len(), 4);
         assert_eq!(report.checks[0].name, CHECK_CLIENT_KEYS);
         assert_eq!(report.checks[1].name, CHECK_CLIENT_CONFIG);
+        assert_eq!(report.checks[2].name, CHECK_SNI_CONFIG);
+        assert_eq!(report.checks[3].name, CHECK_MTU_CONFIG);
     }
 
     #[test]
-    fn run_client_doctor_with_endpoint_has_three_checks() {
+    fn run_client_doctor_with_endpoint_has_five_checks() {
         let config = ClientConfigFile {
             server: Some(crate::config::ClientServerSection {
                 endpoint: Some("127.0.0.1:443".to_string()),
@@ -1358,8 +1632,314 @@ mod tests {
         };
         let report = run_client_doctor(&config);
 
-        // Should have 3 checks (keys + config + server reachable)
-        assert_eq!(report.checks.len(), 3);
+        // Should have 5 checks (keys + config + server reachable + SNI + MTU)
+        assert_eq!(report.checks.len(), 5);
         assert_eq!(report.checks[2].name, CHECK_SERVER_REACHABLE);
+        assert_eq!(report.checks[3].name, CHECK_SNI_CONFIG);
+        assert_eq!(report.checks[4].name, CHECK_MTU_CONFIG);
+    }
+
+    // -----------------------------------------------------------------------
+    // SNI configuration checks (DPI005)
+    // -----------------------------------------------------------------------
+
+    // FRD: specs/frds/FRD-DPI005.md
+
+    // T-DPI005-4: check_sni_config warns when server_name is None
+    #[test]
+    fn sni_config_none_warns() {
+        let result = check_sni_config(None);
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert_eq!(result.name, CHECK_SNI_CONFIG);
+        assert!(result.message.contains("not configured"));
+    }
+
+    // T-DPI005-5: check_sni_config warns on dangerous "www.google.com"
+    #[test]
+    fn sni_config_google_warns() {
+        let result = check_sni_config(Some(DANGEROUS_SNI_VALUE));
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert_eq!(result.name, CHECK_SNI_CONFIG);
+        assert!(result.message.contains("SNI/IP mismatch"));
+    }
+
+    // T-DPI005-6: check_sni_config warns on invalid domain (no dot)
+    #[test]
+    fn sni_config_invalid_domain_warns() {
+        let result = check_sni_config(Some("localhost"));
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert_eq!(result.name, CHECK_SNI_CONFIG);
+        assert!(result.message.contains("does not look like a valid domain"));
+    }
+
+    // T-DPI005-7: check_sni_config warns on domain with whitespace
+    #[test]
+    fn sni_config_whitespace_warns() {
+        let result = check_sni_config(Some("vpn .example.com"));
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert!(result.message.contains("does not look like a valid domain"));
+    }
+
+    // T-DPI005-8: check_sni_config passes on valid domain
+    #[test]
+    fn sni_config_valid_passes() {
+        let result = check_sni_config(Some("vpn.example.com"));
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert_eq!(result.name, CHECK_SNI_CONFIG);
+    }
+
+    // T-DPI005-9: check_sni_config passes on subdomain
+    #[test]
+    fn sni_config_subdomain_passes() {
+        let result = check_sni_config(Some("prrr.tech"));
+        assert_eq!(result.status, CheckStatus::Pass);
+    }
+
+    // T-DPI005-10: client doctor with google SNI warns and recommends fix
+    #[test]
+    fn client_doctor_google_sni_warns_with_recommendation() {
+        let config = ClientConfigFile {
+            server: Some(crate::config::ClientServerSection {
+                server_name: Some("www.google.com".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let report = run_client_doctor(&config);
+        let sni_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == CHECK_SNI_CONFIG)
+            .expect("SNI check present");
+        assert_eq!(sni_check.status, CheckStatus::Warn);
+        assert!(!report.recommendations.is_empty());
+        assert!(report.recommendations.iter().any(|r| r.contains("server_name")));
+    }
+
+    // -----------------------------------------------------------------------
+    // TLS certificate checks (DPI006)
+    // -----------------------------------------------------------------------
+
+    // FRD: specs/frds/FRD-DPI006.md
+
+    /// Helper: generate a self-signed PEM cert+key with given SANs and write to temp dir.
+    /// Returns (cert_path, key_path).
+    fn write_test_pem(dir: &std::path::Path, sans: &[&str]) -> (String, String) {
+        let mut params = rcgen::CertificateParams::new(sans.iter().map(|s| s.to_string()).collect::<Vec<_>>()).expect("valid params");
+        params.not_before = rcgen::date_time_ymd(2025, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2027, 1, 1);
+        let key_pair = rcgen::KeyPair::generate().expect("generate key");
+        let cert = params.self_signed(&key_pair).expect("self-sign");
+
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, cert.pem()).expect("write cert");
+        std::fs::write(&key_path, key_pair.serialize_pem()).expect("write key");
+        (cert_path.to_str().unwrap().to_string(), key_path.to_str().unwrap().to_string())
+    }
+
+    /// Helper: generate an expired PEM cert+key.
+    fn write_expired_pem(dir: &std::path::Path, sans: &[&str]) -> (String, String) {
+        let mut params = rcgen::CertificateParams::new(sans.iter().map(|s| s.to_string()).collect::<Vec<_>>()).expect("valid params");
+        params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2021, 1, 1);
+        let key_pair = rcgen::KeyPair::generate().expect("generate key");
+        let cert = params.self_signed(&key_pair).expect("self-sign");
+
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, cert.pem()).expect("write cert");
+        std::fs::write(&key_path, key_pair.serialize_pem()).expect("write key");
+        (cert_path.to_str().unwrap().to_string(), key_path.to_str().unwrap().to_string())
+    }
+
+    /// Helper: generate a cert with a custom not_after date (year/month/day).
+    fn write_custom_expiry_pem(dir: &std::path::Path, sans: &[&str], not_after_ymd: (i32, u8, u8)) -> (String, String) {
+        let mut params = rcgen::CertificateParams::new(sans.iter().map(|s| s.to_string()).collect::<Vec<_>>()).expect("valid params");
+        params.not_before = rcgen::date_time_ymd(2024, 1, 1);
+        params.not_after = rcgen::date_time_ymd(not_after_ymd.0, not_after_ymd.1, not_after_ymd.2);
+        let key_pair = rcgen::KeyPair::generate().expect("generate key");
+        let cert = params.self_signed(&key_pair).expect("self-sign");
+
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, cert.pem()).expect("write cert");
+        std::fs::write(&key_path, key_pair.serialize_pem()).expect("write key");
+        (cert_path.to_str().unwrap().to_string(), key_path.to_str().unwrap().to_string())
+    }
+
+    // T-DPI006-1: No TLS cert configured → warn
+    #[test]
+    fn tls_cert_not_configured_warns() {
+        let result = check_tls_cert(None, None, None);
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert_eq!(result.name, CHECK_TLS_CERT);
+        assert!(result.message.contains("No TLS certificate configured"));
+    }
+
+    // T-DPI006-2: Cert file missing → fail
+    #[test]
+    fn tls_cert_file_missing_fails() {
+        let result = check_tls_cert(Some("/nonexistent/cert.pem"), Some("/nonexistent/key.pem"), None);
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.message.contains("not found"));
+    }
+
+    // T-DPI006-3: Cert file exists but key missing → fail
+    #[test]
+    fn tls_cert_key_missing_fails() {
+        let dir = std::env::temp_dir().join("prrr-diag-test-tls-no-key");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let cert_file = dir.join("cert.pem");
+        std::fs::write(&cert_file, "dummy cert content").expect("write cert");
+
+        let result = check_tls_cert(Some(cert_file.to_str().unwrap()), None, None);
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.message.contains("tls_key is missing"));
+
+        std::fs::remove_file(&cert_file).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    // T-DPI006-4: Cert file exists but key file missing on disk → fail
+    #[test]
+    fn tls_cert_key_file_missing_fails() {
+        let dir = std::env::temp_dir().join("prrr-diag-test-tls-key-missing");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let cert_file = dir.join("cert.pem");
+        std::fs::write(&cert_file, "dummy cert content").expect("write cert");
+
+        let result = check_tls_cert(Some(cert_file.to_str().unwrap()), Some("/nonexistent/key.pem"), None);
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.message.contains("key file not found"));
+
+        std::fs::remove_file(&cert_file).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    // T-DPI006-5: Valid cert + key → pass
+    #[test]
+    fn tls_cert_valid_passes() {
+        let dir = std::env::temp_dir().join("prrr-diag-test-tls-valid");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let (cert_path, key_path) = write_test_pem(&dir, &["vpn.example.com"]);
+
+        let result = check_tls_cert(Some(&cert_path), Some(&key_path), Some("vpn.example.com"));
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert_eq!(result.name, CHECK_TLS_CERT);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // T-DPI006-6: Expired cert → fail
+    #[test]
+    fn tls_cert_expired_fails() {
+        let dir = std::env::temp_dir().join("prrr-diag-test-tls-expired");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let (cert_path, key_path) = write_expired_pem(&dir, &["vpn.example.com"]);
+
+        let result = check_tls_cert(Some(&cert_path), Some(&key_path), None);
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.message.contains("expired"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // T-DPI006-7: Cert expiring within 30 days → warn
+    #[test]
+    fn tls_cert_expiring_soon_warns() {
+        let dir = std::env::temp_dir().join("prrr-diag-test-tls-expiring");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let (cert_path, key_path) = write_custom_expiry_pem(&dir, &["vpn.example.com"], (2026, 3, 1));
+
+        let result = check_tls_cert(Some(&cert_path), Some(&key_path), None);
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert!(result.message.contains("expires within"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // T-DPI006-8: SAN mismatch → warn
+    #[test]
+    fn tls_cert_san_mismatch_warns() {
+        let dir = std::env::temp_dir().join("prrr-diag-test-tls-san-mismatch");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let (cert_path, key_path) = write_test_pem(&dir, &["other.example.com"]);
+
+        let result = check_tls_cert(Some(&cert_path), Some(&key_path), Some("vpn.example.com"));
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert!(result.message.contains("not found in certificate SANs"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // T-DPI006-9: Valid cert without server_name check → pass
+    #[test]
+    fn tls_cert_no_server_name_passes() {
+        let dir = std::env::temp_dir().join("prrr-diag-test-tls-no-sn");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let (cert_path, key_path) = write_test_pem(&dir, &["vpn.example.com"]);
+
+        let result = check_tls_cert(Some(&cert_path), Some(&key_path), None);
+        assert_eq!(result.status, CheckStatus::Pass);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // MTU configuration checks
+    // -----------------------------------------------------------------------
+
+    // MTU not configured (None) → pass (uses safe default)
+    #[test]
+    fn mtu_config_none_passes() {
+        let result = check_mtu_config(None);
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert_eq!(result.name, CHECK_MTU_CONFIG);
+    }
+
+    // MTU set to default 1280 → pass
+    #[test]
+    fn mtu_config_default_passes() {
+        let result = check_mtu_config(Some(crate::tunnel::tun_device::DEFAULT_TUNNEL_MTU));
+        assert_eq!(result.status, CheckStatus::Pass);
+    }
+
+    // MTU below default → pass
+    #[test]
+    fn mtu_config_below_default_passes() {
+        let result = check_mtu_config(Some(1200));
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert!(result.message.contains("1200"));
+    }
+
+    // MTU above default (e.g. 1420) → warn
+    #[test]
+    fn mtu_config_above_default_warns() {
+        let result = check_mtu_config(Some(1420));
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert_eq!(result.name, CHECK_MTU_CONFIG);
+        assert!(result.message.contains("1420"));
+        assert!(result.message.contains("exceeds safe default"));
+    }
+
+    // Client doctor with high MTU produces recommendation
+    #[test]
+    fn client_doctor_high_mtu_recommends_lower() {
+        let config = ClientConfigFile {
+            interface: Some(crate::config::InterfaceSection {
+                mtu: Some(1420),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let report = run_client_doctor(&config);
+        let mtu_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == CHECK_MTU_CONFIG)
+            .expect("MTU check present");
+        assert_eq!(mtu_check.status, CheckStatus::Warn);
+        assert!(report.recommendations.iter().any(|r| r.contains("mtu") || r.contains("MTU")));
     }
 }

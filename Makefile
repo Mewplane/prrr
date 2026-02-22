@@ -28,6 +28,9 @@ help:
 	@echo "  clean            - Clean build artifacts"
 	@echo "  bench            - Run benchmarks"
 	@echo "  shellcheck       - Lint installation scripts"
+	@echo "  android-debug    - Build Android debug APK"
+	@echo "  android-release  - Build Android release AAB and APK"
+	@echo "  android-test     - Run Android unit tests"
 	@echo "  docker-build     - Build Docker image"
 	@echo "  docker-test      - Build and run tests in Docker"
 
@@ -83,6 +86,34 @@ shellcheck:
 	@echo "Running shellcheck on installation scripts..."
 	shellcheck scripts/install-server.sh scripts/install-client.sh
 	@echo "Shellcheck passed"
+
+# =============================================================================
+# Android targets (Feature 3.7)
+# =============================================================================
+
+ANDROID_DIR ?= prrr-android
+
+## android-debug: Build Android debug APK
+.PHONY: android-debug
+android-debug:
+	@echo "Building Android debug APK..."
+	cd $(ANDROID_DIR) && ./gradlew assembleDebug
+	@echo "Debug APK: $(ANDROID_DIR)/app/build/outputs/apk/debug/app-debug.apk"
+
+## android-release: Build Android release AAB and APK
+.PHONY: android-release
+android-release:
+	@echo "Building Android release AAB..."
+	cd $(ANDROID_DIR) && ./gradlew bundleRelease assembleRelease
+	@echo "Release AAB: $(ANDROID_DIR)/app/build/outputs/bundle/release/app-release.aab"
+	@echo "Release APK: $(ANDROID_DIR)/app/build/outputs/apk/release/app-release.apk"
+
+## android-test: Run Android unit tests
+.PHONY: android-test
+android-test:
+	@echo "Running Android unit tests..."
+	cd $(ANDROID_DIR) && ./gradlew testDebugUnitTest
+	@echo "Android tests complete"
 
 # =============================================================================
 # Docker targets
