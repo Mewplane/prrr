@@ -65,13 +65,15 @@ fn build_server_config(
     Ok(quinn::ServerConfig::with_crypto(Arc::new(quic_server_config)))
 }
 
-/// Build a quinn `ClientConfig` that skips server certificate verification.
+/// Build a quinn `ClientConfig` with configurable certificate verification.
 ///
-/// This is intentionally insecure and only for dev/test with self-signed certs.
-fn build_insecure_client_config() -> Result<quinn::ClientConfig, TransportError> {
+/// When `insecure` is `true`, skips certificate verification (dev/test).
+/// When `insecure` is `false`, verifies against the Mozilla CA root store.
+fn build_client_config(insecure: bool) -> Result<quinn::ClientConfig, TransportError> {
+    let verifier = super::tls::build_cert_verifier(insecure);
     let mut tls_config = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+        .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
 
     tls_config.alpn_protocols = vec![b"prrr".to_vec()];
@@ -79,49 +81,6 @@ fn build_insecure_client_config() -> Result<quinn::ClientConfig, TransportError>
     let quic_client_config = QuicClientConfig::try_from(tls_config).map_err(|e| TransportError::TlsConfig(e.to_string()))?;
 
     Ok(quinn::ClientConfig::new(Arc::new(quic_client_config)))
-}
-
-/// A TLS certificate verifier that accepts any server certificate.
-///
-/// Only for dev/test with self-signed certificates.
-#[derive(Debug)]
-struct SkipServerVerification;
-
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
 }
 
 /// QUIC server that listens for incoming connections.
@@ -184,7 +143,7 @@ impl QuicClient {
     /// Uses an insecure TLS config that skips server certificate verification
     /// (suitable for dev/test with self-signed certs).
     pub fn new_insecure() -> Result<Self, TransportError> {
-        let client_config = build_insecure_client_config()?;
+        let client_config = build_client_config(true)?;
 
         let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().expect("valid socket addr"))
             .map_err(|e| TransportError::BindFailed(e.to_string()))?;

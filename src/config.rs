@@ -27,8 +27,12 @@ pub const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:443";
 /// Default log level when none is specified.
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 
-/// Default TLS server name for SNI.
-pub const DEFAULT_SERVER_NAME: &str = "www.google.com";
+/// Default TLS server name for the server (used for self-signed cert generation in dev/test).
+pub const DEFAULT_SERVER_SERVER_NAME: &str = "localhost";
+
+/// Error message when client `server_name` is not configured.
+pub const ERR_MISSING_SERVER_NAME: &str =
+    "server_name is required. Set --server-name on the CLI or [server].server_name in the config file.";
 
 /// Default maximum number of concurrent VPN clients.
 pub const DEFAULT_MAX_CLIENTS: u32 = 100;
@@ -143,7 +147,7 @@ pub struct ServerArgs {
     pub config: Option<PathBuf>,
 
     /// TLS server name (SNI).
-    #[arg(long, default_value = DEFAULT_SERVER_NAME)]
+    #[arg(long, default_value = DEFAULT_SERVER_SERVER_NAME)]
     pub server_name: String,
 
     /// Server management subcommand.
@@ -215,9 +219,9 @@ pub struct ClientArgs {
     #[arg(long)]
     pub config: Option<PathBuf>,
 
-    /// TLS server name (SNI).
-    #[arg(long, default_value = DEFAULT_SERVER_NAME)]
-    pub server_name: String,
+    /// TLS server name (SNI) — required for production use.
+    #[arg(long)]
+    pub server_name: Option<String>,
 
     /// Server Noise IK public key (base64-encoded, 32 bytes decoded).
     #[arg(long)]
@@ -226,6 +230,10 @@ pub struct ClientArgs {
     /// Server ML-KEM-768 public key (base64-encoded, 1184 bytes decoded).
     #[arg(long)]
     pub server_pq_public_key: Option<String>,
+
+    /// Skip TLS certificate verification (insecure, dev/test only).
+    #[arg(long, default_value_t = false)]
+    pub insecure: bool,
 
     /// Client management subcommand.
     #[command(subcommand)]
@@ -321,6 +329,10 @@ pub struct TransportSection {
     pub max_idle_timeout: Option<u64>,
     /// Keep-alive interval in seconds.
     pub keep_alive: Option<u64>,
+    /// Path to TLS certificate file (PEM) for CA-signed cert.
+    pub tls_cert: Option<String>,
+    /// Path to TLS private key file (PEM).
+    pub tls_key: Option<String>,
 }
 
 /// `[obfuscation]` section — traffic shaping and anti-censorship.
@@ -478,6 +490,8 @@ pub struct ClientTransportSection {
     pub protocol: Option<String>,
     /// Keep-alive interval in seconds.
     pub keep_alive: Option<u64>,
+    /// Skip TLS certificate verification (insecure, dev/test only).
+    pub insecure_skip_verify: Option<bool>,
 }
 
 /// `[obfuscation]` section in client config.
@@ -642,7 +656,7 @@ mod tests {
             Command::Server(args) => {
                 assert_eq!(args.listen, DEFAULT_LISTEN_ADDR.parse::<SocketAddr>().expect("valid addr"));
                 assert_eq!(args.log_level, DEFAULT_LOG_LEVEL);
-                assert_eq!(args.server_name, DEFAULT_SERVER_NAME);
+                assert_eq!(args.server_name, DEFAULT_SERVER_SERVER_NAME);
                 assert!(args.config.is_none());
                 assert!(args.subcommand.is_none(), "no subcommand = start server");
             }
@@ -659,7 +673,7 @@ mod tests {
                 let expected_addr: SocketAddr = "10.0.0.1:443".parse().expect("valid addr");
                 assert_eq!(args.server, Some(expected_addr));
                 assert_eq!(args.log_level, DEFAULT_LOG_LEVEL);
-                assert_eq!(args.server_name, DEFAULT_SERVER_NAME);
+                assert!(args.server_name.is_none());
                 assert!(args.config.is_none());
                 assert!(args.server_public_key.is_none());
                 assert!(args.server_pq_public_key.is_none());
@@ -703,6 +717,91 @@ mod tests {
                 assert!(args.subcommand.is_none());
             }
             Command::Server(_) => panic!("expected Client command"),
+        }
+    }
+
+    // T-DPI003-1: Client --insecure flag defaults to false
+    #[test]
+    fn cli_client_insecure_defaults_false() {
+        let cli = Cli::parse_from(["prrr", "client"]);
+        match cli.command {
+            Command::Client(args) => {
+                assert!(!args.insecure, "--insecure should default to false");
+            }
+            Command::Server(_) => panic!("expected Client command"),
+        }
+    }
+
+    // T-DPI003-2: Client --insecure flag parses when present
+    #[test]
+    fn cli_client_insecure_flag() {
+        let cli = Cli::parse_from(["prrr", "client", "--insecure"]);
+        match cli.command {
+            Command::Client(args) => {
+                assert!(args.insecure, "--insecure should be true when passed");
+            }
+            Command::Server(_) => panic!("expected Client command"),
+        }
+    }
+
+    // T-DPI003-3: Client transport config parses insecure_skip_verify
+    #[test]
+    fn client_transport_insecure_skip_verify() {
+        let toml_str = r#"
+[transport]
+protocol = "masque"
+insecure_skip_verify = true
+"#;
+        let config: ClientConfigFile = toml::from_str(toml_str).expect("parse client transport");
+        let transport = config.transport.expect("transport section present");
+        assert_eq!(transport.insecure_skip_verify, Some(true));
+    }
+
+    // T-DPI003-4: Client transport config without insecure_skip_verify defaults to None
+    #[test]
+    fn client_transport_insecure_skip_verify_absent() {
+        let toml_str = r#"
+[transport]
+protocol = "masque"
+"#;
+        let config: ClientConfigFile = toml::from_str(toml_str).expect("parse client transport");
+        let transport = config.transport.expect("transport section present");
+        assert!(transport.insecure_skip_verify.is_none());
+    }
+
+    // T-DPI005-1: Client --server-name is None when not provided
+    #[test]
+    fn cli_client_server_name_defaults_none() {
+        let cli = Cli::parse_from(["prrr", "client"]);
+        match cli.command {
+            Command::Client(args) => {
+                assert!(args.server_name.is_none(), "server_name should be None when not provided");
+            }
+            Command::Server(_) => panic!("expected Client command"),
+        }
+    }
+
+    // T-DPI005-2: Client --server-name parses when provided
+    #[test]
+    fn cli_client_server_name_provided() {
+        let cli = Cli::parse_from(["prrr", "client", "--server-name", "vpn.example.com"]);
+        match cli.command {
+            Command::Client(args) => {
+                assert_eq!(args.server_name.as_deref(), Some("vpn.example.com"));
+            }
+            Command::Server(_) => panic!("expected Client command"),
+        }
+    }
+
+    // T-DPI005-3: Server --server-name defaults to localhost
+    #[test]
+    fn cli_server_name_defaults_localhost() {
+        let cli = Cli::parse_from(["prrr", "server"]);
+        match cli.command {
+            Command::Server(args) => {
+                assert_eq!(args.server_name, "localhost");
+            }
+            Command::Client(_) => panic!("expected Server command"),
         }
     }
 
@@ -917,6 +1016,8 @@ rekey_interval = 3600
 protocol = "masque"
 max_idle_timeout = 300
 keep_alive = 25
+tls_cert = "/etc/prrr/tls/fullchain.pem"
+tls_key = "/etc/prrr/tls/privkey.pem"
 
 [obfuscation]
 enabled = true
@@ -958,7 +1059,7 @@ log_retention_days = 7
         assert_eq!(srv.max_clients, Some(DEFAULT_MAX_CLIENTS));
         assert_eq!(srv.log_level.as_deref(), Some(DEFAULT_LOG_LEVEL));
         assert_eq!(srv.data_dir.as_deref(), Some(DEFAULT_DATA_DIR));
-        assert_eq!(srv.server_name.as_deref(), Some(DEFAULT_SERVER_NAME));
+        assert_eq!(srv.server_name.as_deref(), Some("www.google.com"));
 
         let net = config.network.expect("network section");
         assert_eq!(net.subnet.as_deref(), Some(DEFAULT_SUBNET));
@@ -977,6 +1078,8 @@ log_retention_days = 7
         assert_eq!(transport.protocol.as_deref(), Some(DEFAULT_TRANSPORT_PROTOCOL));
         assert_eq!(transport.max_idle_timeout, Some(DEFAULT_MAX_IDLE_TIMEOUT));
         assert_eq!(transport.keep_alive, Some(DEFAULT_KEEP_ALIVE));
+        assert_eq!(transport.tls_cert.as_deref(), Some("/etc/prrr/tls/fullchain.pem"));
+        assert_eq!(transport.tls_key.as_deref(), Some("/etc/prrr/tls/privkey.pem"));
 
         let obfs = config.obfuscation.expect("obfuscation section");
         assert_eq!(obfs.enabled, Some(true));
@@ -1030,6 +1133,35 @@ max_clients = 50
         assert!(config.web_admin.is_none());
         assert!(config.messaging.is_none());
         assert!(config.monitoring.is_none());
+    }
+
+    // AC-DPI002: Transport section without TLS fields parses to None
+    #[test]
+    fn transport_without_tls_fields_parses_to_none() {
+        let toml_str = r#"
+[transport]
+protocol = "masque"
+max_idle_timeout = 300
+keep_alive = 25
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).expect("parse transport without tls");
+        let transport = config.transport.expect("transport section present");
+        assert_eq!(transport.protocol.as_deref(), Some("masque"));
+        assert!(transport.tls_cert.is_none());
+        assert!(transport.tls_key.is_none());
+    }
+
+    // AC-DPI002b: Transport section with only tls_cert parses correctly
+    #[test]
+    fn transport_with_tls_cert_only() {
+        let toml_str = r#"
+[transport]
+tls_cert = "/etc/prrr/tls/fullchain.pem"
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).expect("parse transport with cert only");
+        let transport = config.transport.expect("transport section present");
+        assert_eq!(transport.tls_cert.as_deref(), Some("/etc/prrr/tls/fullchain.pem"));
+        assert!(transport.tls_key.is_none());
     }
 
     // AC-4: Unknown fields in TOML are silently ignored
@@ -1244,7 +1376,7 @@ x = 1
     fn defaults_match_spec() {
         assert_eq!(DEFAULT_LISTEN_ADDR, "0.0.0.0:443");
         assert_eq!(DEFAULT_LOG_LEVEL, "info");
-        assert_eq!(DEFAULT_SERVER_NAME, "www.google.com");
+        assert_eq!(DEFAULT_SERVER_SERVER_NAME, "localhost");
         assert_eq!(DEFAULT_MAX_CLIENTS, 100);
         assert_eq!(DEFAULT_DATA_DIR, "/var/lib/prrr");
         assert_eq!(DEFAULT_SUBNET, "10.66.66.0/24");

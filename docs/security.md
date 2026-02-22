@@ -97,6 +97,56 @@ cargo bench --bench crypto_benchmarks
 cargo bench -- --quick
 ```
 
+## TLS Certificate Verification
+
+The client supports two certificate verification modes controlled by the
+`--insecure` CLI flag or `insecure_skip_verify` config option:
+
+| Mode | Flag | Behavior |
+|------|------|----------|
+| Production (default) | `--insecure` absent | Verifies server certificate against Mozilla CA root store (`webpki-roots`) |
+| Dev/Test | `--insecure` present | Accepts any certificate (including self-signed) |
+
+When insecure mode is active, a warning is logged at startup:
+`TLS certificate verification disabled (--insecure). Do NOT use in production.`
+
+The verification is implemented in `src/transport/tls.rs::build_cert_verifier(insecure)` and
+used by all three client config builders: `build_masque_client_config`,
+`build_client_config` (QUIC), and `build_mimicked_client_config` (TLS mimicry).
+
+## Server TLS Certificate Loading
+
+The server supports loading CA-signed TLS certificates from PEM files via
+`transport.tls_cert` and `transport.tls_key` config fields. This is critical
+for DPI evasion — self-signed certificates are trivially detectable.
+
+| Config | Behavior |
+|--------|----------|
+| `tls_cert` + `tls_key` set | Loads PEM certificate chain and private key from disk |
+| Either field absent | Falls back to self-signed certificate generation (dev/test only) |
+
+When using self-signed fallback, a warning is logged:
+`no TLS certificate configured, generating self-signed (not recommended for production)`
+
+The loading is implemented in `src/transport/tls.rs::load_pem_cert_and_key()` using
+`rustls-pemfile`. The full certificate chain (including intermediates) is passed to
+the server config builders, which is required for proper chain validation by clients.
+
+## SNI Configuration
+
+The client `--server-name` flag has no default value and must be explicitly set
+via CLI or `[server].server_name` in the config file. This prevents the SNI/IP
+mismatch that occurs when a generic placeholder domain (e.g., `"www.google.com"`)
+is sent in the TLS ClientHello while connecting to a different server IP.
+
+The `prrr client doctor` command checks SNI configuration:
+- Warns if `server_name` is not configured
+- Warns if `server_name` is `"www.google.com"` (legacy dangerous default)
+- Warns if `server_name` doesn't look like a valid domain (no dot or contains whitespace)
+
+The server `--server-name` defaults to `"localhost"` for dev/test self-signed
+certificate generation. In production, set it to the server's actual domain.
+
 ## Dependency Security
 
 - All dependencies are pinned to specific versions in `Cargo.toml`

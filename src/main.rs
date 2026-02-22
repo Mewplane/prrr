@@ -204,11 +204,16 @@ async fn main() -> anyhow::Result<()> {
                 None
             };
 
+            let tls_cert_path = config.transport.as_ref().and_then(|t| t.tls_cert.as_deref());
+            let tls_key_path = config.transport.as_ref().and_then(|t| t.tls_key.as_deref());
+
             let vpn_result = prrr::server::run_multi_server(
                 args.listen,
                 &args.server_name,
                 &noise_keypair,
                 kem_keypair,
+                tls_cert_path,
+                tls_key_path,
                 prrr::server::MultiServerParams {
                     registry,
                     max_clients,
@@ -264,11 +269,19 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
 
-            let server_name = config
-                .server
-                .as_ref()
-                .and_then(|s| s.server_name.as_deref())
-                .unwrap_or(&args.server_name);
+            // Resolve server_name: CLI flag > config > error
+            let server_name = args
+                .server_name
+                .as_deref()
+                .or_else(|| config.server.as_ref().and_then(|s| s.server_name.as_deref()))
+                .ok_or_else(|| anyhow::anyhow!(prrr::config::ERR_MISSING_SERVER_NAME))?;
+
+            // Resolve insecure flag: CLI flag > config > false
+            let insecure = if args.insecure {
+                true
+            } else {
+                config.transport.as_ref().and_then(|t| t.insecure_skip_verify).unwrap_or(false)
+            };
 
             tracing::info!("starting prrr client");
             tracing::debug!(?config, "client config loaded");
@@ -332,6 +345,7 @@ async fn main() -> anyhow::Result<()> {
                 tun,
                 25,
                 300,
+                insecure,
                 cancel,
             )
             .await

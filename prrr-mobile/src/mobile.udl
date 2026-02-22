@@ -1,0 +1,17 @@
+// FRD: specs/frds/FRD-M006-mobile-documentation.md
+// FRD: specs/frds/FRD-M004-connection-state.md
+//
+// NOTE: UniFFI 0.28's UDL parser doesn't support doc comments.
+// All API documentation is in the Rust source files (config.rs, connection.rs, error.rs)
+// and will be propagated to generated bindings automatically via UniFFI derives.
+
+namespace prrr_mobile {};
+
+[Error]
+interface MobileError {
+  InvalidConfig(string reason);
+  ConnectionFailed(string reason);
+  HandshakeFailed(string reason);
+  NetworkError(string reason);
+  NotConnected();
+};

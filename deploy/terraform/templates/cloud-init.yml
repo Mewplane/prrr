@@ -17,7 +17,7 @@ packages:
 
 write_files:
   - path: /tmp/install_prrr.sh
-    permissions: '0755'
+    permissions: "0755"
     content: |
       #!/bin/bash
       set -e
@@ -26,6 +26,8 @@ write_files:
       curl -fsSL https://install.prrr.dev/server | bash -s -- \
         --admin-pass "${admin_password}" \
         --domain "${domain}" \
+        --vpn-port ${vpn_port} \
+        --admin-port ${admin_port} \
         --max-clients ${max_clients} \
         --dns ${dns_servers}
 
