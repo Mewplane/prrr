@@ -1,4 +1,4 @@
-// FRD: specs/frds/FRD-009.md
+// FRD: specs/frds/FRD-009.md, specs/frds/FRD-DPI009.md
 
 //! VPN client orchestrator.
 //!
@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::handshake::hybrid::{HybridInitiator, InitiatorResult};
 use crate::handshake::noise_ik::KeyPair;
+use crate::obfuscation::psk_udp::{ObfuscatedUdpSocket, PSK_NONCE_OVERHEAD};
 use crate::transport::encrypted_channel::{EncryptedChannel, NONCE_COUNTER_LEN};
 use crate::transport::masque::{MasqueClient, build_masque_client_config};
 use crate::tunnel::TunnelError;
@@ -46,6 +47,7 @@ pub async fn run_client<T: TunDevice>(
     keep_alive_interval: u64,
     max_idle_timeout: u64,
     insecure: bool,
+    obfuscation_key: Option<[u8; 32]>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     if insecure {
@@ -55,8 +57,18 @@ pub async fn run_client<T: TunDevice>(
     // Build MASQUE-enabled client config
     let client_config = build_masque_client_config(keep_alive_interval, max_idle_timeout, insecure)?;
 
-    // Create QUIC client endpoint
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse::<SocketAddr>()?)?;
+    // Create QUIC client endpoint, optionally wrapping with PSK obfuscation
+    let mut endpoint = if let Some(key) = obfuscation_key {
+        tracing::info!("PSK UDP obfuscation enabled (nonce overhead: {PSK_NONCE_OVERHEAD} bytes)");
+        let bind_addr: SocketAddr = "0.0.0.0:0".parse()?;
+        let runtime = quinn::default_runtime().ok_or_else(|| anyhow::anyhow!("no async runtime found"))?;
+        let std_socket = std::net::UdpSocket::bind(bind_addr)?;
+        let inner_socket = runtime.wrap_udp_socket(std_socket)?;
+        let obfuscated = ObfuscatedUdpSocket::wrap(inner_socket, key);
+        quinn::Endpoint::new_with_abstract_socket(quinn::EndpointConfig::default(), None, obfuscated, runtime)?
+    } else {
+        quinn::Endpoint::client("0.0.0.0:0".parse::<SocketAddr>()?)?
+    };
     endpoint.set_default_client_config(client_config);
 
     tracing::info!("connecting to {server_addr}");
@@ -71,17 +83,19 @@ pub async fn run_client<T: TunDevice>(
 
     // Check that TUN MTU fits within the QUIC datagram size budget
     let tun_mtu = usize::from(tun.mtu());
+    let psk_overhead = if obfuscation_key.is_some() { PSK_NONCE_OVERHEAD } else { 0 };
+    let total_overhead = TUNNEL_OVERHEAD_BYTES + psk_overhead;
     if let Some(max_dg) = masque_client.max_datagram_size() {
-        let needed = tun_mtu + TUNNEL_OVERHEAD_BYTES;
+        let needed = tun_mtu + total_overhead;
         if needed > max_dg {
             tracing::error!(
                 tun_mtu = tun_mtu,
-                overhead = TUNNEL_OVERHEAD_BYTES,
+                overhead = total_overhead,
                 max_datagram_size = max_dg,
-                "TUN MTU too large: {tun_mtu} + {TUNNEL_OVERHEAD_BYTES} byte overhead = {needed}, \
+                "TUN MTU too large: {tun_mtu} + {total_overhead} byte overhead = {needed}, \
                  but QUIC max datagram is {max_dg}. Large packets will be dropped. \
                  Lower interface.mtu in client config to at most {}.",
-                max_dg.saturating_sub(TUNNEL_OVERHEAD_BYTES)
+                max_dg.saturating_sub(total_overhead)
             );
         }
     }

@@ -361,6 +361,150 @@ if !is_valid {
 - `build_authenticated_request(psk) -> String` — Build authenticated CONNECT-UDP request.
 - `build_decoy_response() -> Vec<u8>` — Build static decoy HTTP response.
 
+### `obfuscation::psk_udp` — PSK UDP Obfuscation (DPI-007/DPI-008)
+
+Per-client pre-shared key (PSK) based UDP packet obfuscation using ChaCha20
+stream cipher. When enabled, each client receives a unique 256-bit key during
+registration. The key is included in exported client configs and used to
+encrypt/decrypt QUIC UDP datagrams at the outermost layer, making traffic
+indistinguishable from random data to DPI systems.
+
+#### Key Management
+
+- **Key generation**: 256-bit (32-byte) cryptographically random key generated
+  via `rand::RngCore` during `prrr server client add`.
+- **Storage**: Keys are stored as `BLOB` in the SQLite client registry
+  (`obfuscation_key` column).
+- **Distribution**: Keys are base64-encoded in the `[obfuscation]` section of
+  exported client TOML configs.
+- **Per-client isolation**: Each client gets a unique key. Compromising one
+  client's key does not affect others.
+
+#### Configuration
+
+Server-side: enable PSK obfuscation in `server.toml`:
+
+```toml
+[obfuscation]
+enabled = true
+psk_obfuscation = true
+```
+
+When `psk_obfuscation = true`, every new client registered via
+`prrr server client add` automatically receives a PSK. The key appears in
+the client's exported config:
+
+```toml
+[obfuscation]
+psk_obfuscation = true
+obfuscation_key = "base64-encoded-256-bit-key"
+```
+
+Clients registered before PSK was enabled have `obfuscation_key = NULL` and
+connect without PSK obfuscation (backward compatible).
+
+#### Wire Format
+
+```text
+[Nonce (8 bytes, random)] [Obfuscated QUIC Payload (N bytes)]
+```
+
+- **Nonce**: 8 bytes of cryptographically random data, zero-padded to 12 bytes
+  for ChaCha20's standard nonce size.
+- **Payload**: ChaCha20 stream cipher applied with the PSK as key. Ciphertext
+  length equals plaintext length (no expansion).
+- **Total overhead**: 8 bytes per packet.
+
+#### Usage
+
+```rust
+use prrr::obfuscation::psk_udp::PskObfuscator;
+
+let key = [0x42u8; 32];
+let obfuscator = PskObfuscator::new(key);
+
+// Obfuscate before sending over the wire
+let plaintext = b"QUIC packet data";
+let packet = obfuscator.obfuscate(plaintext);
+
+// Deobfuscate after receiving from the wire
+let recovered = obfuscator.deobfuscate(&packet).unwrap();
+assert_eq!(recovered, plaintext);
+```
+
+**Types:**
+- `PskObfuscator` — ChaCha20-based UDP packet obfuscator keyed by a 256-bit PSK.
+- `PskError` — Error enum for obfuscation failures (`PacketTooShort`).
+
+**Methods:**
+- `PskObfuscator::new(key: [u8; 32]) -> PskObfuscator` — Create from 256-bit PSK.
+- `PskObfuscator::obfuscate(plaintext) -> Vec<u8>` — Encrypt with random nonce, return `nonce || ciphertext`.
+- `PskObfuscator::deobfuscate(packet) -> Result<Vec<u8>, PskError>` — Decrypt, return plaintext.
+
+#### Integration Point
+
+PSK obfuscation sits at the outermost layer of the protocol stack:
+
+```text
+Application data
+     ↓
+TrafficMorpher: pad payload
+     ↓
+EncryptedChannel: ChaCha20-Poly1305 + replay protection
+     ↓
+PSK UDP Obfuscation: ChaCha20 stream cipher (per-packet)
+     ↓
+QUIC DATAGRAMs / UDP
+```
+
+#### Security Notes
+
+- ChaCha20 is used as a stream cipher without authentication tag. This is
+  intentional — QUIC already provides authenticated encryption via TLS 1.3.
+  The outer layer only needs to randomize the wire format.
+- 8-byte nonces provide a 2^64 space. Birthday collision probability reaches
+  50% at ~2^32 packets (~4 billion) per key, which is acceptable for VPN
+  session lifetimes.
+- A wrong PSK will "decrypt" to garbage, but QUIC will reject the malformed
+  packet at the TLS layer. No distinguishable error is produced.
+
+#### Socket Integration (Client)
+
+When PSK obfuscation is enabled in the client config, `run_client()` wraps the
+QUIC UDP socket with `ObfuscatedUdpSocket` — a transparent wrapper implementing
+quinn's `AsyncUdpSocket` trait:
+
+- **Send path**: `try_send()` obfuscates each datagram (prepending 8-byte nonce)
+  before forwarding to the real socket.
+- **Recv path**: `poll_recv()` deobfuscates each datagram in-place before
+  returning to quinn. Malformed packets (too short) are silently dropped.
+- **GSO/GRO disabled**: Each datagram is individually wrapped/unwrapped.
+- **MTU adjustment**: Effective MTU budget is reduced by 8 bytes when active.
+
+The wrapping is performed via `quinn::Endpoint::new_with_abstract_socket()`,
+ensuring zero changes to quinn's internal QUIC engine logic.
+
+#### Socket Integration (Server)
+
+When PSK obfuscation is enabled in the server config (`psk_obfuscation = true`
+in `[obfuscation]`), `run_multi_server()` wraps the server's QUIC endpoint
+socket with the same `ObfuscatedUdpSocket` wrapper used by the client:
+
+- **Symmetric operation**: The server deobfuscates incoming client packets and
+  obfuscates outgoing packets, using the same ChaCha20 + random nonce scheme.
+- **Single server-wide key**: All clients connected to this server share the
+  same PSK. Per-client key differentiation is not supported at the socket layer.
+- **Key resolution**: The obfuscation key is read from `[obfuscation].obfuscation_key`
+  (base64-encoded, 32 bytes). The shared `resolve_obfuscation_key()` helper in
+  `config.rs` validates the key format.
+- **Error on misconfiguration**: If `psk_obfuscation = true` but no valid key
+  is provided, the server exits with a clear error message at startup.
+- **Backward compatibility**: When `psk_obfuscation = false` or absent, the
+  server creates its endpoint with `quinn::Endpoint::server()` exactly as before.
+
+The wrapping uses `quinn::Endpoint::new_with_abstract_socket()` with
+`Some(server_config)` to bind the QUIC server to the obfuscated socket.
+
 ## Architecture
 
 ### TLS Fingerprint Mimicry Flow
@@ -403,8 +547,31 @@ TLS 1.3 with mimicked fingerprint (F-010)
   └─ Key exchange groups reordered per TlsProfile
   └─ ALPN=h3 (appears as HTTP/3)
      ↓
+PSK UDP Obfuscation (DPI-007): ChaCha20 stream cipher per-packet
+  └─ Per-client 256-bit PSK, randomizes QUIC wire bytes
+  └─ Optional — only active when psk_obfuscation = true
+     ↓
 UDP/IP: standard port 443 traffic
 ```
+
+### Doctor Checks (DPI-011)
+
+Both `prrr server doctor` and `prrr client doctor` validate PSK obfuscation
+configuration consistency:
+
+| Condition | Status | Action |
+|-----------|--------|--------|
+| PSK not configured (disabled, no key) | Pass | No action needed |
+| PSK enabled with valid 32-byte key | Pass | Configuration correct |
+| PSK enabled but key missing | Fail | Set `obfuscation_key` |
+| PSK enabled but key is invalid base64 | Fail | Fix key encoding |
+| PSK enabled but key is wrong length | Fail | Use exactly 32 bytes |
+| Key present but PSK disabled | Warn | Enable PSK or remove unused key |
+
+Server doctor check: `check_server_psk_config()` validates `[obfuscation]`.
+Client doctor check: `check_client_psk_config()` validates `[obfuscation]`.
+
+Both checks produce actionable recommendations when misconfiguration is detected.
 
 ## Security Notes
 

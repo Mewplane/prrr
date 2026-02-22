@@ -60,6 +60,7 @@ Traffic obfuscation settings. Disabled by default.
 | `padding_strategy` | String | `"power-of-two"` | Padding strategy: `power-of-two`, `http-sizes`, `fixed-mtu:<N>`, `none` |
 | `timing_jitter_ms` | u64 | `50` | Maximum random jitter added to packet timing (ms) |
 | `tls_profile` | String | `"chrome"` | TLS fingerprint profile: `chrome`, `firefox`, `default` |
+| `psk_obfuscation` | bool | `false` | Enable per-client PSK UDP obfuscation (ChaCha20) |
 
 ### `[obfuscation.probe_resist]`
 
@@ -176,6 +177,8 @@ Client obfuscation settings.
 | Field | Type | Description |
 |-------|------|-------------|
 | `enabled` | bool | Enable traffic obfuscation |
+| `psk_obfuscation` | bool | PSK UDP obfuscation enabled (set by server) |
+| `obfuscation_key` | String | Base64-encoded 256-bit PSK for ChaCha20 UDP obfuscation |
 
 ### `[messaging]`
 
@@ -238,6 +241,7 @@ enabled = true
 padding_strategy = "power-of-two"
 timing_jitter_ms = 50
 tls_profile = "chrome"
+psk_obfuscation = true
 
 [obfuscation.probe_resist]
 enabled = true

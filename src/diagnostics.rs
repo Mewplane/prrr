@@ -110,6 +110,15 @@ const DANGEROUS_SNI_VALUE: &str = "www.google.com";
 /// Check name: TLS certificate.
 const CHECK_TLS_CERT: &str = "TLS certificate";
 
+/// Check name: server PSK obfuscation configuration.
+const CHECK_SERVER_PSK_CONFIG: &str = "PSK obfuscation (server)";
+
+/// Check name: client PSK obfuscation configuration.
+const CHECK_CLIENT_PSK_CONFIG: &str = "PSK obfuscation (client)";
+
+/// Expected PSK key length in bytes after base64 decode.
+const PSK_EXPECTED_KEY_LEN: usize = 32;
+
 /// Number of days before cert expiry to warn.
 const CERT_EXPIRY_WARN_DAYS: i64 = 30;
 
@@ -257,6 +266,9 @@ pub fn run_server_doctor(config: &ServerConfig, listen_addr: SocketAddr) -> Diag
     let server_name = config.server.as_ref().and_then(|s| s.server_name.as_deref());
     checks.push(check_tls_cert(tls_cert, tls_key, server_name));
 
+    // 8. PSK obfuscation configuration
+    checks.push(check_server_psk_config(config.obfuscation.as_ref()));
+
     // Build recommendations from check results
     for check in &checks {
         match check.status {
@@ -284,6 +296,14 @@ pub fn run_server_doctor(config: &ServerConfig, listen_addr: SocketAddr) -> Diag
                 recommendations.push(
                     "Configure TLS certificate for production: set transport.tls_cert and transport.tls_key in server config".to_string(),
                 );
+            }
+            CheckStatus::Fail if check.name == CHECK_SERVER_PSK_CONFIG => {
+                recommendations.push(
+                    "Set [obfuscation].obfuscation_key to a valid base64-encoded 32-byte key when psk_obfuscation is enabled".to_string(),
+                );
+            }
+            CheckStatus::Warn if check.name == CHECK_SERVER_PSK_CONFIG => {
+                recommendations.push("Either enable psk_obfuscation or remove the unused obfuscation_key from [obfuscation]".to_string());
             }
             _ => {}
         }
@@ -623,6 +643,9 @@ pub fn run_client_doctor(config: &ClientConfigFile) -> DiagnosticReport {
     let configured_mtu = config.interface.as_ref().and_then(|i| i.mtu);
     checks.push(check_mtu_config(configured_mtu));
 
+    // 6. PSK obfuscation configuration
+    checks.push(check_client_psk_config(config.obfuscation.as_ref()));
+
     // Build recommendations
     for check in &checks {
         match check.status {
@@ -646,6 +669,14 @@ pub fn run_client_doctor(config: &ClientConfigFile) -> DiagnosticReport {
                     "Lower [interface].mtu to {} (default) to avoid QUIC datagram drops",
                     crate::tunnel::tun_device::DEFAULT_TUNNEL_MTU
                 ));
+            }
+            CheckStatus::Fail if check.name == CHECK_CLIENT_PSK_CONFIG => {
+                recommendations.push(
+                    "Set [obfuscation].obfuscation_key to a valid base64-encoded 32-byte key when psk_obfuscation is enabled".to_string(),
+                );
+            }
+            CheckStatus::Warn if check.name == CHECK_CLIENT_PSK_CONFIG => {
+                recommendations.push("Either enable psk_obfuscation or remove the unused obfuscation_key from [obfuscation]".to_string());
             }
             _ => {}
         }
@@ -1016,6 +1047,96 @@ fn check_server_reachable_inner(endpoint: &str) -> CheckResult {
 }
 
 // ---------------------------------------------------------------------------
+// PSK obfuscation doctor checks (DPI-011)
+// FRD: specs/frds/FRD-DPI011.md
+// ---------------------------------------------------------------------------
+
+/// Validate server PSK obfuscation configuration.
+///
+/// Checks the `[obfuscation]` section for consistent PSK settings:
+/// enabled flag must match presence of a valid key.
+pub fn check_server_psk_config(obfuscation: Option<&crate::config::ObfuscationSection>) -> CheckResult {
+    check_psk_config_inner(
+        CHECK_SERVER_PSK_CONFIG,
+        obfuscation.and_then(|o| o.psk_obfuscation).unwrap_or(false),
+        obfuscation.and_then(|o| o.obfuscation_key.as_deref()),
+    )
+}
+
+/// Validate client PSK obfuscation configuration.
+///
+/// Checks the `[obfuscation]` section for consistent PSK settings:
+/// enabled flag must match presence of a valid key.
+pub fn check_client_psk_config(obfuscation: Option<&crate::config::ClientObfuscationSection>) -> CheckResult {
+    check_psk_config_inner(
+        CHECK_CLIENT_PSK_CONFIG,
+        obfuscation.and_then(|o| o.psk_obfuscation).unwrap_or(false),
+        obfuscation.and_then(|o| o.obfuscation_key.as_deref()),
+    )
+}
+
+/// Shared PSK config validation logic for both server and client.
+fn check_psk_config_inner(check_name: &'static str, psk_enabled: bool, key_b64: Option<&str>) -> CheckResult {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+
+    if !psk_enabled {
+        return match key_b64 {
+            Some(_) => CheckResult {
+                name: check_name,
+                status: CheckStatus::Warn,
+                message: "obfuscation_key is set but psk_obfuscation is not enabled (unused key)".to_string(),
+            },
+            None => CheckResult {
+                name: check_name,
+                status: CheckStatus::Pass,
+                message: "PSK obfuscation not configured".to_string(),
+            },
+        };
+    }
+
+    // psk_enabled = true from here
+    let b64 = match key_b64 {
+        Some(k) => k,
+        None => {
+            return CheckResult {
+                name: check_name,
+                status: CheckStatus::Fail,
+                message: "PSK obfuscation enabled but obfuscation_key is missing".to_string(),
+            };
+        }
+    };
+
+    let bytes = match BASE64_STANDARD.decode(b64) {
+        Ok(b) => b,
+        Err(e) => {
+            return CheckResult {
+                name: check_name,
+                status: CheckStatus::Fail,
+                message: format!("PSK obfuscation enabled but obfuscation_key is not valid base64: {e}"),
+            };
+        }
+    };
+
+    if bytes.len() != PSK_EXPECTED_KEY_LEN {
+        return CheckResult {
+            name: check_name,
+            status: CheckStatus::Fail,
+            message: format!(
+                "PSK obfuscation key must be exactly {PSK_EXPECTED_KEY_LEN} bytes, got {}",
+                bytes.len()
+            ),
+        };
+    }
+
+    CheckResult {
+        name: check_name,
+        status: CheckStatus::Pass,
+        message: format!("PSK obfuscation configured (key: {PSK_EXPECTED_KEY_LEN} bytes)"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1382,7 +1503,7 @@ mod tests {
         {
             let mut registry = crate::registry::ClientRegistry::open(subnet, &db_path).expect("open registry");
             let kp = crate::handshake::noise_ik::KeyPair::generate().expect("keypair");
-            registry.add("stale-client", *kp.public_key(), None).expect("add client");
+            registry.add("stale-client", *kp.public_key(), None, None).expect("add client");
             // Client has last_seen = None → considered stale
         }
 
@@ -1406,7 +1527,7 @@ mod tests {
         {
             let mut registry = crate::registry::ClientRegistry::open(subnet, &db_path).expect("open registry");
             let kp = crate::handshake::noise_ik::KeyPair::generate().expect("keypair");
-            let record = registry.add("active-client", *kp.public_key(), None).expect("add client");
+            let record = registry.add("active-client", *kp.public_key(), None, None).expect("add client");
             // Update last_seen to now
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1593,8 +1714,8 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
         let report = run_server_doctor(&config, addr);
 
-        // Should have 7 checks (config, keys, port, disk, memory, stale clients, TLS cert)
-        assert_eq!(report.checks.len(), 7);
+        // Should have 8 checks (config, keys, port, disk, memory, stale clients, TLS cert, PSK)
+        assert_eq!(report.checks.len(), 8);
         assert_eq!(report.checks[0].name, CHECK_CONFIG_VALID);
         assert_eq!(report.checks[1].name, CHECK_KEYS_PRESENT);
         assert_eq!(report.checks[2].name, CHECK_PORT_AVAILABLE);
@@ -1602,6 +1723,7 @@ mod tests {
         assert_eq!(report.checks[4].name, CHECK_MEMORY);
         assert_eq!(report.checks[5].name, CHECK_STALE_CLIENTS);
         assert_eq!(report.checks[6].name, CHECK_TLS_CERT);
+        assert_eq!(report.checks[7].name, CHECK_SERVER_PSK_CONFIG);
     }
 
     // -----------------------------------------------------------------------
@@ -1613,16 +1735,17 @@ mod tests {
         let config = ClientConfigFile::default();
         let report = run_client_doctor(&config);
 
-        // Should have 4 checks (keys + config + SNI + MTU; no server reachable since no endpoint)
-        assert_eq!(report.checks.len(), 4);
+        // Should have 5 checks (keys + config + SNI + MTU + PSK; no server reachable since no endpoint)
+        assert_eq!(report.checks.len(), 5);
         assert_eq!(report.checks[0].name, CHECK_CLIENT_KEYS);
         assert_eq!(report.checks[1].name, CHECK_CLIENT_CONFIG);
         assert_eq!(report.checks[2].name, CHECK_SNI_CONFIG);
         assert_eq!(report.checks[3].name, CHECK_MTU_CONFIG);
+        assert_eq!(report.checks[4].name, CHECK_CLIENT_PSK_CONFIG);
     }
 
     #[test]
-    fn run_client_doctor_with_endpoint_has_five_checks() {
+    fn run_client_doctor_with_endpoint_has_six_checks() {
         let config = ClientConfigFile {
             server: Some(crate::config::ClientServerSection {
                 endpoint: Some("127.0.0.1:443".to_string()),
@@ -1632,11 +1755,12 @@ mod tests {
         };
         let report = run_client_doctor(&config);
 
-        // Should have 5 checks (keys + config + server reachable + SNI + MTU)
-        assert_eq!(report.checks.len(), 5);
+        // Should have 6 checks (keys + config + server reachable + SNI + MTU + PSK)
+        assert_eq!(report.checks.len(), 6);
         assert_eq!(report.checks[2].name, CHECK_SERVER_REACHABLE);
         assert_eq!(report.checks[3].name, CHECK_SNI_CONFIG);
         assert_eq!(report.checks[4].name, CHECK_MTU_CONFIG);
+        assert_eq!(report.checks[5].name, CHECK_CLIENT_PSK_CONFIG);
     }
 
     // -----------------------------------------------------------------------
@@ -1941,5 +2065,210 @@ mod tests {
             .expect("MTU check present");
         assert_eq!(mtu_check.status, CheckStatus::Warn);
         assert!(report.recommendations.iter().any(|r| r.contains("mtu") || r.contains("MTU")));
+    }
+
+    // -----------------------------------------------------------------------
+    // PSK obfuscation doctor checks (DPI-011)
+    // -----------------------------------------------------------------------
+
+    // FRD: specs/frds/FRD-DPI011.md
+
+    /// Valid base64-encoded 32-byte PSK key for tests.
+    const TEST_PSK_KEY_B64: &str = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVoxMjM0NTY=";
+
+    /// Base64-encoded 16-byte key (wrong length) for tests.
+    const TEST_PSK_SHORT_KEY_B64: &str = "QUJDREVGR0hJSktMTU5PUA==";
+
+    // T-DPI011-1: Server PSK disabled, no key → Pass
+    #[test]
+    fn server_psk_not_configured_passes() {
+        let result = check_server_psk_config(None);
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert_eq!(result.name, CHECK_SERVER_PSK_CONFIG);
+        assert!(result.message.contains("not configured"));
+    }
+
+    // T-DPI011-2: Server PSK enabled, valid key → Pass
+    #[test]
+    fn server_psk_valid_key_passes() {
+        let obfs = crate::config::ObfuscationSection {
+            psk_obfuscation: Some(true),
+            obfuscation_key: Some(TEST_PSK_KEY_B64.to_string()),
+            ..Default::default()
+        };
+        let result = check_server_psk_config(Some(&obfs));
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert!(result.message.contains("32 bytes"));
+    }
+
+    // T-DPI011-3: Server PSK enabled, key missing → Fail
+    #[test]
+    fn server_psk_enabled_missing_key_fails() {
+        let obfs = crate::config::ObfuscationSection {
+            psk_obfuscation: Some(true),
+            obfuscation_key: None,
+            ..Default::default()
+        };
+        let result = check_server_psk_config(Some(&obfs));
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.message.contains("missing"));
+    }
+
+    // T-DPI011-4: Server PSK enabled, invalid base64 → Fail
+    #[test]
+    fn server_psk_invalid_base64_fails() {
+        let obfs = crate::config::ObfuscationSection {
+            psk_obfuscation: Some(true),
+            obfuscation_key: Some("!!!not-base64!!!".to_string()),
+            ..Default::default()
+        };
+        let result = check_server_psk_config(Some(&obfs));
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.message.contains("not valid base64"));
+    }
+
+    // T-DPI011-5: Server PSK enabled, wrong key length → Fail
+    #[test]
+    fn server_psk_wrong_key_length_fails() {
+        let obfs = crate::config::ObfuscationSection {
+            psk_obfuscation: Some(true),
+            obfuscation_key: Some(TEST_PSK_SHORT_KEY_B64.to_string()),
+            ..Default::default()
+        };
+        let result = check_server_psk_config(Some(&obfs));
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.message.contains("must be exactly 32 bytes"));
+    }
+
+    // T-DPI011-6: Server PSK disabled, key present → Warn (unused key)
+    #[test]
+    fn server_psk_disabled_with_key_warns() {
+        let obfs = crate::config::ObfuscationSection {
+            psk_obfuscation: Some(false),
+            obfuscation_key: Some(TEST_PSK_KEY_B64.to_string()),
+            ..Default::default()
+        };
+        let result = check_server_psk_config(Some(&obfs));
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert!(result.message.contains("unused key"));
+    }
+
+    // T-DPI011-7: Client PSK disabled, no key → Pass
+    #[test]
+    fn client_psk_not_configured_passes() {
+        let result = check_client_psk_config(None);
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert_eq!(result.name, CHECK_CLIENT_PSK_CONFIG);
+        assert!(result.message.contains("not configured"));
+    }
+
+    // T-DPI011-8: Client PSK enabled, valid key → Pass
+    #[test]
+    fn client_psk_valid_key_passes() {
+        let obfs = crate::config::ClientObfuscationSection {
+            psk_obfuscation: Some(true),
+            obfuscation_key: Some(TEST_PSK_KEY_B64.to_string()),
+            ..Default::default()
+        };
+        let result = check_client_psk_config(Some(&obfs));
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert!(result.message.contains("32 bytes"));
+    }
+
+    // T-DPI011-9: Client PSK enabled, key missing → Fail
+    #[test]
+    fn client_psk_enabled_missing_key_fails() {
+        let obfs = crate::config::ClientObfuscationSection {
+            psk_obfuscation: Some(true),
+            obfuscation_key: None,
+            ..Default::default()
+        };
+        let result = check_client_psk_config(Some(&obfs));
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.message.contains("missing"));
+    }
+
+    // T-DPI011-10: Client PSK enabled, invalid base64 → Fail
+    #[test]
+    fn client_psk_invalid_base64_fails() {
+        let obfs = crate::config::ClientObfuscationSection {
+            psk_obfuscation: Some(true),
+            obfuscation_key: Some("!!!not-base64!!!".to_string()),
+            ..Default::default()
+        };
+        let result = check_client_psk_config(Some(&obfs));
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.message.contains("not valid base64"));
+    }
+
+    // T-DPI011-11: Client PSK enabled, wrong key length → Fail
+    #[test]
+    fn client_psk_wrong_key_length_fails() {
+        let obfs = crate::config::ClientObfuscationSection {
+            psk_obfuscation: Some(true),
+            obfuscation_key: Some(TEST_PSK_SHORT_KEY_B64.to_string()),
+            ..Default::default()
+        };
+        let result = check_client_psk_config(Some(&obfs));
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.message.contains("must be exactly 32 bytes"));
+    }
+
+    // T-DPI011-12: Client PSK disabled, key present → Warn (unused key)
+    #[test]
+    fn client_psk_disabled_with_key_warns() {
+        let obfs = crate::config::ClientObfuscationSection {
+            psk_obfuscation: Some(false),
+            obfuscation_key: Some(TEST_PSK_KEY_B64.to_string()),
+            ..Default::default()
+        };
+        let result = check_client_psk_config(Some(&obfs));
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert!(result.message.contains("unused key"));
+    }
+
+    // T-DPI011-13: Server doctor report includes PSK check (8 checks total)
+    #[test]
+    fn run_server_doctor_includes_psk_check() {
+        let config = ServerConfig::default();
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
+        let report = run_server_doctor(&config, addr);
+
+        assert_eq!(report.checks.len(), 8);
+        assert_eq!(report.checks[7].name, CHECK_SERVER_PSK_CONFIG);
+        assert_eq!(report.checks[7].status, CheckStatus::Pass);
+    }
+
+    // T-DPI011-14: Client doctor report includes PSK check (5 checks, no endpoint)
+    #[test]
+    fn run_client_doctor_includes_psk_check() {
+        let config = ClientConfigFile::default();
+        let report = run_client_doctor(&config);
+
+        assert_eq!(report.checks.len(), 5);
+        assert_eq!(report.checks[4].name, CHECK_CLIENT_PSK_CONFIG);
+        assert_eq!(report.checks[4].status, CheckStatus::Pass);
+    }
+
+    // T-DPI011-15: Server doctor PSK fail produces recommendation
+    #[test]
+    fn server_doctor_psk_fail_produces_recommendation() {
+        let config = ServerConfig {
+            obfuscation: Some(crate::config::ObfuscationSection {
+                psk_obfuscation: Some(true),
+                obfuscation_key: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
+        let report = run_server_doctor(&config, addr);
+        let psk_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == CHECK_SERVER_PSK_CONFIG)
+            .expect("PSK check present");
+        assert_eq!(psk_check.status, CheckStatus::Fail);
+        assert!(report.recommendations.iter().any(|r| r.contains("obfuscation_key")));
     }
 }

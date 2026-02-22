@@ -27,8 +27,8 @@ pub const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:443";
 /// Default log level when none is specified.
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 
-/// Default TLS server name for the server (used for self-signed cert generation in dev/test).
-pub const DEFAULT_SERVER_SERVER_NAME: &str = "localhost";
+/// Default TLS server name for the server (used for self-signed cert generation in dev/test, and to bypass DPI).
+pub const DEFAULT_SERVER_SERVER_NAME: &str = "www.google.com";
 
 /// Error message when client `server_name` is not configured.
 pub const ERR_MISSING_SERVER_NAME: &str =
@@ -348,6 +348,10 @@ pub struct ObfuscationSection {
     pub tls_profile: Option<String>,
     /// Active probing resistance sub-section.
     pub probe_resist: Option<ProbeResistSection>,
+    /// Whether PSK-based UDP obfuscation is enabled (DPI Hardening Phase 2).
+    pub psk_obfuscation: Option<bool>,
+    /// Base64-encoded 256-bit pre-shared key for UDP obfuscation.
+    pub obfuscation_key: Option<String>,
 }
 
 /// `[obfuscation.probe_resist]` section — active probing resistance.
@@ -499,6 +503,10 @@ pub struct ClientTransportSection {
 pub struct ClientObfuscationSection {
     /// Whether obfuscation is enabled.
     pub enabled: Option<bool>,
+    /// Whether PSK-based UDP obfuscation is enabled (DPI Hardening Phase 2).
+    pub psk_obfuscation: Option<bool>,
+    /// Base64-encoded 256-bit pre-shared key for UDP obfuscation.
+    pub obfuscation_key: Option<String>,
 }
 
 /// `[messaging]` section in client config.
@@ -561,6 +569,51 @@ pub fn resolve_server_kem_key(cli_flag: Option<&str>, config_value: Option<&str>
     }
 
     Ok(bytes)
+}
+
+// ---------------------------------------------------------------------------
+// PSK obfuscation key resolution (DPI-007 / DPI-010)
+// ---------------------------------------------------------------------------
+
+/// Expected length of a PSK obfuscation key in bytes (256 bits).
+const PSK_KEY_LEN: usize = 32;
+
+/// Error message when PSK obfuscation is enabled but no key is configured.
+const ERR_MISSING_PSK_KEY: &str = "psk_obfuscation is enabled but obfuscation_key is not set";
+
+/// Error message prefix for invalid base64 in the obfuscation key.
+const ERR_INVALID_PSK_BASE64: &str = "invalid obfuscation_key base64";
+
+/// Error message prefix for wrong PSK key length.
+const ERR_WRONG_PSK_KEY_LEN: &str = "obfuscation_key must be exactly";
+
+/// Resolve a PSK obfuscation key from config fields.
+///
+/// When `psk_enabled` is `true`, decodes the base64 key and validates that it
+/// is exactly 32 bytes. Returns `None` when `psk_enabled` is `false`.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - `psk_enabled` is `true` but `key_b64` is `None`
+/// - The base64 value is invalid
+/// - The decoded key is not exactly 32 bytes
+pub fn resolve_obfuscation_key(psk_enabled: bool, key_b64: Option<&str>) -> anyhow::Result<Option<[u8; PSK_KEY_LEN]>> {
+    if !psk_enabled {
+        return Ok(None);
+    }
+
+    let b64 = key_b64.ok_or_else(|| anyhow::anyhow!(ERR_MISSING_PSK_KEY))?;
+
+    let bytes = BASE64_STANDARD
+        .decode(b64)
+        .map_err(|e| anyhow::anyhow!("{ERR_INVALID_PSK_BASE64}: {e}"))?;
+
+    let key: [u8; PSK_KEY_LEN] = bytes
+        .try_into()
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("{ERR_WRONG_PSK_KEY_LEN} {PSK_KEY_LEN} bytes, got {}", v.len()))?;
+
+    Ok(Some(key))
 }
 
 // ---------------------------------------------------------------------------
@@ -793,13 +846,13 @@ protocol = "masque"
         }
     }
 
-    // T-DPI005-3: Server --server-name defaults to localhost
+    // T-DPI005-3: Server --server-name defaults to www.google.com
     #[test]
     fn cli_server_name_defaults_localhost() {
         let cli = Cli::parse_from(["prrr", "server"]);
         match cli.command {
             Command::Server(args) => {
-                assert_eq!(args.server_name, "localhost");
+                assert_eq!(args.server_name, "www.google.com");
             }
             Command::Client(_) => panic!("expected Server command"),
         }
@@ -1376,7 +1429,7 @@ x = 1
     fn defaults_match_spec() {
         assert_eq!(DEFAULT_LISTEN_ADDR, "0.0.0.0:443");
         assert_eq!(DEFAULT_LOG_LEVEL, "info");
-        assert_eq!(DEFAULT_SERVER_SERVER_NAME, "localhost");
+        assert_eq!(DEFAULT_SERVER_SERVER_NAME, "www.google.com");
         assert_eq!(DEFAULT_MAX_CLIENTS, 100);
         assert_eq!(DEFAULT_DATA_DIR, "/var/lib/prrr");
         assert_eq!(DEFAULT_SUBNET, "10.66.66.0/24");
@@ -1555,5 +1608,158 @@ x = 1
             }
             _ => panic!("expected Client command"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // PSK obfuscation config tests (FRD-DPI007)
+    // -----------------------------------------------------------------------
+
+    // T-1 / AC-1: Server TOML with PSK obfuscation fields parses correctly
+    #[test]
+    fn server_obfuscation_psk_fields_parse() {
+        let toml_str = r#"
+[obfuscation]
+enabled = true
+psk_obfuscation = true
+obfuscation_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).expect("parse server psk obfuscation");
+        let obfs = config.obfuscation.expect("obfuscation section");
+        assert_eq!(obfs.enabled, Some(true));
+        assert_eq!(obfs.psk_obfuscation, Some(true));
+        assert_eq!(
+            obfs.obfuscation_key.as_deref(),
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+        );
+    }
+
+    // T-2 / AC-2: Server TOML without PSK fields still parses (backward compat)
+    #[test]
+    fn server_obfuscation_without_psk_backward_compat() {
+        let toml_str = r#"
+[obfuscation]
+enabled = true
+padding_strategy = "power-of-two"
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).expect("parse without psk");
+        let obfs = config.obfuscation.expect("obfuscation section");
+        assert_eq!(obfs.enabled, Some(true));
+        assert!(obfs.psk_obfuscation.is_none());
+        assert!(obfs.obfuscation_key.is_none());
+    }
+
+    // T-3 / AC-3: Client TOML with PSK obfuscation fields parses correctly
+    #[test]
+    fn client_obfuscation_psk_fields_parse() {
+        let toml_str = r#"
+[obfuscation]
+enabled = true
+psk_obfuscation = true
+obfuscation_key = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+"#;
+        let config: ClientConfigFile = toml::from_str(toml_str).expect("parse client psk obfuscation");
+        let obfs = config.obfuscation.expect("obfuscation section");
+        assert_eq!(obfs.enabled, Some(true));
+        assert_eq!(obfs.psk_obfuscation, Some(true));
+        assert_eq!(
+            obfs.obfuscation_key.as_deref(),
+            Some("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=")
+        );
+    }
+
+    // T-4 / AC-4: Client TOML without PSK fields still parses (backward compat)
+    #[test]
+    fn client_obfuscation_without_psk_backward_compat() {
+        let toml_str = r#"
+[obfuscation]
+enabled = true
+"#;
+        let config: ClientConfigFile = toml::from_str(toml_str).expect("parse without psk");
+        let obfs = config.obfuscation.expect("obfuscation section");
+        assert_eq!(obfs.enabled, Some(true));
+        assert!(obfs.psk_obfuscation.is_none());
+        assert!(obfs.obfuscation_key.is_none());
+    }
+
+    // T-DPI007-1: PSK fields default to None in empty ObfuscationSection
+    #[test]
+    fn obfuscation_section_default_psk_none() {
+        let obfs = ObfuscationSection::default();
+        assert!(obfs.psk_obfuscation.is_none());
+        assert!(obfs.obfuscation_key.is_none());
+    }
+
+    // T-DPI007-2: PSK fields default to None in empty ClientObfuscationSection
+    #[test]
+    fn client_obfuscation_section_default_psk_none() {
+        let obfs = ClientObfuscationSection::default();
+        assert!(obfs.psk_obfuscation.is_none());
+        assert!(obfs.obfuscation_key.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // PSK obfuscation key resolution tests (FRD-DPI010)
+    // -----------------------------------------------------------------------
+
+    // T-DPI010-1: psk_enabled=false returns None regardless of key
+    #[test]
+    fn resolve_obfuscation_key_disabled_returns_none() {
+        let result = resolve_obfuscation_key(false, Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    // T-DPI010-2: psk_enabled=false with no key returns None
+    #[test]
+    fn resolve_obfuscation_key_disabled_no_key_returns_none() {
+        let result = resolve_obfuscation_key(false, None);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    // T-DPI010-3: psk_enabled=true with valid 32-byte base64 key returns Some
+    #[test]
+    fn resolve_obfuscation_key_valid() {
+        // 32 bytes of 0x42 encoded as base64
+        let key_b64 = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=";
+        let result = resolve_obfuscation_key(true, Some(key_b64));
+        let key = result.expect("should succeed").expect("should be Some");
+        assert_eq!(key, [0x42; 32]);
+    }
+
+    // T-DPI010-4: psk_enabled=true but no key returns error
+    #[test]
+    fn resolve_obfuscation_key_enabled_missing_key() {
+        let result = resolve_obfuscation_key(true, None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains(ERR_MISSING_PSK_KEY), "error: {msg}");
+    }
+
+    // T-DPI010-5: psk_enabled=true with invalid base64 returns error
+    #[test]
+    fn resolve_obfuscation_key_invalid_base64() {
+        let result = resolve_obfuscation_key(true, Some("not-valid-base64!!!"));
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains(ERR_INVALID_PSK_BASE64), "error: {msg}");
+    }
+
+    // T-DPI010-6: psk_enabled=true with wrong key length returns error
+    #[test]
+    fn resolve_obfuscation_key_wrong_length() {
+        // 16 bytes (too short) encoded as base64
+        let short_key_b64 = "AAAAAAAAAAAAAAAAAAAAAA==";
+        let result = resolve_obfuscation_key(true, Some(short_key_b64));
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains(ERR_WRONG_PSK_KEY_LEN), "error: {msg}");
+    }
+
+    // T-DPI010-7: psk_enabled=true with empty base64 string returns error
+    #[test]
+    fn resolve_obfuscation_key_empty_string() {
+        let result = resolve_obfuscation_key(true, Some(""));
+        assert!(result.is_err());
     }
 }

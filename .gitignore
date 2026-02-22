@@ -1,7 +1,6 @@
 target
 .claude
 .agents
-specs/
 android-sdk/
 
 # Android build artifacts

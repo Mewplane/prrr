@@ -35,7 +35,7 @@ pub fn handle_server_client_action(
     server_args: &ServerArgs,
 ) -> anyhow::Result<()> {
     match action {
-        ServerClientAction::Add { name } => handle_client_add(registry, name),
+        ServerClientAction::Add { name } => handle_client_add(registry, name, config),
         ServerClientAction::List => handle_client_list(registry),
         ServerClientAction::Remove { name } => handle_client_remove(registry, name),
         ServerClientAction::Export { name, qr, output } => {
@@ -70,20 +70,39 @@ fn build_server_context(config: &ServerConfig, server_args: &ServerArgs) -> anyh
     let port = server_args.listen.port();
     let endpoint = format!("{server_name}:{port}");
 
+    let psk_obfuscation = config.obfuscation.as_ref().and_then(|o| o.psk_obfuscation).unwrap_or(false);
+
     Ok(ServerContext {
         endpoint,
         noise_public_key,
         kem_public_key,
+        psk_obfuscation,
     })
 }
 
+/// Length of a 256-bit PSK obfuscation key in bytes.
+const PSK_OBFUSCATION_KEY_LEN: usize = 32;
+
 /// Register a new VPN client with auto-generated keys.
-fn handle_client_add(registry: &mut ClientRegistry, name: &str) -> anyhow::Result<()> {
+///
+/// When the server config has `psk_obfuscation = true`, generates a
+/// cryptographically random 256-bit obfuscation key for the client.
+fn handle_client_add(registry: &mut ClientRegistry, name: &str, config: &ServerConfig) -> anyhow::Result<()> {
     let keypair = KeyPair::generate()?;
     let public_key = *keypair.public_key();
     let private_key_b64 = BASE64.encode(keypair.private_key_bytes());
 
-    let record = registry.add(name, public_key, None)?;
+    let psk_enabled = config.obfuscation.as_ref().and_then(|o| o.psk_obfuscation).unwrap_or(false);
+
+    let obfuscation_key = if psk_enabled {
+        let mut key = vec![0u8; PSK_OBFUSCATION_KEY_LEN];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key);
+        Some(key)
+    } else {
+        None
+    };
+
+    let record = registry.add(name, public_key, None, obfuscation_key)?;
 
     let public_key_b64 = BASE64.encode(record.public_key);
 
@@ -93,6 +112,9 @@ fn handle_client_add(registry: &mut ClientRegistry, name: &str) -> anyhow::Resul
     println!("  IP Address:  {}", record.ip_address);
     println!("  Public Key:  {public_key_b64}");
     println!("  Private Key: {private_key_b64}");
+    if let Some(ref key) = record.obfuscation_key {
+        println!("  PSK Key:     {}", BASE64.encode(key));
+    }
     println!();
     println!("Save the private key now. It will not be shown again.");
 
@@ -217,6 +239,7 @@ mod tests {
             endpoint: "127.0.0.1:443".to_string(),
             noise_public_key: [0xAA; 32],
             kem_public_key: vec![0xBB; 64],
+            psk_obfuscation: false,
         }
     }
 
@@ -224,7 +247,7 @@ mod tests {
     #[test]
     fn cli_add_creates_client() {
         let mut registry = test_registry();
-        handle_client_add(&mut registry, TEST_CLIENT_NAME).expect("add should succeed");
+        handle_client_add(&mut registry, TEST_CLIENT_NAME, &ServerConfig::default()).expect("add should succeed");
 
         let record = registry.get_by_name(TEST_CLIENT_NAME).expect("client should exist");
         assert_eq!(record.name, TEST_CLIENT_NAME);
@@ -234,8 +257,8 @@ mod tests {
     #[test]
     fn cli_add_duplicate_name_fails() {
         let mut registry = test_registry();
-        handle_client_add(&mut registry, TEST_CLIENT_NAME).expect("first add");
-        let err = handle_client_add(&mut registry, TEST_CLIENT_NAME);
+        handle_client_add(&mut registry, TEST_CLIENT_NAME, &ServerConfig::default()).expect("first add");
+        let err = handle_client_add(&mut registry, TEST_CLIENT_NAME, &ServerConfig::default());
         assert!(err.is_err(), "duplicate name should fail");
     }
 
@@ -243,8 +266,8 @@ mod tests {
     #[test]
     fn cli_list_returns_clients() {
         let mut registry = test_registry();
-        handle_client_add(&mut registry, "alice").expect("add alice");
-        handle_client_add(&mut registry, "bob").expect("add bob");
+        handle_client_add(&mut registry, "alice", &ServerConfig::default()).expect("add alice");
+        handle_client_add(&mut registry, "bob", &ServerConfig::default()).expect("add bob");
 
         // list should succeed (output goes to stdout)
         handle_client_list(&registry).expect("list should succeed");
@@ -262,7 +285,7 @@ mod tests {
     #[test]
     fn cli_remove_revokes_client() {
         let mut registry = test_registry();
-        handle_client_add(&mut registry, TEST_CLIENT_NAME).expect("add");
+        handle_client_add(&mut registry, TEST_CLIENT_NAME, &ServerConfig::default()).expect("add");
         assert_eq!(registry.count(), 1);
 
         handle_client_remove(&mut registry, TEST_CLIENT_NAME).expect("remove should succeed");
@@ -282,7 +305,7 @@ mod tests {
     #[test]
     fn cli_export_produces_toml() {
         let mut registry = test_registry();
-        handle_client_add(&mut registry, TEST_CLIENT_NAME).expect("add");
+        handle_client_add(&mut registry, TEST_CLIENT_NAME, &ServerConfig::default()).expect("add");
         let ctx = test_server_context();
 
         // Export to file
@@ -301,7 +324,7 @@ mod tests {
     #[test]
     fn cli_export_qr_produces_svg() {
         let mut registry = test_registry();
-        handle_client_add(&mut registry, TEST_CLIENT_NAME).expect("add");
+        handle_client_add(&mut registry, TEST_CLIENT_NAME, &ServerConfig::default()).expect("add");
         let ctx = test_server_context();
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -317,7 +340,7 @@ mod tests {
     #[test]
     fn cli_export_writes_to_file() {
         let mut registry = test_registry();
-        handle_client_add(&mut registry, TEST_CLIENT_NAME).expect("add");
+        handle_client_add(&mut registry, TEST_CLIENT_NAME, &ServerConfig::default()).expect("add");
         let ctx = test_server_context();
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -387,5 +410,62 @@ mod tests {
         let output_dir = dir.path().join("config");
         let err = import_config_to(config_path.to_str().expect("path"), &output_dir);
         assert!(err.is_err(), "invalid TOML should fail");
+    }
+
+    // -----------------------------------------------------------------------
+    // PSK obfuscation key generation tests (FRD-DPI007)
+    // -----------------------------------------------------------------------
+
+    /// Build a server config with PSK obfuscation enabled.
+    fn psk_enabled_config() -> ServerConfig {
+        use crate::config::ObfuscationSection;
+        ServerConfig {
+            obfuscation: Some(ObfuscationSection {
+                psk_obfuscation: Some(true),
+                ..ObfuscationSection::default()
+            }),
+            ..ServerConfig::default()
+        }
+    }
+
+    // T-7 / AC-7: Client add with PSK enabled generates 32-byte key
+    #[test]
+    fn cli_add_with_psk_generates_key() {
+        let mut registry = test_registry();
+        let config = psk_enabled_config();
+
+        handle_client_add(&mut registry, TEST_CLIENT_NAME, &config).expect("add with psk");
+
+        let record = registry.get_by_name(TEST_CLIENT_NAME).expect("client exists");
+        let key = record.obfuscation_key.expect("obfuscation key should be present");
+        assert_eq!(key.len(), PSK_OBFUSCATION_KEY_LEN);
+    }
+
+    // T-8 / AC-8: Client add without PSK enabled generates no key
+    #[test]
+    fn cli_add_without_psk_no_key() {
+        let mut registry = test_registry();
+
+        handle_client_add(&mut registry, TEST_CLIENT_NAME, &ServerConfig::default()).expect("add without psk");
+
+        let record = registry.get_by_name(TEST_CLIENT_NAME).expect("client exists");
+        assert!(record.obfuscation_key.is_none());
+    }
+
+    // AC-DPI007: Two clients get different PSK keys (randomness check)
+    #[test]
+    fn cli_add_psk_keys_differ() {
+        let mut registry = test_registry();
+        let config = psk_enabled_config();
+
+        handle_client_add(&mut registry, "alice", &config).expect("add alice");
+        handle_client_add(&mut registry, "bob", &config).expect("add bob");
+
+        let alice = registry.get_by_name("alice").expect("alice");
+        let bob = registry.get_by_name("bob").expect("bob");
+        assert_ne!(
+            alice.obfuscation_key, bob.obfuscation_key,
+            "different clients should get different PSK keys"
+        );
     }
 }

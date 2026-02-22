@@ -93,6 +93,8 @@ pub struct ServerContext {
     pub noise_public_key: [u8; 32],
     /// Server ML-KEM-768 encapsulation key (raw bytes).
     pub kem_public_key: Vec<u8>,
+    /// Whether PSK obfuscation is enabled on the server.
+    pub psk_obfuscation: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +128,15 @@ pub fn generate_client_config(ctx: &ServerContext, record: &ClientRecord) -> Res
     writeln!(config, "address = \"{ip_with_prefix}\"").map_err(|e| DistributionError::Serialization(e.to_string()))?;
     writeln!(config, "dns = [{dns_array}]").map_err(|e| DistributionError::Serialization(e.to_string()))?;
     write!(config, "mtu = {DEFAULT_MTU}").map_err(|e| DistributionError::Serialization(e.to_string()))?;
+
+    if let Some(ref obfs_key) = record.obfuscation_key {
+        let obfs_key_b64 = base64::engine::general_purpose::STANDARD.encode(obfs_key);
+        writeln!(config).map_err(|e| DistributionError::Serialization(e.to_string()))?;
+        writeln!(config).map_err(|e| DistributionError::Serialization(e.to_string()))?;
+        writeln!(config, "[obfuscation]").map_err(|e| DistributionError::Serialization(e.to_string()))?;
+        writeln!(config, "psk_obfuscation = true").map_err(|e| DistributionError::Serialization(e.to_string()))?;
+        write!(config, "obfuscation_key = \"{obfs_key_b64}\"").map_err(|e| DistributionError::Serialization(e.to_string()))?;
+    }
 
     Ok(config)
 }
@@ -301,6 +312,7 @@ mod tests {
             endpoint: TEST_ENDPOINT.to_string(),
             noise_public_key: TEST_NOISE_KEY,
             kem_public_key: vec![0xBB; TEST_KEM_KEY_LEN],
+            psk_obfuscation: false,
         }
     }
 
@@ -316,6 +328,7 @@ mod tests {
             status: ClientStatus::Active,
             bytes_sent: 0,
             bytes_received: 0,
+            obfuscation_key: None,
         }
     }
 
@@ -565,6 +578,82 @@ mod tests {
         assert_eq!(hex, "deadbeef");
     }
 
+    // --- T-9: Config export includes [obfuscation] when PSK key is present ---
+
+    #[test]
+    fn config_export_includes_obfuscation_section_with_psk() {
+        let ctx = ServerContext {
+            endpoint: TEST_ENDPOINT.to_string(),
+            noise_public_key: TEST_NOISE_KEY,
+            kem_public_key: vec![0xBB; TEST_KEM_KEY_LEN],
+            psk_obfuscation: true,
+        };
+        let mut record = test_client_record();
+        record.obfuscation_key = Some(vec![0xDD; 32]);
+
+        let config = generate_client_config(&ctx, &record).expect("generate config");
+        let parsed: toml::Value = toml::from_str(&config).expect("parse TOML");
+
+        let obfs = parsed.get("obfuscation").expect("[obfuscation] section must be present");
+        assert_eq!(
+            obfs.get("psk_obfuscation").and_then(|v| v.as_bool()),
+            Some(true),
+            "psk_obfuscation must be true"
+        );
+
+        let key_b64 = obfs
+            .get("obfuscation_key")
+            .and_then(|v| v.as_str())
+            .expect("obfuscation_key present");
+        let decoded = base64::engine::general_purpose::STANDARD.decode(key_b64).expect("decode key");
+        assert_eq!(decoded, vec![0xDD; 32], "obfuscation key must round-trip");
+    }
+
+    // --- T-10: Config export omits [obfuscation] when no PSK key ---
+
+    #[test]
+    fn config_export_omits_obfuscation_section_without_psk() {
+        let ctx = test_server_context();
+        let record = test_client_record(); // obfuscation_key: None
+
+        let config = generate_client_config(&ctx, &record).expect("generate config");
+        let parsed: toml::Value = toml::from_str(&config).expect("parse TOML");
+
+        assert!(
+            parsed.get("obfuscation").is_none(),
+            "[obfuscation] section must be absent when no PSK key"
+        );
+        assert!(!config.contains("[obfuscation]"), "raw config must not contain [obfuscation]");
+    }
+
+    // --- T-11: QR round-trip with PSK obfuscation key ---
+
+    #[test]
+    fn qr_round_trip_with_psk_obfuscation() {
+        let ctx = ServerContext {
+            endpoint: TEST_ENDPOINT.to_string(),
+            noise_public_key: TEST_NOISE_KEY,
+            kem_public_key: vec![0xBB; TEST_KEM_KEY_LEN],
+            psk_obfuscation: true,
+        };
+        let mut record = test_client_record();
+        record.obfuscation_key = Some(vec![0xEE; 32]);
+
+        let original_config = generate_client_config(&ctx, &record).expect("generate config");
+
+        // Encode the same way QR does
+        let encoded = URL_SAFE_NO_PAD.encode(original_config.as_bytes());
+        let url = format!("{IMPORT_URL_PREFIX}{encoded}");
+
+        // Decode back
+        let decoded = decode_import_url(&url).expect("decode URL");
+        assert_eq!(decoded, original_config, "round-trip decode must preserve obfuscation section");
+
+        // Verify obfuscation section survived
+        let parsed: toml::Value = toml::from_str(&decoded).expect("parse decoded TOML");
+        assert!(parsed.get("obfuscation").is_some(), "obfuscation section must survive round-trip");
+    }
+
     // --- Additional: generate_client_config with real-ish keys ---
 
     #[test]
@@ -573,6 +662,7 @@ mod tests {
             endpoint: TEST_ENDPOINT.to_string(),
             noise_public_key: TEST_NOISE_KEY,
             kem_public_key: vec![0x42; 1184], // ML-KEM-768 encapsulation key size
+            psk_obfuscation: false,
         };
         let record = test_client_record();
         let config = generate_client_config(&ctx, &record).expect("generate config");

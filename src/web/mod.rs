@@ -117,6 +117,7 @@ mod tests {
                 endpoint: "127.0.0.1:443".to_string(),
                 noise_public_key: [0xAA; 32],
                 kem_public_key: vec![0xBB; 64],
+                psk_obfuscation: false,
             }),
             config_tokens: Arc::new(ConfigTokenStore::new()),
             server_config: Arc::new(ServerConfigResponse {

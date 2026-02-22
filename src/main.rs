@@ -113,10 +113,12 @@ async fn main() -> anyhow::Result<()> {
 
             // Build server context for client config distribution (P-009)
             let server_endpoint = format!("{}", args.listen);
+            let psk_obfuscation = config.obfuscation.as_ref().and_then(|o| o.psk_obfuscation).unwrap_or(false);
             let server_context = std::sync::Arc::new(prrr::distribution::ServerContext {
                 endpoint: server_endpoint,
                 noise_public_key: server_noise_pub,
                 kem_public_key: server_kem_pub,
+                psk_obfuscation,
             });
             let config_tokens = std::sync::Arc::new(prrr::distribution::ConfigTokenStore::new());
 
@@ -207,6 +209,12 @@ async fn main() -> anyhow::Result<()> {
             let tls_cert_path = config.transport.as_ref().and_then(|t| t.tls_cert.as_deref());
             let tls_key_path = config.transport.as_ref().and_then(|t| t.tls_key.as_deref());
 
+            // Resolve PSK obfuscation key from server config
+            let server_obfuscation_key = prrr::config::resolve_obfuscation_key(
+                psk_obfuscation,
+                config.obfuscation.as_ref().and_then(|o| o.obfuscation_key.as_deref()),
+            )?;
+
             let vpn_result = prrr::server::run_multi_server(
                 args.listen,
                 &args.server_name,
@@ -214,6 +222,7 @@ async fn main() -> anyhow::Result<()> {
                 kem_keypair,
                 tls_cert_path,
                 tls_key_path,
+                server_obfuscation_key,
                 prrr::server::MultiServerParams {
                     registry,
                     max_clients,
@@ -336,6 +345,13 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("failed to create TUN device (need root/CAP_NET_ADMIN): {e}"))?;
             tracing::info!(name = tun_config.name, address = %tun_address, gateway = %gateway, mtu = tun_mtu, "TUN device created");
 
+            // Resolve PSK obfuscation key from client config
+            let client_psk_enabled = config.obfuscation.as_ref().and_then(|o| o.psk_obfuscation).unwrap_or(false);
+            let obfuscation_key = prrr::config::resolve_obfuscation_key(
+                client_psk_enabled,
+                config.obfuscation.as_ref().and_then(|o| o.obfuscation_key.as_deref()),
+            )?;
+
             prrr::client::run_client(
                 server_addr,
                 server_name,
@@ -346,6 +362,7 @@ async fn main() -> anyhow::Result<()> {
                 25,
                 300,
                 insecure,
+                obfuscation_key,
                 cancel,
             )
             .await

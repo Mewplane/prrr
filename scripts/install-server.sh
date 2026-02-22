@@ -298,38 +298,11 @@ install_deps() {
 
 install_binary() {
     log_step "Installing prrr binary..."
-
-    # Try pre-compiled binary first
-    local download_url="${PRRR_DOWNLOAD_BASE}/${PRRR_VERSION}/${PRRR_BINARY_NAME}-${ARCH}"
-
-    if curl -fsSL "${download_url}" -o "/tmp/${PRRR_BINARY_NAME}" 2>/dev/null; then
-        install -m 755 "/tmp/${PRRR_BINARY_NAME}" "${PRRR_BINARY_PATH}"
-        rm -f "/tmp/${PRRR_BINARY_NAME}"
-        log_info "Binary installed from pre-compiled release: ${PRRR_BINARY_PATH}"
+    if [[ -f "./prrr" ]]; then
+        install -m 755 "./prrr" "${PRRR_BINARY_PATH}"
+        log_info "Binary installed from local file: ${PRRR_BINARY_PATH}"
     else
-        log_warn "Pre-compiled binary not available, building from source..."
-
-        # Ensure Rust toolchain is available
-        if ! command -v cargo &>/dev/null; then
-            log_step "Installing Rust toolchain..."
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-                sh -s -- -y --default-toolchain stable > /dev/null 2>&1
-            # shellcheck source=/dev/null
-            source "${HOME}/.cargo/env"
-        fi
-
-        cargo install prrr --git "${PRRR_GIT_REPO}" 2>/dev/null
-        local cargo_bin
-        cargo_bin="$(command -v prrr 2>/dev/null || echo "${HOME}/.cargo/bin/prrr")"
-        if [[ -f "${cargo_bin}" ]]; then
-            install -m 755 "${cargo_bin}" "${PRRR_BINARY_PATH}"
-        fi
-        log_info "Binary built and installed from source: ${PRRR_BINARY_PATH}"
-    fi
-
-    # Verify installation
-    if [[ ! -x "${PRRR_BINARY_PATH}" ]]; then
-        log_error "Binary installation failed: ${PRRR_BINARY_PATH} not found"
+        log_error "Local ./prrr binary not found! Please build it or provide it. (Skipping curl and cargo install for local deploy)"
     fi
 }
 
@@ -402,8 +375,8 @@ session_timeout = 3600"
 enabled = false"
     fi
 
-    # Use domain for server_name when available, otherwise default to localhost
-    local effective_server_name="localhost"
+    # Use domain for server_name when available, otherwise default to www.google.com to bypass DPI
+    local effective_server_name="www.google.com"
     if [[ -n "${DOMAIN}" ]]; then
         effective_server_name="${DOMAIN}"
     fi
@@ -489,7 +462,7 @@ After=network-online.target nss-lookup.target
 Wants=network-online.target
 
 [Service]
-Type=notify
+Type=simple
 User=root
 Group=root
 ExecStart=${PRRR_BINARY_PATH} server --config ${PRRR_CONFIG_DIR}/server.toml
@@ -541,10 +514,28 @@ configure_firewall_ufw() {
         ufw allow "${WEB_PORT}/tcp" comment "prrr Web Admin" > /dev/null 2>&1
     fi
 
-    # Enable firewall
-    ufw --force enable > /dev/null 2>&1
+    # Enable forwarding and NAT masquerade
+    sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
 
-    log_info "UFW firewall configured"
+    # Get primary interface
+    local primary_if
+    primary_if=$(ip route show default | awk '/default/ {print $5}' | head -1)
+
+    local ufw_before_rules="/etc/ufw/before.rules"
+    if ! grep -q "*nat" "${ufw_before_rules}"; then
+        cat <<EOF | sudo tee -a "${ufw_before_rules}" >/dev/null
+
+*nat
+:POSTROUTING ACCEPT [0:0]
+-A POSTROUTING -s ${DEFAULT_SUBNET} -o ${primary_if} -j MASQUERADE
+COMMIT
+EOF
+    fi
+
+    # Enable firewall
+    ufw --force enable > /dev/null 2>&1 || true
+
+    log_info "UFW firewall configured with NAT for ${DEFAULT_SUBNET} on ${primary_if}"
 }
 
 configure_firewall_firewalld() {

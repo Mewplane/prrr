@@ -1,5 +1,6 @@
 // FRD: specs/frds/FRD-009.md
 // FRD: specs/frds/FRD-P005.md
+// FRD: specs/frds/FRD-DPI010.md
 
 //! VPN server orchestrator.
 //!
@@ -16,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::crypto::hybrid_kex::KemKeyPair;
 use crate::handshake::hybrid::{HybridResponder, ResponderResult};
 use crate::handshake::noise_ik::KeyPair;
+use crate::obfuscation::psk_udp::{ObfuscatedUdpSocket, PSK_NONCE_OVERHEAD};
 use crate::registry::ClientRegistry;
 use crate::transport::encrypted_channel::EncryptedChannel;
 use crate::transport::masque::{MasqueProxy, build_masque_server_config};
@@ -78,6 +80,7 @@ pub async fn run_multi_server<F: TunFactory>(
     kem_keypair: KemKeyPair,
     tls_cert_path: Option<&str>,
     tls_key_path: Option<&str>,
+    obfuscation_key: Option<[u8; 32]>,
     params: MultiServerParams<F>,
 ) -> anyhow::Result<()> {
     let (cert_chain, key) = match (tls_cert_path, tls_key_path) {
@@ -93,7 +96,16 @@ pub async fn run_multi_server<F: TunFactory>(
     };
     let server_config = build_masque_server_config(cert_chain, key, 25, 300)?;
 
-    let endpoint = quinn::Endpoint::server(server_config, listen_addr)?;
+    let endpoint = if let Some(obfs_key) = obfuscation_key {
+        tracing::info!("PSK UDP obfuscation enabled on server (nonce overhead: {PSK_NONCE_OVERHEAD} bytes)");
+        let runtime = quinn::default_runtime().ok_or_else(|| anyhow::anyhow!("no async runtime found"))?;
+        let std_socket = std::net::UdpSocket::bind(listen_addr)?;
+        let inner_socket = runtime.wrap_udp_socket(std_socket)?;
+        let obfuscated = ObfuscatedUdpSocket::wrap(inner_socket, obfs_key);
+        quinn::Endpoint::new_with_abstract_socket(quinn::EndpointConfig::default(), Some(server_config), obfuscated, runtime)?
+    } else {
+        quinn::Endpoint::server(server_config, listen_addr)?
+    };
     let local_addr = endpoint.local_addr()?;
     tracing::info!("multi-client server listening on {local_addr}");
 
@@ -399,7 +411,7 @@ mod tests {
 
     /// Helper: register a client in the registry using the given KeyPair.
     fn register_client(registry: &mut ClientRegistry, name: &str, keypair: &KeyPair) {
-        registry.add(name, *keypair.public_key(), None).expect("register client");
+        registry.add(name, *keypair.public_key(), None, None).expect("register client");
     }
 
     // AC-6: TunFactory trait creates per-client TUN
@@ -559,6 +571,7 @@ mod tests {
                 25,
                 300,
                 true,
+                None,
                 client1_cancel,
             )
             .await
@@ -580,6 +593,7 @@ mod tests {
                 25,
                 300,
                 true,
+                None,
                 client2_cancel,
             )
             .await
@@ -665,6 +679,7 @@ mod tests {
                 25,
                 300,
                 true,
+                None,
                 client1_cancel,
             )
             .await
@@ -693,6 +708,7 @@ mod tests {
                 25,
                 300,
                 true,
+                None,
                 client2_cancel,
             )
             .await
@@ -771,6 +787,7 @@ mod tests {
                 25,
                 300,
                 true,
+                None,
                 client1_cancel_clone,
             )
             .await
@@ -793,6 +810,7 @@ mod tests {
                 25,
                 300,
                 true,
+                None,
                 client2_cancel_clone,
             )
             .await
@@ -873,6 +891,7 @@ mod tests {
                 25,
                 300,
                 true,
+                None,
                 rogue_cancel,
             )
             .await
@@ -980,6 +999,7 @@ mod tests {
                 25,
                 300,
                 true,
+                None,
                 client_cancel,
             )
             .await
@@ -1081,6 +1101,7 @@ mod tests {
                     25,
                     300,
                     true,
+                    None,
                     client_cancel,
                 )
                 .await
@@ -1176,6 +1197,7 @@ mod tests {
                 25,
                 300,
                 true,
+                None,
                 client_cancel,
             )
             .await

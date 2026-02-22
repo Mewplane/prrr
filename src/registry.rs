@@ -36,7 +36,7 @@ pub const REGISTRY_FILENAME: &str = "clients.json";
 pub const DATABASE_FILENAME: &str = "clients.db";
 
 /// Current schema version.
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 /// Status string stored in SQLite for active clients.
 const STATUS_ACTIVE: &str = "active";
@@ -117,6 +117,14 @@ pub struct ClientRecord {
     /// Total bytes received by client (network → TUN).
     #[serde(default)]
     pub bytes_received: u64,
+    /// Optional 256-bit PSK obfuscation key (32 bytes when present).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_bytes",
+        deserialize_with = "deserialize_optional_bytes"
+    )]
+    pub obfuscation_key: Option<Vec<u8>>,
 }
 
 /// Connection event types for history logging.
@@ -315,6 +323,7 @@ impl ClientRegistry {
         name: &str,
         public_key: [u8; PUBLIC_KEY_LEN],
         pq_public_key: Option<Vec<u8>>,
+        obfuscation_key: Option<Vec<u8>>,
     ) -> Result<ClientRecord, RegistryError> {
         // Check for duplicate name among non-revoked clients
         let name_exists: bool = self.conn.query_row(
@@ -353,10 +362,11 @@ impl ClientRegistry {
             status: ClientStatus::Active,
             bytes_sent: 0,
             bytes_received: 0,
+            obfuscation_key: obfuscation_key.clone(),
         };
 
         self.conn.execute(
-            "INSERT INTO clients (id, name, public_key, pq_public_key, ip_address, created_at, last_seen, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO clients (id, name, public_key, pq_public_key, ip_address, created_at, last_seen, status, obfuscation_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 record.id.to_string(),
                 record.name,
@@ -366,6 +376,7 @@ impl ClientRegistry {
                 record.created_at as i64,
                 Option::<i64>::None,
                 record.status.as_str(),
+                obfuscation_key.as_deref(),
             ],
         )?;
 
@@ -400,7 +411,7 @@ impl ClientRegistry {
     pub fn get(&self, id: Uuid) -> Option<ClientRecord> {
         self.conn
             .query_row(
-                "SELECT id, name, public_key, pq_public_key, ip_address, created_at, last_seen, status, bytes_sent, bytes_received FROM clients WHERE id = ?1",
+                "SELECT id, name, public_key, pq_public_key, ip_address, created_at, last_seen, status, bytes_sent, bytes_received, obfuscation_key FROM clients WHERE id = ?1",
                 params![id.to_string()],
                 row_to_record,
             )
@@ -411,7 +422,7 @@ impl ClientRegistry {
     pub fn get_by_public_key(&self, key: &[u8; PUBLIC_KEY_LEN]) -> Option<ClientRecord> {
         self.conn
             .query_row(
-                "SELECT id, name, public_key, pq_public_key, ip_address, created_at, last_seen, status, bytes_sent, bytes_received FROM clients WHERE public_key = ?1",
+                "SELECT id, name, public_key, pq_public_key, ip_address, created_at, last_seen, status, bytes_sent, bytes_received, obfuscation_key FROM clients WHERE public_key = ?1",
                 params![key.as_slice()],
                 row_to_record,
             )
@@ -422,7 +433,7 @@ impl ClientRegistry {
     pub fn get_by_name(&self, name: &str) -> Option<ClientRecord> {
         self.conn
             .query_row(
-                "SELECT id, name, public_key, pq_public_key, ip_address, created_at, last_seen, status, bytes_sent, bytes_received FROM clients WHERE name = ?1 AND status != ?2",
+                "SELECT id, name, public_key, pq_public_key, ip_address, created_at, last_seen, status, bytes_sent, bytes_received, obfuscation_key FROM clients WHERE name = ?1 AND status != ?2",
                 params![name, STATUS_REVOKED],
                 row_to_record,
             )
@@ -433,7 +444,7 @@ impl ClientRegistry {
     pub fn list(&self) -> Vec<ClientRecord> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, name, public_key, pq_public_key, ip_address, created_at, last_seen, status, bytes_sent, bytes_received FROM clients WHERE status != ?1 ORDER BY created_at")
+            .prepare("SELECT id, name, public_key, pq_public_key, ip_address, created_at, last_seen, status, bytes_sent, bytes_received, obfuscation_key FROM clients WHERE status != ?1 ORDER BY created_at")
             .expect("prepare list query");
         let rows = stmt.query_map(params![STATUS_REVOKED], row_to_record).expect("query list");
         rows.filter_map(|r| r.ok()).collect()
@@ -445,7 +456,7 @@ impl ClientRegistry {
     pub fn authenticate(&self, initiator_static: &[u8; PUBLIC_KEY_LEN]) -> Option<ClientRecord> {
         self.conn
             .query_row(
-                "SELECT id, name, public_key, pq_public_key, ip_address, created_at, last_seen, status, bytes_sent, bytes_received FROM clients WHERE public_key = ?1 AND status = ?2",
+                "SELECT id, name, public_key, pq_public_key, ip_address, created_at, last_seen, status, bytes_sent, bytes_received, obfuscation_key FROM clients WHERE public_key = ?1 AND status = ?2",
                 params![initiator_static.as_slice(), STATUS_ACTIVE],
                 row_to_record,
             )
@@ -733,6 +744,10 @@ fn run_migrations(conn: &rusqlite::Connection) -> Result<(), RegistryError> {
         )?;
     }
 
+    if version < 3 {
+        conn.execute_batch("ALTER TABLE clients ADD COLUMN obfuscation_key BLOB;")?;
+    }
+
     if version < SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -752,6 +767,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClientRecord> {
     let status_str: String = row.get(7)?;
     let bytes_sent: i64 = row.get(8)?;
     let bytes_received: i64 = row.get(9)?;
+    let obfuscation_key: Option<Vec<u8>> = row.get(10)?;
 
     let id =
         Uuid::parse_str(&id_str).map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
@@ -779,6 +795,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClientRecord> {
         status,
         bytes_sent: bytes_sent as u64,
         bytes_received: bytes_received as u64,
+        obfuscation_key,
     })
 }
 
@@ -871,12 +888,12 @@ mod tests {
     fn registry_add_sequential_ips() {
         let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
 
-        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None).expect("add first");
+        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None, None).expect("add first");
         assert_eq!(c1.ip_address, TEST_FIRST_CLIENT_IP);
         assert_eq!(c1.status, ClientStatus::Active);
         assert_eq!(c1.name, TEST_CLIENT_NAME);
 
-        let c2 = reg.add(TEST_CLIENT_NAME_2, test_public_key(0x02), None).expect("add second");
+        let c2 = reg.add(TEST_CLIENT_NAME_2, test_public_key(0x02), None, None).expect("add second");
         assert_eq!(c2.ip_address, TEST_SECOND_CLIENT_IP);
     }
 
@@ -884,9 +901,9 @@ mod tests {
     #[test]
     fn registry_add_duplicate_name() {
         let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
-        reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None).expect("first add");
+        reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None, None).expect("first add");
 
-        let err = reg.add(TEST_CLIENT_NAME, test_public_key(0x02), None).unwrap_err();
+        let err = reg.add(TEST_CLIENT_NAME, test_public_key(0x02), None, None).unwrap_err();
         assert!(matches!(err, RegistryError::DuplicateName(_)), "expected DuplicateName, got: {err}");
     }
 
@@ -895,9 +912,9 @@ mod tests {
     fn registry_add_duplicate_public_key() {
         let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
         let key = test_public_key(0xAA);
-        reg.add(TEST_CLIENT_NAME, key, None).expect("first add");
+        reg.add(TEST_CLIENT_NAME, key, None, None).expect("first add");
 
-        let err = reg.add(TEST_CLIENT_NAME_2, key, None).unwrap_err();
+        let err = reg.add(TEST_CLIENT_NAME_2, key, None, None).unwrap_err();
         assert!(
             matches!(err, RegistryError::DuplicatePublicKey),
             "expected DuplicatePublicKey, got: {err}"
@@ -909,9 +926,9 @@ mod tests {
     fn registry_subnet_exhausted() {
         let mut reg = ClientRegistry::new("192.168.1.0/30").expect("valid /30");
 
-        reg.add("c1", test_public_key(0x01), None).expect("first");
+        reg.add("c1", test_public_key(0x01), None, None).expect("first");
 
-        let err = reg.add("c2", test_public_key(0x02), None).unwrap_err();
+        let err = reg.add("c2", test_public_key(0x02), None, None).unwrap_err();
         assert!(
             matches!(err, RegistryError::SubnetExhausted),
             "expected SubnetExhausted, got: {err}"
@@ -922,7 +939,7 @@ mod tests {
     #[test]
     fn registry_remove_releases_ip() {
         let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
-        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None).expect("add");
+        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None, None).expect("add");
         let id = c1.id;
         let ip = c1.ip_address;
 
@@ -937,7 +954,7 @@ mod tests {
     #[test]
     fn registry_get_by_id() {
         let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
-        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None).expect("add");
+        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None, None).expect("add");
 
         let found = reg.get(c1.id).expect("should find");
         assert_eq!(found.name, TEST_CLIENT_NAME);
@@ -950,7 +967,7 @@ mod tests {
     fn registry_get_by_public_key() {
         let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
         let key = test_public_key(0xBB);
-        reg.add(TEST_CLIENT_NAME, key, None).expect("add");
+        reg.add(TEST_CLIENT_NAME, key, None, None).expect("add");
 
         let found = reg.get_by_public_key(&key).expect("should find");
         assert_eq!(found.name, TEST_CLIENT_NAME);
@@ -963,8 +980,8 @@ mod tests {
     #[test]
     fn registry_list_excludes_revoked() {
         let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
-        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None).expect("add c1");
-        reg.add(TEST_CLIENT_NAME_2, test_public_key(0x02), None).expect("add c2");
+        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None, None).expect("add c1");
+        reg.add(TEST_CLIENT_NAME_2, test_public_key(0x02), None, None).expect("add c2");
 
         assert_eq!(reg.list().len(), 2);
 
@@ -983,9 +1000,9 @@ mod tests {
         let revoked_key = test_public_key(0x03);
         let unknown_key = test_public_key(0xFF);
 
-        let c_active = reg.add("active-client", active_key, None).expect("add active");
-        let c_suspended = reg.add("suspended-client", suspended_key, None).expect("add suspended");
-        let c_revoked = reg.add("revoked-client", revoked_key, None).expect("add revoked");
+        let c_active = reg.add("active-client", active_key, None, None).expect("add active");
+        let c_suspended = reg.add("suspended-client", suspended_key, None, None).expect("add suspended");
+        let c_revoked = reg.add("revoked-client", revoked_key, None, None).expect("add revoked");
 
         reg.suspend(c_suspended.id).expect("suspend");
         reg.remove(c_revoked.id).expect("revoke");
@@ -1002,7 +1019,7 @@ mod tests {
     #[test]
     fn registry_update_last_seen() {
         let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
-        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None).expect("add");
+        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None, None).expect("add");
 
         assert!(reg.get(c1.id).expect("get").last_seen.is_none());
 
@@ -1032,7 +1049,7 @@ mod tests {
 
         {
             let mut reg = ClientRegistry::open(TEST_SUBNET, &db_path).expect("open");
-            let c1 = reg.add(TEST_CLIENT_NAME, key1, Some(pq_key.clone())).expect("add");
+            let c1 = reg.add(TEST_CLIENT_NAME, key1, Some(pq_key.clone()), None).expect("add");
             reg.update_last_seen(c1.id, ts).expect("update");
             client_id = c1.id;
         }
@@ -1062,14 +1079,14 @@ mod tests {
     fn registry_revoked_ip_reusable() {
         let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
 
-        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None).expect("add first");
+        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None, None).expect("add first");
         let first_ip = c1.ip_address;
 
-        reg.add(TEST_CLIENT_NAME_2, test_public_key(0x02), None).expect("add second");
+        reg.add(TEST_CLIENT_NAME_2, test_public_key(0x02), None, None).expect("add second");
 
         reg.remove(c1.id).expect("revoke");
 
-        let c3 = reg.add("third-client", test_public_key(0x03), None).expect("add third");
+        let c3 = reg.add("third-client", test_public_key(0x03), None, None).expect("add third");
         assert_eq!(c3.ip_address, first_ip, "revoked IP should be reused");
     }
 
@@ -1085,10 +1102,12 @@ mod tests {
     #[test]
     fn registry_duplicate_name_after_revoke() {
         let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
-        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None).expect("add first");
+        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None, None).expect("add first");
         reg.remove(c1.id).expect("revoke");
 
-        let c2 = reg.add(TEST_CLIENT_NAME, test_public_key(0x02), None).expect("add after revoke");
+        let c2 = reg
+            .add(TEST_CLIENT_NAME, test_public_key(0x02), None, None)
+            .expect("add after revoke");
         assert_ne!(c2.id, c1.id);
     }
 
@@ -1097,10 +1116,10 @@ mod tests {
     fn registry_duplicate_key_after_revoke() {
         let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
         let key = test_public_key(0xAA);
-        let c1 = reg.add(TEST_CLIENT_NAME, key, None).expect("add first");
+        let c1 = reg.add(TEST_CLIENT_NAME, key, None, None).expect("add first");
         reg.remove(c1.id).expect("revoke");
 
-        let c2 = reg.add(TEST_CLIENT_NAME_2, key, None).expect("add after revoke");
+        let c2 = reg.add(TEST_CLIENT_NAME_2, key, None, None).expect("add after revoke");
         assert_ne!(c2.id, c1.id);
     }
 
@@ -1113,7 +1132,7 @@ mod tests {
 
         {
             let mut reg = ClientRegistry::open(TEST_SUBNET, &db_path).expect("open");
-            let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None).expect("add");
+            let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None, None).expect("add");
             reg.remove(c1.id).expect("revoke");
             client_id = c1.id;
         }
@@ -1129,8 +1148,8 @@ mod tests {
     #[test]
     fn registry_count_excludes_revoked() {
         let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
-        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None).expect("add");
-        reg.add(TEST_CLIENT_NAME_2, test_public_key(0x02), None).expect("add");
+        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None, None).expect("add");
+        reg.add(TEST_CLIENT_NAME_2, test_public_key(0x02), None, None).expect("add");
         assert_eq!(reg.count(), 2);
 
         reg.remove(c1.id).expect("revoke");
@@ -1141,7 +1160,7 @@ mod tests {
     #[test]
     fn registry_suspend_reactivate() {
         let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
-        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None).expect("add");
+        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None, None).expect("add");
 
         reg.suspend(c1.id).expect("suspend");
         assert_eq!(reg.get(c1.id).expect("get").status, ClientStatus::Suspended);
@@ -1158,14 +1177,14 @@ mod tests {
 
         {
             let mut reg = ClientRegistry::open(TEST_SUBNET, &db_path).expect("open");
-            reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None).expect("add c1");
-            reg.add(TEST_CLIENT_NAME_2, test_public_key(0x02), None).expect("add c2");
+            reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None, None).expect("add c1");
+            reg.add(TEST_CLIENT_NAME_2, test_public_key(0x02), None, None).expect("add c2");
         }
 
         let mut reg2 = ClientRegistry::open(TEST_SUBNET, &db_path).expect("reopen");
 
         // Adding a third client should get .4 (not .2 or .3 which are taken)
-        let c3 = reg2.add("third-client", test_public_key(0x03), None).expect("add c3");
+        let c3 = reg2.add("third-client", test_public_key(0x03), None, None).expect("add c3");
         assert_eq!(c3.ip_address, Ipv4Addr::new(10, 66, 66, 4));
     }
 
@@ -1204,8 +1223,8 @@ mod tests {
         let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
         assert_eq!(reg.suspended_count(), 0);
 
-        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None).expect("add");
-        let c2 = reg.add(TEST_CLIENT_NAME_2, test_public_key(0x02), None).expect("add");
+        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None, None).expect("add");
+        let c2 = reg.add(TEST_CLIENT_NAME_2, test_public_key(0x02), None, None).expect("add");
 
         reg.suspend(c1.id).expect("suspend");
         assert_eq!(reg.suspended_count(), 1);
@@ -1221,7 +1240,7 @@ mod tests {
     #[test]
     fn get_by_name_found() {
         let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
-        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None).expect("add");
+        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None, None).expect("add");
 
         let found = reg.get_by_name(TEST_CLIENT_NAME).expect("should find");
         assert_eq!(found.id, c1.id);
@@ -1239,7 +1258,7 @@ mod tests {
     #[test]
     fn get_by_name_skips_revoked() {
         let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
-        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None).expect("add");
+        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None, None).expect("add");
         reg.remove(c1.id).expect("revoke");
 
         assert!(
@@ -1254,7 +1273,7 @@ mod tests {
     #[test]
     fn new_client_has_zero_traffic() {
         let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
-        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None).expect("add");
+        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None, None).expect("add");
         assert_eq!(c1.bytes_sent, 0);
         assert_eq!(c1.bytes_received, 0);
 
@@ -1267,7 +1286,7 @@ mod tests {
     #[test]
     fn update_traffic_increments() {
         let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
-        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None).expect("add");
+        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None, None).expect("add");
 
         reg.update_traffic(c1.id, 1000, 2000).expect("update traffic");
         let loaded = reg.get(c1.id).expect("get");
@@ -1289,16 +1308,16 @@ mod tests {
         assert!(matches!(err, RegistryError::ClientNotFound(_)));
     }
 
-    // Schema v2 migration sets correct version
+    // Schema migration sets correct version (v3 adds obfuscation_key)
     #[test]
-    fn migration_v2_schema_version() {
+    fn migration_v3_schema_version() {
         let reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
         let version: i32 = reg
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("query version");
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 2);
+        assert_eq!(SCHEMA_VERSION, 3);
     }
 
     // Traffic counters persist across reopen
@@ -1310,7 +1329,7 @@ mod tests {
 
         {
             let mut reg = ClientRegistry::open(TEST_SUBNET, &db_path).expect("open");
-            let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None).expect("add");
+            let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None, None).expect("add");
             client_id = c1.id;
             reg.update_traffic(client_id, 5000, 3000).expect("update traffic");
         }
@@ -1327,7 +1346,7 @@ mod tests {
     #[test]
     fn log_connect_event() {
         let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
-        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None).expect("add");
+        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None, None).expect("add");
 
         reg.log_connection_event(c1.id, ConnectionEvent::Connect, Some("127.0.0.1:4433"), None, 0, 0)
             .expect("log connect");
@@ -1346,7 +1365,7 @@ mod tests {
     #[test]
     fn log_disconnect_with_traffic() {
         let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
-        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None).expect("add");
+        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None, None).expect("add");
 
         reg.log_connection_event(c1.id, ConnectionEvent::Disconnect, Some("10.0.0.1:5555"), None, 4096, 8192)
             .expect("log disconnect");
@@ -1362,7 +1381,7 @@ mod tests {
     #[test]
     fn get_history_respects_limit() {
         let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
-        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None).expect("add");
+        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None, None).expect("add");
 
         let event_count = 5u32;
         let query_limit = 3u32;
@@ -1404,5 +1423,92 @@ mod tests {
         assert_eq!(ConnectionEvent::Connect.as_str(), "connect");
         assert_eq!(ConnectionEvent::Disconnect.as_str(), "disconnect");
         assert_eq!(ConnectionEvent::AuthFailed.as_str(), "auth_failed");
+    }
+
+    // -----------------------------------------------------------------------
+    // PSK obfuscation key tests (FRD-DPI007)
+    // -----------------------------------------------------------------------
+
+    /// Length of a 256-bit obfuscation key.
+    const OBFUSCATION_KEY_LEN: usize = 32;
+
+    // T-5 / AC-5: Registry stores and retrieves obfuscation key
+    #[test]
+    fn registry_add_with_obfuscation_key() {
+        let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
+        let key = vec![0xAA; OBFUSCATION_KEY_LEN];
+
+        let record = reg
+            .add(TEST_CLIENT_NAME, test_public_key(0x01), None, Some(key.clone()))
+            .expect("add with obfuscation key");
+        assert_eq!(record.obfuscation_key, Some(key.clone()));
+
+        let loaded = reg.get(record.id).expect("get by id");
+        assert_eq!(loaded.obfuscation_key, Some(key.clone()));
+
+        let by_name = reg.get_by_name(TEST_CLIENT_NAME).expect("get by name");
+        assert_eq!(by_name.obfuscation_key, Some(key));
+    }
+
+    // T-6 / AC-6: Registry add without obfuscation key stores NULL
+    #[test]
+    fn registry_add_without_obfuscation_key() {
+        let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
+
+        let record = reg
+            .add(TEST_CLIENT_NAME, test_public_key(0x01), None, None)
+            .expect("add without obfuscation key");
+        assert!(record.obfuscation_key.is_none());
+
+        let loaded = reg.get(record.id).expect("get by id");
+        assert!(loaded.obfuscation_key.is_none());
+    }
+
+    // T-12: Obfuscation key persists across file-backed registry reopen
+    #[test]
+    fn registry_obfuscation_key_persists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join(DATABASE_FILENAME);
+        let key = vec![0xBB; OBFUSCATION_KEY_LEN];
+
+        let client_id;
+        {
+            let mut reg = ClientRegistry::open(TEST_SUBNET, &db_path).expect("open");
+            let record = reg
+                .add(TEST_CLIENT_NAME, test_public_key(0x01), None, Some(key.clone()))
+                .expect("add");
+            client_id = record.id;
+        }
+
+        let reg2 = ClientRegistry::open(TEST_SUBNET, &db_path).expect("reopen");
+        let loaded = reg2.get(client_id).expect("get after reopen");
+        assert_eq!(loaded.obfuscation_key, Some(key));
+    }
+
+    // AC-DPI007: Obfuscation key appears in list() results
+    #[test]
+    fn registry_list_includes_obfuscation_key() {
+        let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
+        let key = vec![0xCC; OBFUSCATION_KEY_LEN];
+
+        reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None, Some(key.clone()))
+            .expect("add");
+
+        let clients = reg.list();
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].obfuscation_key, Some(key));
+    }
+
+    // AC-DPI007: Obfuscation key appears in authenticate() results
+    #[test]
+    fn registry_authenticate_includes_obfuscation_key() {
+        let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
+        let key = vec![0xDD; OBFUSCATION_KEY_LEN];
+        let pub_key = test_public_key(0x01);
+
+        reg.add(TEST_CLIENT_NAME, pub_key, None, Some(key.clone())).expect("add");
+
+        let record = reg.authenticate(&pub_key).expect("authenticate");
+        assert_eq!(record.obfuscation_key, Some(key));
     }
 }

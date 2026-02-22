@@ -187,7 +187,7 @@ pub async fn create_client(
     };
 
     let mut registry = state.registry.lock().await;
-    let record = registry.add(&req.name, public_key_bytes, pq_public_key)?;
+    let record = registry.add(&req.name, public_key_bytes, pq_public_key, None)?;
 
     Ok((
         StatusCode::CREATED,
@@ -419,6 +419,7 @@ mod tests {
                 endpoint: "127.0.0.1:443".to_string(),
                 noise_public_key: [0xAA; 32],
                 kem_public_key: vec![0xBB; 64],
+                psk_obfuscation: false,
             }),
             config_tokens: Arc::new(ConfigTokenStore::new()),
             server_config: Arc::new(test_server_config()),
@@ -517,8 +518,8 @@ mod tests {
         let state = test_app_state();
         {
             let mut reg = state.registry.lock().await;
-            reg.add("alice", [0x01; PUBLIC_KEY_LEN], None).unwrap();
-            reg.add("bob", [0x02; PUBLIC_KEY_LEN], None).unwrap();
+            reg.add("alice", [0x01; PUBLIC_KEY_LEN], None, None).unwrap();
+            reg.add("bob", [0x02; PUBLIC_KEY_LEN], None, None).unwrap();
         }
         let app = test_router(state);
 
@@ -534,7 +535,7 @@ mod tests {
         let state = test_app_state();
         let id = {
             let mut reg = state.registry.lock().await;
-            reg.add("alice", [0x01; PUBLIC_KEY_LEN], None).unwrap().id
+            reg.add("alice", [0x01; PUBLIC_KEY_LEN], None, None).unwrap().id
         };
         let app = test_router(state);
 
@@ -601,7 +602,7 @@ mod tests {
         let state = test_app_state();
         {
             let mut reg = state.registry.lock().await;
-            reg.add("alice", [0x01; PUBLIC_KEY_LEN], None).unwrap();
+            reg.add("alice", [0x01; PUBLIC_KEY_LEN], None, None).unwrap();
         }
         let app = test_router(state);
 
@@ -648,7 +649,7 @@ mod tests {
         let state = test_app_state();
         let id = {
             let mut reg = state.registry.lock().await;
-            reg.add("alice", [0x01; PUBLIC_KEY_LEN], None).unwrap().id
+            reg.add("alice", [0x01; PUBLIC_KEY_LEN], None, None).unwrap().id
         };
         let app = test_router(state);
 
@@ -682,7 +683,7 @@ mod tests {
         let state = test_app_state();
         let id = {
             let mut reg = state.registry.lock().await;
-            reg.add("alice", [0x01; PUBLIC_KEY_LEN], None).unwrap().id
+            reg.add("alice", [0x01; PUBLIC_KEY_LEN], None, None).unwrap().id
         };
         let app = test_router(state);
 
@@ -716,7 +717,7 @@ mod tests {
         let state = test_app_state();
         let id = {
             let mut reg = state.registry.lock().await;
-            let record = reg.add("alice", [0x01; PUBLIC_KEY_LEN], None).unwrap();
+            let record = reg.add("alice", [0x01; PUBLIC_KEY_LEN], None, None).unwrap();
             let id = record.id;
             reg.suspend(id).unwrap();
             id
@@ -768,8 +769,8 @@ mod tests {
         state.active_connections.store(1, Ordering::Relaxed);
         {
             let mut reg = state.registry.lock().await;
-            let record = reg.add("alice", [0x01; PUBLIC_KEY_LEN], None).unwrap();
-            let bob = reg.add("bob", [0x02; PUBLIC_KEY_LEN], None).unwrap();
+            let record = reg.add("alice", [0x01; PUBLIC_KEY_LEN], None, None).unwrap();
+            let bob = reg.add("bob", [0x02; PUBLIC_KEY_LEN], None, None).unwrap();
             reg.suspend(bob.id).unwrap();
             // alice is active, bob is suspended, both in count
             let _ = record;
@@ -791,7 +792,7 @@ mod tests {
         let state = test_app_state();
         let id = {
             let mut reg = state.registry.lock().await;
-            reg.add("alice", [0x01; PUBLIC_KEY_LEN], None).unwrap().id
+            reg.add("alice", [0x01; PUBLIC_KEY_LEN], None, None).unwrap().id
         };
         let app = test_router(state);
 
@@ -837,7 +838,7 @@ mod tests {
         let state = test_app_state();
         let id = {
             let mut reg = state.registry.lock().await;
-            reg.add("alice", [0x01; PUBLIC_KEY_LEN], None).unwrap().id
+            reg.add("alice", [0x01; PUBLIC_KEY_LEN], None, None).unwrap().id
         };
         let app = test_router(state);
 
@@ -862,7 +863,7 @@ mod tests {
         let state = test_app_state();
         let id = {
             let mut reg = state.registry.lock().await;
-            reg.add("alice", [0x01; PUBLIC_KEY_LEN], None).unwrap().id
+            reg.add("alice", [0x01; PUBLIC_KEY_LEN], None, None).unwrap().id
         };
         let app = test_router(state);
 
@@ -885,7 +886,7 @@ mod tests {
         let state = test_app_state();
         let id = {
             let mut reg = state.registry.lock().await;
-            reg.add("alice", [0x01; PUBLIC_KEY_LEN], None).unwrap().id
+            reg.add("alice", [0x01; PUBLIC_KEY_LEN], None, None).unwrap().id
         };
         let app = test_router(state);
 
@@ -957,7 +958,7 @@ mod tests {
         let state = test_app_state();
         let id = {
             let mut reg = state.registry.lock().await;
-            let c = reg.add("alice", [0x01; PUBLIC_KEY_LEN], None).unwrap();
+            let c = reg.add("alice", [0x01; PUBLIC_KEY_LEN], None, None).unwrap();
             reg.update_traffic(c.id, 12345, 67890).unwrap();
             c.id
         };
