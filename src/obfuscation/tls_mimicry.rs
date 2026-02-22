@@ -244,16 +244,18 @@ pub fn compute_ja3_hash(profile: TlsProfile) -> String {
 
 /// Build a `quinn::ClientConfig` with the given TLS profile applied.
 ///
-/// Uses insecure certificate verification (for dev/test with self-signed certs).
+/// When `insecure` is `true`, skips certificate verification (dev/test).
+/// When `insecure` is `false`, verifies against the Mozilla CA root store.
 /// ALPN is set to `h3` for MASQUE compatibility.
-pub fn build_mimicked_client_config(profile: TlsProfile) -> Result<quinn::ClientConfig, TransportError> {
+pub fn build_mimicked_client_config(profile: TlsProfile, insecure: bool) -> Result<quinn::ClientConfig, TransportError> {
     let provider = build_crypto_provider(profile);
+    let verifier = crate::transport::tls::build_cert_verifier(insecure);
 
     let mut tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions()
         .map_err(|e| TransportError::TlsConfig(e.to_string()))?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+        .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
 
     tls_config.alpn_protocols = vec![crate::transport::masque::ALPN_H3.to_vec()];
@@ -269,10 +271,11 @@ pub fn build_mimicked_client_config(profile: TlsProfile) -> Result<quinn::Client
 
 /// Build a `quinn::ServerConfig` with the given TLS profile applied.
 ///
+/// Accepts a certificate chain (one or more certs) and a private key.
 /// ALPN is set to `h3` for MASQUE compatibility.
 pub fn build_mimicked_server_config(
     profile: TlsProfile,
-    cert_der: rustls::pki_types::CertificateDer<'static>,
+    cert_chain: Vec<rustls::pki_types::CertificateDer<'static>>,
     key_der: rustls::pki_types::PrivateKeyDer<'static>,
 ) -> Result<quinn::ServerConfig, TransportError> {
     let provider = build_crypto_provider(profile);
@@ -281,7 +284,7 @@ pub fn build_mimicked_server_config(
         .with_safe_default_protocol_versions()
         .map_err(|e| TransportError::TlsConfig(e.to_string()))?
         .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der)
+        .with_single_cert(cert_chain, key_der)
         .map_err(|e| TransportError::TlsConfig(e.to_string()))?;
 
     tls_config.alpn_protocols = vec![crate::transport::masque::ALPN_H3.to_vec()];
@@ -293,53 +296,6 @@ pub fn build_mimicked_server_config(
     server_config.transport_config(Arc::new(crate::transport::masque::datagram_transport_config(25, 300)));
 
     Ok(server_config)
-}
-
-// ---------------------------------------------------------------------------
-// SkipServerVerification (reused from transport layer, kept private here)
-// ---------------------------------------------------------------------------
-
-/// A TLS certificate verifier that accepts any server certificate.
-///
-/// Only for dev/test with self-signed certificates.
-#[derive(Debug)]
-struct SkipServerVerification;
-
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        ring_provider::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -526,7 +482,7 @@ mod tests {
     #[test]
     fn mimicked_client_config_builds() {
         for profile in [TlsProfile::Chrome, TlsProfile::Firefox, TlsProfile::Default] {
-            let result = build_mimicked_client_config(profile);
+            let result = build_mimicked_client_config(profile, true);
             assert!(result.is_ok(), "build_mimicked_client_config should succeed for {profile}");
         }
     }
@@ -559,11 +515,11 @@ mod tests {
 
         let (cert, key) = crate::transport::quic::generate_self_signed_cert(vec![TEST_SERVER_NAME.to_string()]).expect("cert generation");
 
-        let server_config = build_mimicked_server_config(TlsProfile::Chrome, cert, key).expect("server config");
+        let server_config = build_mimicked_server_config(TlsProfile::Chrome, vec![cert], key).expect("server config");
         let server_endpoint = quinn::Endpoint::server(server_config, TEST_BIND_ADDR.parse().expect("valid addr")).expect("server bind");
         let server_addr = server_endpoint.local_addr().expect("local addr");
 
-        let client_config = build_mimicked_client_config(TlsProfile::Chrome).expect("client config");
+        let client_config = build_mimicked_client_config(TlsProfile::Chrome, true).expect("client config");
         let mut client_endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().expect("valid addr")).expect("client bind");
         client_endpoint.set_default_client_config(client_config);
 
@@ -684,11 +640,11 @@ mod tests {
     async fn quic_connection_with_profile(profile: TlsProfile) {
         let (cert, key) = crate::transport::quic::generate_self_signed_cert(vec![TEST_SERVER_NAME.to_string()]).expect("cert generation");
 
-        let server_config = build_mimicked_server_config(profile, cert, key).expect("server config");
+        let server_config = build_mimicked_server_config(profile, vec![cert], key).expect("server config");
         let server_endpoint = quinn::Endpoint::server(server_config, TEST_BIND_ADDR.parse().expect("valid addr")).expect("server bind");
         let server_addr = server_endpoint.local_addr().expect("local addr");
 
-        let client_config = build_mimicked_client_config(profile).expect("client config");
+        let client_config = build_mimicked_client_config(profile, true).expect("client config");
         let mut client_endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().expect("valid addr")).expect("client bind");
         client_endpoint.set_default_client_config(client_config);
 

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FRD: specs/frds/FRD-M008-android-project-setup.md -->
+<resources>
+    <style name="Theme.PrrrVPN" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>

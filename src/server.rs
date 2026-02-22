@@ -66,16 +66,32 @@ pub struct MultiServerParams<F: TunFactory> {
 /// authenticates clients against the registry, and spawns independent
 /// per-client tunnel pipelines. Enforces the `max_clients` connection limit.
 ///
+/// When `tls_cert_path` and `tls_key_path` are both `Some`, loads a CA-signed
+/// PEM certificate. Otherwise falls back to generating a self-signed cert.
+///
 /// Returns `Ok(())` on clean shutdown (cancellation) or `Err` on bind failure.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_multi_server<F: TunFactory>(
     listen_addr: SocketAddr,
     server_name: &str,
     noise_keypair: &KeyPair,
     kem_keypair: KemKeyPair,
+    tls_cert_path: Option<&str>,
+    tls_key_path: Option<&str>,
     params: MultiServerParams<F>,
 ) -> anyhow::Result<()> {
-    let (cert, key) = generate_self_signed_cert(vec![server_name.to_string()])?;
-    let server_config = build_masque_server_config(cert, key, 25, 300)?;
+    let (cert_chain, key) = match (tls_cert_path, tls_key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            tracing::info!(cert = cert_path, key = key_path, "loading CA-signed TLS certificate");
+            crate::transport::tls::load_pem_cert_and_key(std::path::Path::new(cert_path), std::path::Path::new(key_path))?
+        }
+        _ => {
+            tracing::warn!("no TLS certificate configured, generating self-signed (not recommended for production)");
+            let (cert, key) = generate_self_signed_cert(vec![server_name.to_string()])?;
+            (vec![cert], key)
+        }
+    };
+    let server_config = build_masque_server_config(cert_chain, key, 25, 300)?;
 
     let endpoint = quinn::Endpoint::server(server_config, listen_addr)?;
     let local_addr = endpoint.local_addr()?;
@@ -354,7 +370,7 @@ impl Drop for ActiveClientGuard {
 /// Useful for tests that bind to `:0` and need the actual port.
 pub fn bind_ephemeral_server(server_name: &str) -> anyhow::Result<(quinn::Endpoint, SocketAddr)> {
     let (cert, key) = generate_self_signed_cert(vec![server_name.to_string()])?;
-    let server_config = build_masque_server_config(cert, key, 25, 300)?;
+    let server_config = build_masque_server_config(vec![cert], key, 25, 300)?;
     let addr: SocketAddr = "127.0.0.1:0".parse()?;
     let endpoint = quinn::Endpoint::server(server_config, addr)?;
     let local_addr = endpoint.local_addr()?;
@@ -423,7 +439,7 @@ mod tests {
             let server_noise_pub = *server_noise.public_key();
 
             let (cert, key) = generate_self_signed_cert(vec![TEST_SERVER_NAME.to_string()]).expect("cert");
-            let server_config = build_masque_server_config(cert, key, 25, 300).expect("server config");
+            let server_config = build_masque_server_config(vec![cert], key, 25, 300).expect("server config");
             let listen_addr: SocketAddr = TEST_LISTEN_ADDR.parse().expect("valid addr");
             let endpoint = quinn::Endpoint::server(server_config, listen_addr).expect("server bind");
             let actual_addr = endpoint.local_addr().expect("local addr");
@@ -542,6 +558,7 @@ mod tests {
                 client1_tun,
                 25,
                 300,
+                true,
                 client1_cancel,
             )
             .await
@@ -562,6 +579,7 @@ mod tests {
                 client2_tun,
                 25,
                 300,
+                true,
                 client2_cancel,
             )
             .await
@@ -646,6 +664,7 @@ mod tests {
                 client1_tun,
                 25,
                 300,
+                true,
                 client1_cancel,
             )
             .await
@@ -673,6 +692,7 @@ mod tests {
                 client2_tun,
                 25,
                 300,
+                true,
                 client2_cancel,
             )
             .await
@@ -750,6 +770,7 @@ mod tests {
                 client1_tun,
                 25,
                 300,
+                true,
                 client1_cancel_clone,
             )
             .await
@@ -771,6 +792,7 @@ mod tests {
                 client2_tun,
                 25,
                 300,
+                true,
                 client2_cancel_clone,
             )
             .await
@@ -850,6 +872,7 @@ mod tests {
                 rogue_tun,
                 25,
                 300,
+                true,
                 rogue_cancel,
             )
             .await
@@ -908,7 +931,7 @@ mod tests {
         // Build server endpoint using KeyStore keys
         let (server_noise, server_kem) = key_store.into_parts();
         let (cert, key) = generate_self_signed_cert(vec![TEST_SERVER_NAME.to_string()]).expect("cert");
-        let server_config = build_masque_server_config(cert, key, 25, 300).expect("server config");
+        let server_config = build_masque_server_config(vec![cert], key, 25, 300).expect("server config");
         let listen_addr: SocketAddr = TEST_LISTEN_ADDR.parse().expect("valid addr");
         let endpoint = quinn::Endpoint::server(server_config, listen_addr).expect("server bind");
         let actual_addr = endpoint.local_addr().expect("local addr");
@@ -956,6 +979,7 @@ mod tests {
                 client_tun,
                 25,
                 300,
+                true,
                 client_cancel,
             )
             .await
@@ -1056,6 +1080,7 @@ mod tests {
                     tun,
                     25,
                     300,
+                    true,
                     client_cancel,
                 )
                 .await
@@ -1150,6 +1175,7 @@ mod tests {
                 client_tun,
                 25,
                 300,
+                true,
                 client_cancel,
             )
             .await

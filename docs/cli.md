@@ -125,7 +125,7 @@ prrr client --server <ADDR> [OPTIONS]
 | `--server <ADDR>` | (required) | — | Server address to connect to |
 | `--log-level <LEVEL>` | `info` | `PRRR_LOG_LEVEL` | Log level |
 | `--config <PATH>` | — | — | Optional TOML configuration file |
-| `--server-name <NAME>` | `localhost` | — | TLS server name (SNI) |
+| `--server-name <NAME>` | — | — | TLS server name (SNI) — required (CLI or config) |
 | `--server-public-key <BASE64>` | — | — | Server Noise IK public key (base64, 32 bytes decoded) |
 | `--server-pq-public-key <BASE64>` | — | — | Server ML-KEM-768 public key (base64, 1184 bytes decoded) |
 
@@ -206,7 +206,7 @@ listen_addr = "0.0.0.0:443"
 max_clients = 100
 log_level = "info"
 data_dir = "/var/lib/prrr"
-server_name = "www.google.com"
+server_name = "vpn.example.com"
 
 [network]
 subnet = "10.66.66.0/24"
@@ -344,10 +344,12 @@ RUST_LOG=prrr=trace prrr server
   - `check_disk_space(data_dir)` — filesystem usage check (Linux: `df`, other: passthrough)
   - `check_memory()` — system memory check (Linux: `/proc/meminfo`, other: passthrough)
   - `check_stale_clients(subnet, db_path)` — warn about clients not seen in 30+ days
+  - `check_tls_cert(tls_cert, tls_key, server_name)` — validate TLS certificate: file existence, PEM parsing, expiry (30-day warn), SAN matching
 - `run_client_doctor(config)` — run all client diagnostic checks
   - `check_client_keys(config)` — verify client key files exist (pass in ephemeral mode)
   - `check_client_config(config)` — verify server endpoint is configured
   - `check_server_reachable(endpoint)` — UDP probe with 5-second timeout
+  - `check_sni_config(server_name)` — warn on missing, dangerous (`www.google.com`), or invalid SNI
 - `parse_meminfo_and_check(content)` — parse `/proc/meminfo` content for memory check
 
 ### `cli` — CLI Command Handlers (P-009B)
@@ -832,9 +834,9 @@ Diagnostics tests (P-010):
 - `client_server_invalid_address_fails` — invalid address = fail
 - `report_print_colored_output` — colored output doesn't panic
 - `report_recommendations_present` — recommendations list populated
-- `run_server_doctor_produces_report` — server doctor returns 6 checks
-- `run_client_doctor_produces_report` — client doctor returns 2 checks (no endpoint)
-- `run_client_doctor_with_endpoint_has_three_checks` — client doctor returns 3 checks (with endpoint)
+- `run_server_doctor_produces_report` — server doctor returns 7 checks
+- `run_client_doctor_produces_report` — client doctor returns 3 checks (no endpoint)
+- `run_client_doctor_with_endpoint_has_four_checks` — client doctor returns 4 checks (with endpoint)
 - `cli_server_doctor_parses` — `prrr server doctor` CLI parsing
 - `cli_client_doctor_parses` — `prrr client doctor` CLI parsing
 

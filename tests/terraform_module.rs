@@ -366,5 +366,8 @@ fn terraform_cloud_init_packages() {
 #[test]
 fn terraform_firewall_web_admin() {
     let content = read_tf(MAIN_TF);
-    assert!(content.contains("\"8443\""), "Firewall must include web admin port 8443");
+    assert!(
+        content.contains("var.admin_https_port"),
+        "Firewall must reference admin HTTPS port variable"
+    );
 }
