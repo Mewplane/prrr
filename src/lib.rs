@@ -34,6 +34,9 @@ pub mod metrics;
 /// Transport-agnostic client reconnection with exponential backoff.
 pub mod reconnect;
 
+/// Binary-driven routing lifecycle with fwmark policy routing.
+pub mod routing;
+
 /// Client registry for authorized VPN clients.
 pub mod registry;
 

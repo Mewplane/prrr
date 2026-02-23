@@ -363,6 +363,10 @@ pub struct HarpTransportConfig {
     pub polling_enabled: Option<bool>,
     /// Seconds before idle HARP sessions are cleaned up.
     pub session_idle_timeout: Option<u64>,
+    /// Path to TLS certificate file (PEM) for HTTPS.
+    pub tls_cert: Option<String>,
+    /// Path to TLS private key file (PEM).
+    pub tls_key: Option<String>,
 }
 
 /// `[obfuscation]` section — traffic shaping and anti-censorship.
@@ -511,6 +515,10 @@ pub struct RoutingSection {
     pub allowed_ips: Option<Vec<String>>,
     /// Excluded destination CIDRs.
     pub excluded_ips: Option<Vec<String>>,
+    /// Firewall mark for VPN transport sockets (default: 51820).
+    pub fwmark: Option<u32>,
+    /// Path to routing hook script (default: `/usr/local/bin/prrr-route`).
+    pub hook_script: Option<String>,
 }
 
 /// `[transport]` section in client config.
@@ -669,6 +677,10 @@ pub enum ResolvedTransport {
         polling_enabled: bool,
         /// Session idle timeout in seconds.
         session_idle_timeout: u64,
+        /// Optional TLS certificate path.
+        tls_cert: Option<String>,
+        /// Optional TLS key path.
+        tls_key: Option<String>,
     },
 }
 
@@ -684,6 +696,8 @@ pub fn resolve_server_transports(config: &ServerConfig) -> Vec<ResolvedTransport
                 websocket_enabled: true,
                 polling_enabled: true,
                 session_idle_timeout: DEFAULT_HARP_SESSION_IDLE_TIMEOUT,
+                tls_cert: None,
+                tls_key: None,
             }];
         }
     };
@@ -710,6 +724,8 @@ pub fn resolve_server_transports(config: &ServerConfig) -> Vec<ResolvedTransport
                     websocket_enabled: h.websocket_enabled.unwrap_or(true),
                     polling_enabled: h.polling_enabled.unwrap_or(true),
                     session_idle_timeout: h.session_idle_timeout.unwrap_or(DEFAULT_HARP_SESSION_IDLE_TIMEOUT),
+                    tls_cert: h.tls_cert.clone(),
+                    tls_key: h.tls_key.clone(),
                 })
             }
         })
@@ -1690,6 +1706,7 @@ session_idle_timeout = 400
                 websocket_enabled,
                 polling_enabled,
                 session_idle_timeout,
+                ..
             } => {
                 assert!(*websocket_enabled);
                 assert!(*polling_enabled);
@@ -1732,6 +1749,7 @@ name = "harp"
                 websocket_enabled,
                 polling_enabled,
                 session_idle_timeout,
+                ..
             } => {
                 assert!(*websocket_enabled);
                 assert!(*polling_enabled);

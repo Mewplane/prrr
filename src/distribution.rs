@@ -52,10 +52,12 @@ const QR_ERROR_CORRECTION: qrcode::EcLevel = qrcode::EcLevel::M;
 /// Minimum QR code SVG dimension in pixels.
 const QR_MIN_DIMENSION: u32 = 200;
 
-/// Default DNS servers for generated client configs.
+/// Default DNS servers (used in tests).
+#[cfg(test)]
 const DEFAULT_DNS: &[&str] = &["1.1.1.1", "8.8.8.8"];
 
-/// Default MTU for generated client configs.
+/// Default MTU (used in tests).
+#[cfg(test)]
 const DEFAULT_MTU: u16 = 1280;
 
 /// CIDR prefix length for per-client address assignment.
@@ -83,49 +85,73 @@ pub enum DistributionError {
 
 /// Server-side context needed to generate a client configuration.
 ///
-/// Carries the server's public keys and endpoint address. Created once
-/// at server startup and shared across all distribution operations.
+/// Carries the server's public keys, endpoint address, and network settings.
+/// Created once at server startup and shared across all distribution operations.
 #[derive(Debug, Clone)]
 pub struct ServerContext {
     /// Server listen endpoint (e.g. `"vpn.example.com:443"`).
     pub endpoint: String,
+    /// TLS server name (SNI) for client connections.
+    pub server_name: String,
     /// Server X25519 Noise IK public key (32 bytes).
     pub noise_public_key: [u8; 32],
     /// Server ML-KEM-768 encapsulation key (raw bytes).
     pub kem_public_key: Vec<u8>,
+    /// DNS servers to push to clients.
+    pub dns_servers: Vec<String>,
+    /// Tunnel MTU.
+    pub mtu: u16,
+    /// Default transport protocol (e.g. `"harp"` or `"masque"`).
+    pub transport_protocol: String,
 }
 
 // ---------------------------------------------------------------------------
 // Config generation
 // ---------------------------------------------------------------------------
 
+/// Default private key path for generated client configs.
+const DEFAULT_PRIVATE_KEY_PATH: &str = "~/.config/prrr/private.key";
+
 /// Generate a complete client TOML configuration string.
 ///
-/// The output includes the server endpoint, public keys, and client-specific
-/// settings (name, assigned IP, DNS, MTU). Private keys are never included.
+/// The output includes the server endpoint, server name, public keys,
+/// client-specific settings (name, assigned IP, DNS, MTU), transport
+/// protocol, and a default private key path. The private key itself
+/// is never included — only the path where the client should store it.
 pub fn generate_client_config(ctx: &ServerContext, record: &ClientRecord) -> Result<String, DistributionError> {
     let noise_b64 = base64::engine::general_purpose::STANDARD.encode(ctx.noise_public_key);
     let kem_b64 = base64::engine::general_purpose::STANDARD.encode(&ctx.kem_public_key);
     let ip_with_prefix = format!("{}{CLIENT_CIDR_PREFIX}", record.ip_address);
 
-    let dns_array = DEFAULT_DNS.iter().map(|d| format!("\"{d}\"")).collect::<Vec<_>>().join(", ");
+    let dns_array = ctx.dns_servers.iter().map(|d| format!("\"{d}\"")).collect::<Vec<_>>().join(", ");
 
     let mut config = String::new();
-    writeln!(config, "# prrr client configuration — generated for \"{}\"", record.name)
-        .map_err(|e| DistributionError::Serialization(e.to_string()))?;
-    writeln!(config).map_err(|e| DistributionError::Serialization(e.to_string()))?;
-    writeln!(config, "[client]").map_err(|e| DistributionError::Serialization(e.to_string()))?;
-    writeln!(config, "name = \"{}\"", record.name).map_err(|e| DistributionError::Serialization(e.to_string()))?;
-    writeln!(config).map_err(|e| DistributionError::Serialization(e.to_string()))?;
-    writeln!(config, "[server]").map_err(|e| DistributionError::Serialization(e.to_string()))?;
-    writeln!(config, "endpoint = \"{}\"", ctx.endpoint).map_err(|e| DistributionError::Serialization(e.to_string()))?;
-    writeln!(config, "public_key = \"{noise_b64}\"").map_err(|e| DistributionError::Serialization(e.to_string()))?;
-    writeln!(config, "pq_public_key = \"{kem_b64}\"").map_err(|e| DistributionError::Serialization(e.to_string()))?;
-    writeln!(config).map_err(|e| DistributionError::Serialization(e.to_string()))?;
-    writeln!(config, "[interface]").map_err(|e| DistributionError::Serialization(e.to_string()))?;
-    writeln!(config, "address = \"{ip_with_prefix}\"").map_err(|e| DistributionError::Serialization(e.to_string()))?;
-    writeln!(config, "dns = [{dns_array}]").map_err(|e| DistributionError::Serialization(e.to_string()))?;
-    write!(config, "mtu = {DEFAULT_MTU}").map_err(|e| DistributionError::Serialization(e.to_string()))?;
+    let w = |config: &mut String, args: std::fmt::Arguments<'_>| -> Result<(), DistributionError> {
+        config.write_fmt(args).map_err(|e| DistributionError::Serialization(e.to_string()))
+    };
+
+    w(
+        &mut config,
+        format_args!("# prrr client configuration — generated for \"{}\"\n", record.name),
+    )?;
+    w(&mut config, format_args!("\n"))?;
+    w(&mut config, format_args!("[client]\n"))?;
+    w(&mut config, format_args!("name = \"{}\"\n", record.name))?;
+    w(&mut config, format_args!("\n"))?;
+    w(&mut config, format_args!("[server]\n"))?;
+    w(&mut config, format_args!("endpoint = \"{}\"\n", ctx.endpoint))?;
+    w(&mut config, format_args!("server_name = \"{}\"\n", ctx.server_name))?;
+    w(&mut config, format_args!("public_key = \"{noise_b64}\"\n"))?;
+    w(&mut config, format_args!("pq_public_key = \"{kem_b64}\"\n"))?;
+    w(&mut config, format_args!("\n"))?;
+    w(&mut config, format_args!("[interface]\n"))?;
+    w(&mut config, format_args!("private_key_path = \"{DEFAULT_PRIVATE_KEY_PATH}\"\n"))?;
+    w(&mut config, format_args!("address = \"{ip_with_prefix}\"\n"))?;
+    w(&mut config, format_args!("dns = [{dns_array}]\n"))?;
+    w(&mut config, format_args!("mtu = {}\n", ctx.mtu))?;
+    w(&mut config, format_args!("\n"))?;
+    w(&mut config, format_args!("[transport]\n"))?;
+    w(&mut config, format_args!("protocol = \"{}\"", ctx.transport_protocol))?;
 
     Ok(config)
 }
@@ -299,8 +325,12 @@ mod tests {
     fn test_server_context() -> ServerContext {
         ServerContext {
             endpoint: TEST_ENDPOINT.to_string(),
+            server_name: "vpn.example.com".to_string(),
             noise_public_key: TEST_NOISE_KEY,
             kem_public_key: vec![0xBB; TEST_KEM_KEY_LEN],
+            dns_servers: DEFAULT_DNS.iter().map(|s| (*s).to_string()).collect(),
+            mtu: DEFAULT_MTU,
+            transport_protocol: "harp".to_string(),
         }
     }
 
@@ -332,9 +362,10 @@ mod tests {
         assert!(parsed.get("client").is_some(), "missing [client] section");
         assert!(parsed.get("server").is_some(), "missing [server] section");
         assert!(parsed.get("interface").is_some(), "missing [interface] section");
+        assert!(parsed.get("transport").is_some(), "missing [transport] section");
     }
 
-    // --- AC-2: Config contains server keys ---
+    // --- AC-2: Config contains server keys and server_name ---
 
     #[test]
     fn config_contains_server_keys() {
@@ -349,6 +380,12 @@ mod tests {
             server.get("endpoint").and_then(|v| v.as_str()),
             Some(TEST_ENDPOINT),
             "endpoint mismatch"
+        );
+
+        assert_eq!(
+            server.get("server_name").and_then(|v| v.as_str()),
+            Some("vpn.example.com"),
+            "server_name mismatch"
         );
 
         let noise_b64 = base64::engine::general_purpose::STANDARD.encode(TEST_NOISE_KEY);
@@ -399,19 +436,33 @@ mod tests {
             Some(i64::from(DEFAULT_MTU)),
             "mtu mismatch"
         );
+
+        let transport = parsed.get("transport").expect("[transport]");
+        assert_eq!(
+            transport.get("protocol").and_then(|v| v.as_str()),
+            Some("harp"),
+            "transport protocol mismatch"
+        );
     }
 
-    // --- AC-4: Config excludes private keys ---
+    // --- AC-4: Config excludes private key material ---
 
     #[test]
-    fn config_excludes_private_keys() {
+    fn config_excludes_private_key_material() {
         let ctx = test_server_context();
         let record = test_client_record();
         let config = generate_client_config(&ctx, &record).expect("generate config");
 
         let lower = config.to_lowercase();
-        assert!(!lower.contains("private"), "config must not contain 'private'");
+        // private_key_path is allowed (it's a file path, not key material)
+        // but actual key values or "secret" must not appear
         assert!(!lower.contains("secret"), "config must not contain 'secret'");
+
+        // Verify private_key_path is present but contains only a path, not raw key bytes
+        let parsed: toml::Value = toml::from_str(&config).expect("parse TOML");
+        let iface = parsed.get("interface").expect("[interface]");
+        let pk_path = iface.get("private_key_path").and_then(|v| v.as_str()).expect("private_key_path");
+        assert!(pk_path.ends_with(".key"), "private_key_path should be a file path");
     }
 
     // --- AC-5: QR SVG is valid SVG ---
@@ -571,8 +622,12 @@ mod tests {
     fn config_generation_with_large_kem_key() {
         let ctx = ServerContext {
             endpoint: TEST_ENDPOINT.to_string(),
+            server_name: "vpn.example.com".to_string(),
             noise_public_key: TEST_NOISE_KEY,
             kem_public_key: vec![0x42; 1184], // ML-KEM-768 encapsulation key size
+            dns_servers: DEFAULT_DNS.iter().map(|s| (*s).to_string()).collect(),
+            mtu: DEFAULT_MTU,
+            transport_protocol: "harp".to_string(),
         };
         let record = test_client_record();
         let config = generate_client_config(&ctx, &record).expect("generate config");

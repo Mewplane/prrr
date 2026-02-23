@@ -98,6 +98,10 @@ pub struct ReconnectConfig {
 /// Creates a new session (new handshake, new keys) on each reconnection
 /// attempt. The TUN device persists across reconnections.
 ///
+/// When `route_manager` is provided, routes are set up after each successful
+/// transport connection and torn down before retrying or exiting. This
+/// ensures routing only exists while the tunnel is active.
+///
 /// Exits cleanly when `cancel` is triggered (returns `Ok(())`).
 /// Only retries on transport/pipeline errors, not on cancellation.
 pub async fn run_with_reconnect<T: TunDevice + Clone>(
@@ -107,6 +111,7 @@ pub async fn run_with_reconnect<T: TunDevice + Clone>(
     server_kem_pub: &[u8],
     tun: T,
     config: &ReconnectConfig,
+    mut route_manager: Option<&mut crate::routing::RouteManager>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let mut backoff = BackoffState::new(config.backoff_initial_ms, config.backoff_max_ms);
@@ -147,6 +152,11 @@ pub async fn run_with_reconnect<T: TunDevice + Clone>(
             }
         };
 
+        // Set up routes after transport connects
+        if let Some(ref mut rm) = route_manager {
+            rm.up();
+        }
+
         let channel = EncryptedChannel::new(conn.session_keys.tx_key, conn.session_keys.rx_key);
         let stats = std::sync::Arc::new(TrafficStats::new());
         let pipeline = crate::tunnel::TunnelPipeline::new(tun.clone(), channel, conn.sender, conn.receiver, stats);
@@ -154,14 +164,26 @@ pub async fn run_with_reconnect<T: TunDevice + Clone>(
         tracing::info!("tunnel pipeline running");
         match pipeline.run(cancel.clone()).await {
             Ok(()) => {
+                // Tear down routes on clean exit
+                if let Some(ref mut rm) = route_manager {
+                    rm.down();
+                }
                 tracing::info!("tunnel pipeline exited cleanly");
                 return Ok(());
             }
             Err(TunnelError::Cancelled) => {
+                // Tear down routes on cancellation
+                if let Some(ref mut rm) = route_manager {
+                    rm.down();
+                }
                 tracing::info!("tunnel pipeline cancelled — shutting down");
                 return Ok(());
             }
             Err(e) => {
+                // Tear down routes before retry
+                if let Some(ref mut rm) = route_manager {
+                    rm.down();
+                }
                 if cancel.is_cancelled() {
                     tracing::info!("reconnect loop cancelled after pipeline error");
                     return Ok(());
@@ -459,7 +481,17 @@ mod tests {
             cancel_clone.cancel();
         });
 
-        let result = run_with_reconnect(&transport, &noise_keypair, &server_noise_pub, &server_kem_pub, tun, &config, cancel).await;
+        let result = run_with_reconnect(
+            &transport,
+            &noise_keypair,
+            &server_noise_pub,
+            &server_kem_pub,
+            tun,
+            &config,
+            None,
+            cancel,
+        )
+        .await;
 
         assert!(result.is_ok());
     }
@@ -494,7 +526,17 @@ mod tests {
             cancel_clone.cancel();
         });
 
-        let result = run_with_reconnect(&transport, &noise_keypair, &server_noise_pub, &server_kem_pub, tun, &config, cancel).await;
+        let result = run_with_reconnect(
+            &transport,
+            &noise_keypair,
+            &server_noise_pub,
+            &server_kem_pub,
+            tun,
+            &config,
+            None,
+            cancel,
+        )
+        .await;
 
         assert!(result.is_ok());
     }
@@ -533,7 +575,17 @@ mod tests {
             cancel_clone.cancel();
         });
 
-        let result = run_with_reconnect(&transport, &noise_keypair, &server_noise_pub, &server_kem_pub, tun, &config, cancel).await;
+        let result = run_with_reconnect(
+            &transport,
+            &noise_keypair,
+            &server_noise_pub,
+            &server_kem_pub,
+            tun,
+            &config,
+            None,
+            cancel,
+        )
+        .await;
 
         assert!(result.is_ok());
         assert!(connect_count.load(Ordering::Relaxed) >= min_connect_attempts);

@@ -70,10 +70,34 @@ fn build_server_context(config: &ServerConfig, server_args: &ServerArgs) -> anyh
     let port = server_args.listen.port();
     let endpoint = format!("{server_name}:{port}");
 
+    let dns_servers = config
+        .network
+        .as_ref()
+        .and_then(|n| n.dns_servers.as_ref())
+        .cloned()
+        .unwrap_or_else(|| crate::config::DEFAULT_DNS_SERVERS.iter().map(|s| (*s).to_string()).collect());
+    let mtu = config.network.as_ref().and_then(|n| n.mtu).unwrap_or(crate::config::DEFAULT_MTU);
+    let transport_protocol = config
+        .transports
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .find_map(|e| match e {
+            crate::config::TransportEntry::Harp(h) if h.enabled != Some(false) => Some("harp"),
+            crate::config::TransportEntry::Masque(m) if m.enabled != Some(false) => Some("masque"),
+            _ => None,
+        })
+        .unwrap_or(crate::config::DEFAULT_TRANSPORT_PROTOCOL)
+        .to_string();
+
     Ok(ServerContext {
         endpoint,
+        server_name: server_name.to_string(),
         noise_public_key,
         kem_public_key,
+        dns_servers,
+        mtu,
+        transport_protocol,
     })
 }
 
@@ -215,8 +239,12 @@ mod tests {
     fn test_server_context() -> ServerContext {
         ServerContext {
             endpoint: "127.0.0.1:443".to_string(),
+            server_name: "localhost".to_string(),
             noise_public_key: [0xAA; 32],
             kem_public_key: vec![0xBB; 64],
+            dns_servers: vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
+            mtu: 1280,
+            transport_protocol: "harp".to_string(),
         }
     }
 
