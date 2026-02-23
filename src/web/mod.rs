@@ -1,4 +1,4 @@
-// FRD: specs/frds/FRD-P006.md, specs/frds/FRD-P007.md
+// FRD: specs/frds/FRD-P006.md, specs/frds/FRD-P007.md, specs/frds/FRD-20260223-web-ui-logo-integration.md
 
 //! REST API backend and web frontend for VPN administration.
 //!
@@ -9,6 +9,8 @@
 pub mod auth;
 pub mod errors;
 pub mod handlers;
+/// HARP session management for the HTTPS API Relay Protocol.
+pub mod harp;
 pub mod spa;
 pub mod state;
 
@@ -17,7 +19,7 @@ pub use state::AppState;
 use std::net::SocketAddr;
 
 use axum::Router;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use tower_http::cors::{Any, CorsLayer};
 
 /// API version prefix for all routes.
@@ -33,6 +35,7 @@ pub fn build_router(state: AppState) -> Router {
     let protected_routes = Router::new()
         .route("/server/status", get(handlers::server_status))
         .route("/server/config", get(handlers::server_config))
+        .route("/server/transports", get(handlers::server_transports))
         .route("/clients", get(handlers::list_clients).post(handlers::create_client))
         .route("/clients/{id}", get(handlers::get_client).delete(handlers::delete_client))
         .route("/clients/{id}/suspend", post(handlers::suspend_client))
@@ -41,14 +44,25 @@ pub fn build_router(state: AppState) -> Router {
         .route("/clients/{id}/qr", get(handlers::get_client_qr))
         .route("/clients/{id}/config-url", post(handlers::create_config_url))
         .route("/stats/overview", get(handlers::stats_overview))
+        .route("/stats/traffic", get(handlers::stats_traffic))
+        .route("/harp/sessions", get(handlers::list_harp_sessions))
+        .route("/harp/sessions/{session_id_hex}", delete(handlers::terminate_harp_session))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth::require_auth));
+
+    let harp_routes = Router::new()
+        .route("/harp/session", post(harp::create_session))
+        .route("/harp/stream/{session_id}", get(harp::stream_handler))
+        .route("/harp/upload/{session_id}", post(harp::upload_handler))
+        .route("/harp/download/{session_id}", post(harp::download_handler));
 
     let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
 
     Router::new()
         .route("/", get(spa::spa_handler))
+        .route("/assets/logo_w.png", get(spa::logo_handler))
+        .route("/assets/logo_w_text.png", get(spa::logo_text_handler))
         .route("/c/{token}", get(handlers::get_config_by_token))
-        .nest(API_V1_PREFIX, auth_routes.merge(protected_routes))
+        .nest(API_V1_PREFIX, auth_routes.merge(protected_routes).merge(harp_routes))
         .fallback(get(spa::spa_handler))
         .layer(cors)
         .with_state(state)
@@ -103,7 +117,8 @@ mod tests {
 
     fn test_app_state() -> AppState {
         use crate::distribution::{ConfigTokenStore, ServerContext};
-        use crate::web::handlers::ServerConfigResponse;
+        use crate::web::handlers::{ServerConfigResponse, TransportInfoResponse};
+        use crate::web::harp::HarpSessionStore;
         let registry = ClientRegistry::new("10.66.66.0/24").expect("valid subnet");
         AppState {
             registry: Arc::new(Mutex::new(registry)),
@@ -132,6 +147,12 @@ mod tests {
                 web_admin_enabled: true,
                 metrics_enabled: false,
             }),
+            resolved_transports: Arc::new(vec![TransportInfoResponse::from_harp(true, true, 300)]),
+            harp_sessions: Arc::new(HarpSessionStore::new()),
+            server_noise_private_key: Arc::from([0u8; 32].as_slice()),
+            server_noise_public_key: [0u8; 32],
+            server_kem_dk_bytes: Arc::from([0u8; 0].as_slice()),
+            tunnel_spawner: None,
         }
     }
 
@@ -311,6 +332,43 @@ mod tests {
         assert_eq!(body.version, env!("CARGO_PKG_VERSION"));
     }
 
+    // AC-3: GET /api/v1/server/transports requires authentication
+    #[tokio::test]
+    async fn server_transports_requires_auth() {
+        let state = test_app_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/server/transports")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // AC-1: GET /api/v1/server/transports returns transport list with auth
+    #[tokio::test]
+    async fn server_transports_returns_list_with_auth() {
+        use crate::web::handlers::TransportListResponse;
+
+        let state = test_app_state();
+        let app = build_router(state);
+        let token = login_and_get_token(&app, "admin-pass").await;
+
+        let resp = app
+            .clone()
+            .oneshot(authed_request("GET", "/api/v1/server/transports", &token, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: TransportListResponse = parse_json(resp).await;
+        assert!(!body.transports.is_empty(), "transports list must not be empty");
+        assert_eq!(body.transports[0].name, "harp");
+    }
+
     #[tokio::test]
     async fn cors_preflight_returns_headers() {
         let state = test_app_state();
@@ -367,6 +425,56 @@ mod tests {
         assert_eq!(status.connected_clients, 7);
     }
 
+    // --- Logo asset route integration tests (FRD-20260223-web-ui-logo-integration) ---
+
+    #[tokio::test]
+    async fn logo_route_returns_png() {
+        let state = test_app_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/assets/logo_w.png")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .expect("content-type header")
+            .to_str()
+            .expect("valid header value");
+        assert_eq!(content_type, "image/png", "logo route must return image/png");
+        let body = axum::body::to_bytes(resp.into_body(), 1_048_576).await.unwrap();
+        assert!(!body.is_empty(), "logo body must not be empty");
+    }
+
+    #[tokio::test]
+    async fn logo_text_route_returns_png() {
+        let state = test_app_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/assets/logo_w_text.png")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .expect("content-type header")
+            .to_str()
+            .expect("valid header value");
+        assert_eq!(content_type, "image/png", "logo text route must return image/png");
+        let body = axum::body::to_bytes(resp.into_body(), 1_048_576).await.unwrap();
+        assert!(!body.is_empty(), "logo text body must not be empty");
+    }
+
     // --- SPA routing integration tests (P-007) ---
 
     #[tokio::test]
@@ -414,6 +522,101 @@ mod tests {
         let req = Request::builder()
             .method("GET")
             .uri("/api/v1/server/status")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // --- Traffic stats integration tests (FRD-20260223-client-traffic-stats-ui) ---
+
+    // AC-11: Traffic endpoint requires authentication
+    #[tokio::test]
+    async fn stats_traffic_requires_auth() {
+        let state = test_app_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/stats/traffic")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // Traffic endpoint returns data with auth
+    #[tokio::test]
+    async fn stats_traffic_returns_data_with_auth() {
+        use crate::web::handlers::TrafficStatsResponse;
+
+        let state = test_app_state();
+        let app = build_router(state);
+        let token = login_and_get_token(&app, "admin-pass").await;
+
+        let resp = app
+            .clone()
+            .oneshot(authed_request("GET", "/api/v1/stats/traffic", &token, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: TrafficStatsResponse = parse_json(resp).await;
+        assert_eq!(body.total_bytes_sent, 0);
+        assert_eq!(body.total_bytes_received, 0);
+        assert_eq!(body.client_count, 0);
+    }
+
+    // --- HARP session management integration tests (FRD-20260223-harp-session-management-ui) ---
+
+    // AC-2: Session list requires auth
+    #[tokio::test]
+    async fn harp_sessions_list_requires_auth() {
+        let state = test_app_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/harp/sessions")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // Session list returns data with auth
+    #[tokio::test]
+    async fn harp_sessions_list_with_auth() {
+        use crate::web::handlers::HarpSessionListResponse;
+
+        let state = test_app_state();
+        let _ = state.harp_sessions.create(uuid::Uuid::new_v4());
+        let app = build_router(state);
+        let token = login_and_get_token(&app, "admin-pass").await;
+
+        let resp = app
+            .clone()
+            .oneshot(authed_request("GET", "/api/v1/harp/sessions", &token, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: HarpSessionListResponse = parse_json(resp).await;
+        assert_eq!(body.sessions.len(), 1);
+    }
+
+    // Terminate session requires auth
+    #[tokio::test]
+    async fn harp_session_terminate_requires_auth() {
+        let state = test_app_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/harp/sessions/deadbeef12345678")
             .body(Body::empty())
             .unwrap();
 

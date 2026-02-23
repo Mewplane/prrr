@@ -2,12 +2,21 @@
 
 /// Encrypted bidirectional channel with nonce management and replay protection.
 pub mod encrypted_channel;
+/// HARP frame codec for HTTPS API Relay Protocol.
+pub mod harp;
 /// MASQUE CONNECT-UDP framing over QUIC DATAGRAMs (RFC 9297/9298).
 pub mod masque;
 /// QUIC client and server transport (quinn-based).
 pub mod quic;
 /// Shared TLS certificate verification.
 pub(crate) mod tls;
+/// Pluggable transport abstraction layer (traits + shared types).
+pub mod traits;
+
+pub use traits::{
+    BoxedDatagramReceiver, BoxedDatagramSender, ClientConnectParams, ClientTransport, ServerTransport, SharedServerState,
+    TransportConnection,
+};
 
 /// Errors produced by transport-layer operations.
 #[derive(Debug, thiserror::Error)]
@@ -64,4 +73,42 @@ pub enum TransportError {
     /// QUIC variable-length integer decoding failed.
     #[error("varint decode error: {0}")]
     VarintDecode(String),
+
+    /// HARP frame is shorter than the minimum header size.
+    #[error("HARP frame too short: expected at least {expected} bytes, got {actual}")]
+    HarpFrameTooShort {
+        /// Minimum valid frame length (header size).
+        expected: usize,
+        /// Actual frame length received.
+        actual: usize,
+    },
+
+    /// HARP frame has an unsupported protocol version.
+    #[error("HARP unsupported version: {0}")]
+    HarpUnsupportedVersion(u8),
+
+    /// HARP frame payload is truncated (fewer bytes than declared length).
+    #[error("HARP frame truncated: header declares {header_len} payload bytes, only {available} available")]
+    HarpFrameTruncated {
+        /// Payload length declared in the header.
+        header_len: usize,
+        /// Bytes actually available after the header.
+        available: usize,
+    },
+
+    /// HARP frame payload exceeds the maximum allowed size.
+    #[error("HARP payload too large: {0} bytes exceeds maximum 65535")]
+    HarpPayloadTooLarge(usize),
+
+    /// HARP frame has an unrecognized frame type value.
+    #[error("HARP unknown frame type: {0:#x}")]
+    HarpUnknownFrameType(u8),
+
+    /// HARP session channel was closed (session removed from store).
+    #[error("HARP channel closed")]
+    HarpChannelClosed,
+
+    /// HARP CLOSE frame received (peer requested session teardown).
+    #[error("HARP session closed by peer")]
+    HarpSessionClosed,
 }

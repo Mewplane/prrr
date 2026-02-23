@@ -184,8 +184,8 @@ fn script_server_config() {
     assert!(content.contains("[network]"), "Server script config must have [network] section");
     assert!(content.contains("[crypto]"), "Server script config must have [crypto] section");
     assert!(
-        content.contains("[transport]"),
-        "Server script config must have [transport] section"
+        content.contains("[[transports]]"),
+        "Server script config must have [[transports]] section"
     );
     assert!(
         content.contains("[obfuscation]"),

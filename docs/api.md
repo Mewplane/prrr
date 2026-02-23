@@ -62,7 +62,8 @@ Server status and uptime.
   "uptime_seconds": 3600,
   "version": "0.1.0",
   "connected_clients": 3,
-  "total_clients": 10
+  "total_clients": 10,
+  "active_harp_sessions": 2
 }
 ```
 
@@ -87,6 +88,34 @@ Non-sensitive server configuration.
   "metrics_enabled": false
 }
 ```
+
+### GET `/api/v1/server/transports`
+
+Enabled transport configurations.
+
+**Response:**
+
+```json
+{
+  "transports": [
+    {
+      "name": "harp",
+      "protocol": "https+ws",
+      "websocket_enabled": true,
+      "polling_enabled": true,
+      "session_idle_timeout": 300
+    },
+    {
+      "name": "masque",
+      "protocol": "quic+masque",
+      "max_idle_timeout": 300,
+      "keep_alive": 25
+    }
+  ]
+}
+```
+
+Fields are transport-specific: HARP includes `websocket_enabled`, `polling_enabled`, `session_idle_timeout`; MASQUE includes `max_idle_timeout`, `keep_alive`. Absent fields are omitted from the JSON.
 
 ---
 
@@ -281,6 +310,74 @@ Aggregate statistics.
 }
 ```
 
+### GET `/api/v1/stats/traffic`
+
+Aggregate traffic statistics across all clients.
+
+**Response:**
+
+```json
+{
+  "total_bytes_sent": 123456789,
+  "total_bytes_received": 987654321,
+  "client_count": 5
+}
+```
+
+---
+
+## HARP Session Management Endpoints (Admin)
+
+These endpoints require JWT authentication and are used to monitor and
+manage active HARP tunnel sessions from the web admin UI.
+
+### GET `/api/v1/harp/sessions`
+
+List all active HARP sessions.
+
+**Response:**
+
+```json
+{
+  "sessions": [
+    {
+      "session_id": "a1b2c3d4e5f67890",
+      "client_name": "alice",
+      "client_id": "a1b2c3d4-...",
+      "created_at": 1700000000,
+      "last_activity": 1700000060,
+      "idle_seconds": 5
+    }
+  ]
+}
+```
+
+The `session_id` is truncated to the first 16 hex characters for display
+safety (the full cryptographic session ID is not exposed). `created_at` and
+`last_activity` are Unix epoch seconds.
+
+### DELETE `/api/v1/harp/sessions/{session_id_hex}`
+
+Force-terminate an active HARP session.
+
+**Response (200):**
+
+```json
+{
+  "status": "terminated"
+}
+```
+
+**Response (404):**
+
+```json
+{
+  "error": "session not found"
+}
+```
+
+The `session_id_hex` parameter is matched as a prefix against active sessions.
+
 ---
 
 ## Error Responses
@@ -309,9 +406,20 @@ All error responses follow a consistent format:
 
 ## SPA Frontend
 
-The root path (`GET /`) serves an embedded single-page application built with Preact and HTM. The SPA uses hash-based routing (`#/login`, `#/`, `#/clients`) and communicates with the REST API described above.
+The root path (`GET /`) serves an embedded single-page application built with Preact and HTM. The SPA uses hash-based routing (`#/login`, `#/`, `#/sessions`, `#/settings`) and communicates with the REST API described above.
 
 The SPA is included in the binary via `include_str!` and has no runtime filesystem dependencies.
+
+### Static Assets
+
+Logo images are embedded in the binary via `include_bytes!` and served at:
+
+| Route | Description | Content-Type |
+|-------|-------------|-------------|
+| `GET /assets/logo_w.png` | Cat logo (sidebar, favicon) | `image/png` |
+| `GET /assets/logo_w_text.png` | Cat logo with text (login page) | `image/png` |
+
+These routes do not require authentication.
 
 ---
 
@@ -380,3 +488,86 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 # Health check (metrics port, no auth)
 curl -s http://localhost:9090/health | jq
 ```
+
+---
+
+## HARP Session Endpoints
+
+These endpoints handle VPN tunnel session establishment over HTTPS. They do
+**not** require JWT authentication — authentication is performed via the
+cryptographic handshake. All errors return `200 OK` with fake response data
+to prevent DPI fingerprinting.
+
+### POST `/api/v1/harp/session`
+
+Establish a new HARP VPN session via hybrid Noise IK + ML-KEM-768 handshake.
+
+**Request:**
+
+```json
+{
+  "noise_msg1": "<base64-encoded Noise IK message 1>",
+  "capabilities": ["stream", "poll"],
+  "timestamp": 1708700000
+}
+```
+
+**Response (200):**
+
+```json
+{
+  "session_id": "<base64-encoded 32-byte session ID>",
+  "noise_msg2": "<base64-encoded Noise IK message 2>",
+  "transport": {
+    "mode": "stream",
+    "stream_endpoint": "/api/v1/harp/stream/<session_id>",
+    "upload_endpoint": "/api/v1/harp/upload/<session_id>",
+    "download_endpoint": "/api/v1/harp/download/<session_id>"
+  },
+  "config": {
+    "rekey_interval": 3600,
+    "keepalive_interval": 25,
+    "max_frame_size": 65535,
+    "poll_interval_ms": 100
+  }
+}
+```
+
+**Notes:**
+- The `timestamp` must be within 30 seconds of the server's clock.
+- Failed handshakes return `200 OK` with a fake response (random session_id
+  and noise_msg2) that is structurally identical to a real response.
+- The client completes the handshake by calling `HybridInitiator::finish()`
+  with the returned `noise_msg2`.
+- Transport endpoint paths use URL-safe base64 encoding (no `/`, `+`, `=`)
+  for the session ID. The `session_id` field in the JSON body uses standard base64.
+
+### GET `/api/v1/harp/stream/{session_id}` (WebSocket)
+
+Bidirectional WebSocket streaming transport for an established HARP session.
+
+**Prerequisites:** A valid session from `POST /api/v1/harp/session`.
+
+**Request:** Standard HTTP Upgrade to WebSocket. The `{session_id}` path
+parameter is the URL-safe base64 encoding of the 32-byte session ID
+(as returned in `transport.stream_endpoint`).
+
+**Behavior:**
+
+- On successful upgrade, the server runs a bidirectional bridge:
+  - Server → Client: frames from the session's `to_client` channel are sent
+    as WebSocket `Binary` messages
+  - Client → Server: WebSocket `Binary` messages are forwarded to the
+    session's `from_client` channel
+- Each frame sent or received updates the session's `last_activity` timestamp
+- When the WebSocket closes (from either side), the session is removed from
+  the store
+
+**Error handling:**
+
+- Unknown or invalid session ID: the server still performs the WebSocket
+  upgrade (returning `101 Switching Protocols`) then immediately sends a
+  `Close` frame. This prevents DPI from distinguishing valid vs invalid
+  sessions at the HTTP level.
+- Non-WebSocket requests to this endpoint are rejected by axum's
+  WebSocket extractor.

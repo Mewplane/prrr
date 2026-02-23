@@ -6,7 +6,7 @@ This guide covers production deployment of prrr VPN servers with HTTPS-secured a
 
 - **Server**: Ubuntu 22.04+, Debian 11+, or Fedora 38+ with root access
 - **Domain**: A registered domain with DNS access (for Let's Encrypt certificates)
-- **Ports**: UDP 443 (VPN), TCP 80 (Let's Encrypt validation), TCP 9443 (HTTPS admin panel)
+- **Ports**: TCP 443 (HARP VPN), UDP 443 (MASQUE VPN, optional), TCP 80 (Let's Encrypt validation), TCP 9443 (HTTPS admin panel)
 - **Client**: Rust 1.85+ for building from source, or use installation script
 
 ## Deployment Options
@@ -53,7 +53,7 @@ sudo ./install-server.sh --domain prrr.example.com --admin-pass "your-secure-pas
 |--------|---------|-------------|
 | `--domain DOMAIN` | **required** | Domain name for Let's Encrypt certificates |
 | `--admin-pass PASSWORD` | auto-generated | Web admin password |
-| `--vpn-port PORT` | `443` | VPN listen port (UDP) |
+| `--vpn-port PORT` | `443` | VPN listen port (TCP for HARP, UDP for MASQUE) |
 | `--admin-port PORT` | `9443` | HTTPS admin panel port (TCP) |
 | `--no-certbot` | `false` | Skip Let's Encrypt setup (use existing certs) |
 | `--email EMAIL` | -- | Email for Let's Encrypt notifications |
@@ -230,7 +230,13 @@ subnet = "10.66.66.0/24"
 gateway = "10.66.66.1"
 dns_servers = ["1.1.1.1", "8.8.8.8"]
 
-[transport]
+[[transports]]
+name = "harp"
+websocket_enabled = true
+polling_enabled = true
+
+[[transports]]
+name = "masque"
 tls_cert = "/etc/letsencrypt/live/prrr.example.com/fullchain.pem"
 tls_key = "/etc/letsencrypt/live/prrr.example.com/privkey.pem"
 
@@ -351,17 +357,20 @@ sudo systemctl start prrr
 
 ```bash
 # Ubuntu/Debian (ufw)
-sudo ufw allow 443/udp comment 'prrr VPN'
+sudo ufw allow 443/tcp comment 'prrr VPN (HARP)'
+sudo ufw allow 443/udp comment 'prrr VPN (MASQUE)'
 sudo ufw allow 80/tcp comment 'Let\'s Encrypt'
 sudo ufw allow 9443/tcp comment 'prrr Admin HTTPS'
 
 # Fedora (firewalld)
+sudo firewall-cmd --permanent --add-port=443/tcp
 sudo firewall-cmd --permanent --add-port=443/udp
 sudo firewall-cmd --permanent --add-port=80/tcp
 sudo firewall-cmd --permanent --add-port=9443/tcp
 sudo firewall-cmd --reload
 
 # Or using iptables directly
+sudo iptables -A INPUT -p tcp --dport 443 -j ACCEPT
 sudo iptables -A INPUT -p udp --dport 443 -j ACCEPT
 sudo iptables -A INPUT -p tcp --dport 80 -j ACCEPT
 sudo iptables -A INPUT -p tcp --dport 9443 -j ACCEPT
@@ -396,7 +405,8 @@ sudo systemctl status prrr
 sudo systemctl status nginx
 
 # Check ports
-sudo ss -ulnp | grep 443     # VPN (UDP)
+sudo ss -tlnp | grep 443     # VPN — HARP (TCP)
+sudo ss -ulnp | grep 443     # VPN — MASQUE (UDP), if enabled
 sudo ss -tlnp | grep 8443    # prrr admin (HTTP, localhost only)
 sudo ss -tlnp | grep 9443    # nginx (HTTPS, public)
 
@@ -552,6 +562,147 @@ sudo sed -i 's/PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/s
 sudo systemctl restart sshd
 ```
 
+## Podman E2E Testing
+
+The project includes a containerized end-to-end test environment using Podman. This creates a real VPN tunnel between a server and client running in separate containers, validating the full connection lifecycle without requiring host-level privileges beyond what Podman needs.
+
+### Prerequisites
+
+- **Podman** 4.0+ (rootless mode supported)
+- **Linux kernel** with TUN/TAP support (`/dev/net/tun`)
+- **SELinux note**: On Fedora/RHEL, the test script uses `--security-opt label=disable` to allow TUN device access in rootless containers
+
+### Quick Start
+
+```bash
+# Build the container image
+make podman-build
+
+# Run the full E2E test (both MASQUE and HARP transports)
+make podman-e2e
+
+# Run individual transports
+make podman-e2e-masque    # MASQUE/QUIC only
+make podman-e2e-harp      # HARP/HTTP+WebSocket only
+make podman-e2e-multi     # Both transports sequentially
+```
+
+### What the E2E Test Validates
+
+1. **Container image build** — Multi-stage Dockerfile compiles prrr from source
+2. **Server startup** — Server generates keys, enables both MASQUE and HARP transports
+3. **Client registration** — `prrr server client add` registers a test client and exports its config
+4. **Key distribution** — Private key is captured from server output and injected into client config
+5. **Transport selection** — Client selects MASQUE or HARP based on `PRRR_TRANSPORT` env var
+6. **Tunnel creation** — Both containers create TUN devices (`prrr0`) in their own network namespaces
+7. **Bidirectional connectivity** — Client pings server VPN gateway, server pings client VPN IP
+
+### Architecture
+
+The test uses `podman network create` (not a pod) so each container has its own network namespace. This is required because both server and client create a TUN device named `prrr0` — sharing a network namespace would cause `EBUSY` conflicts.
+
+```
+┌─────────────────────────────────────────────────┐
+│              Podman Network (bridge)             │
+│                                                  │
+│  ┌──────────────┐         ┌──────────────┐       │
+│  │   Server      │         │   Client      │      │
+│  │  10.89.x.2    │◄───────►│  10.89.x.3    │      │
+│  │               │  QUIC   │               │      │
+│  │  TUN: prrr0   │         │  TUN: prrr0   │      │
+│  │  10.66.66.1   │◄ ─ ─ ─►│  10.66.66.2   │      │
+│  └──────────────┘  tunnel  └──────────────┘       │
+└─────────────────────────────────────────────────┘
+```
+
+### Container Capabilities
+
+The containers require specific Linux capabilities:
+
+| Capability | Purpose |
+|---|---|
+| `CAP_NET_ADMIN` | Create and configure TUN devices |
+| `CAP_NET_RAW` | ICMP ping for connectivity verification |
+| `--device=/dev/net/tun` | Access to the TUN/TAP kernel interface |
+| `--security-opt label=disable` | Allow TUN access under SELinux (Fedora/RHEL) |
+
+### Environment Variables
+
+The entrypoint script supports these environment variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `PRRR_MODE` | `server` | Container mode: `server` or `client` |
+| `PRRR_LISTEN_ADDR` | `0.0.0.0:443` | Server listen address |
+| `PRRR_CLIENT_NAME` | `test-client` | Client name for registration |
+| `PRRR_SERVER_NAME` | `localhost` | TLS SNI server name |
+| `PRRR_SERVER_ENDPOINT` | `127.0.0.1:443` | Server address for client connection |
+| `PRRR_SHARED_DIR` | `/shared` | Shared volume for config exchange |
+| `PRRR_TRANSPORT` | `harp` | Client transport protocol: `harp` or `masque` |
+
+### Manual Testing
+
+Run individual components for debugging:
+
+```bash
+# Build image
+podman build -t prrr-test -f deploy/client/Containerfile .
+
+# Create network and shared volume
+podman network create prrr-net
+podman volume create prrr-shared
+
+# Start server
+podman run -d --name prrr-server --network prrr-net \
+  --cap-add=NET_ADMIN --cap-add=NET_RAW --device=/dev/net/tun \
+  --security-opt label=disable \
+  -v prrr-shared:/shared \
+  -e PRRR_MODE=server \
+  -e PRRR_CLIENT_NAME=test-client \
+  prrr-test
+
+# Check server logs
+podman logs -f prrr-server
+
+# Get server IP
+SERVER_IP=$(podman inspect prrr-server \
+  --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+
+# Start client
+podman run -d --name prrr-client --network prrr-net \
+  --cap-add=NET_ADMIN --cap-add=NET_RAW --device=/dev/net/tun \
+  --security-opt label=disable \
+  -v prrr-shared:/shared:ro \
+  -e PRRR_MODE=client \
+  -e PRRR_SERVER_NAME=localhost \
+  -e PRRR_SERVER_ENDPOINT="${SERVER_IP}:443" \
+  prrr-test
+
+# Check client logs
+podman logs -f prrr-client
+
+# Test connectivity
+podman exec prrr-client ping -c 3 -W 5 10.66.66.1
+podman exec prrr-server ping -c 3 -W 5 10.66.66.2
+
+# Cleanup
+podman rm -f prrr-server prrr-client
+podman volume rm prrr-shared
+podman network rm prrr-net
+```
+
+### Integration Tests
+
+Rust integration tests in `tests/e2e_podman.rs` validate the container artifacts (Containerfile, entrypoint, orchestration script) without requiring Podman to be installed. The full E2E test is gated behind the `podman-e2e` feature flag and `#[ignore]` attribute — it runs only via `make podman-e2e`.
+
+```bash
+# Run unit-level container artifact tests (no Podman needed)
+cargo test --test e2e_podman
+
+# Run full E2E test (requires Podman + root-capable TUN)
+make podman-e2e
+```
+
 ## Troubleshooting
 
 ### "Address already in use" errors
@@ -680,10 +831,11 @@ The VPN transport (QUIC/MASQUE) uses its own TLS certificate, separate from the 
 
 ### Using Let's Encrypt for VPN Transport
 
-If you already obtained Let's Encrypt certificates (Step 4 above), point the VPN transport at the same certificates:
+If you already obtained Let's Encrypt certificates (Step 4 above), point the MASQUE transport at the same certificates:
 
 ```toml
-[transport]
+[[transports]]
+name = "masque"
 tls_cert = "/etc/letsencrypt/live/prrr.example.com/fullchain.pem"
 tls_key = "/etc/letsencrypt/live/prrr.example.com/privkey.pem"
 ```
@@ -740,7 +892,7 @@ Use this checklist to verify your production deployment is resistant to Deep Pac
 ### Server Configuration
 
 - [ ] **Use a real domain name** — Register a domain and point it at your server. Bare IP addresses in TLS SNI are flagged by DPI.
-- [ ] **Use a CA-signed TLS certificate** — Configure `tls_cert` and `tls_key` in `[transport]` with Let's Encrypt or another CA. Self-signed certificates are trivially detectable.
+- [ ] **Use a CA-signed TLS certificate** — Configure `tls_cert` and `tls_key` in the MASQUE `[[transports]]` entry with Let's Encrypt or another CA. Self-signed certificates are trivially detectable.
 - [ ] **Set `server_name` to the real domain** — The server's `server_name` must match the domain in your TLS certificate. Mismatches between SNI and certificate SANs are a DPI signal.
 - [ ] **Use port 443** — QUIC on non-standard ports draws attention. Port 443 is expected for HTTPS/QUIC traffic.
 - [ ] **Verify with server doctor** — Run `prrr server --config /etc/prrr/server.toml doctor` and resolve all warnings.

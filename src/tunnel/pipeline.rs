@@ -641,4 +641,71 @@ mod tests {
 
         cancel.cancel();
     }
+
+    // -- AC-7 (pipeline bridge): Full pipeline with HarpSender/HarpReceiver --
+    // FRD: specs/frds/FRD-20260223-harp-pipeline-bridge.md
+
+    #[tokio::test]
+    async fn harp_pipeline_bidirectional() {
+        use crate::transport::harp::{HarpReceiver, HarpSender};
+
+        // Channels: client_tx → proxy_rx (client sends to proxy)
+        //           proxy_tx → client_rx (proxy sends to client)
+        let (client_tx, proxy_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (proxy_tx, client_rx) = mpsc::channel::<Vec<u8>>(256);
+
+        let (client_tun, client_handle) = MockTun::new(DEFAULT_TUNNEL_MTU);
+        let (proxy_tun, proxy_handle) = MockTun::new(DEFAULT_TUNNEL_MTU);
+
+        let client_channel = EncryptedChannel::new(TEST_TX_KEY, TEST_RX_KEY);
+        let proxy_channel = EncryptedChannel::new(TEST_RX_KEY, TEST_TX_KEY);
+
+        let client_sender = HarpSender::new(client_tx);
+        let client_receiver = HarpReceiver::new(Arc::new(TokioMutex::new(client_rx)));
+        let proxy_sender = HarpSender::new(proxy_tx);
+        let proxy_receiver = HarpReceiver::new(Arc::new(TokioMutex::new(proxy_rx)));
+
+        let client_pipeline = TunnelPipeline::new(
+            client_tun,
+            client_channel,
+            client_sender,
+            client_receiver,
+            Arc::new(TrafficStats::new()),
+        );
+
+        let proxy_pipeline = TunnelPipeline::new(
+            proxy_tun,
+            proxy_channel,
+            proxy_sender,
+            proxy_receiver,
+            Arc::new(TrafficStats::new()),
+        );
+
+        let cancel = CancellationToken::new();
+        let cancel_c = cancel.clone();
+        let cancel_p = cancel.clone();
+
+        let _client_task = tokio::spawn(async move { client_pipeline.run(cancel_c).await });
+        let _proxy_task = tokio::spawn(async move { proxy_pipeline.run(cancel_p).await });
+
+        // Client → Proxy
+        let msg = b"harp-client-to-proxy";
+        client_handle.inject_packet(msg).await.expect("inject");
+        let captured = tokio::time::timeout(std::time::Duration::from_secs(2), proxy_handle.capture_packet())
+            .await
+            .expect("timeout")
+            .expect("capture");
+        assert_eq!(captured, msg);
+
+        // Proxy → Client
+        let reply = b"harp-proxy-to-client";
+        proxy_handle.inject_packet(reply).await.expect("inject");
+        let captured = tokio::time::timeout(std::time::Duration::from_secs(2), client_handle.capture_packet())
+            .await
+            .expect("timeout")
+            .expect("capture");
+        assert_eq!(captured, reply);
+
+        cancel.cancel();
+    }
 }

@@ -447,6 +447,10 @@ RUST_LOG=prrr=trace prrr server
 - **Distribution:** `GET /c/{token}` — public config retrieval by token (no auth)
 - `ApiError` — typed error enum mapping to HTTP status codes (400, 401, 404, 409, 500)
 - `spa_handler()` — serves embedded HTML for all non-API GET requests (client-side hash routing)
+- `logo_handler()` — serves embedded `logo_w.png` at `GET /assets/logo_w.png` (image/png)
+- `logo_text_handler()` — serves embedded `logo_w_text.png` at `GET /assets/logo_w_text.png` (image/png)
+- `server_transports()` — `GET /api/v1/server/transports` returns enabled transport configurations
+- `stats_traffic()` — `GET /api/v1/stats/traffic` returns aggregate traffic statistics across all clients
 - CORS enabled via `tower-http` for SPA development
 - Dependencies: `axum 0.8`, `jsonwebtoken 9`, `argon2 0.5`, `tower-http 0.6`
 
@@ -480,13 +484,18 @@ interface is available at `http://<listen_addr>/` (default `http://0.0.0.0:8443/
 - Client distribution in creation modal: Show QR Code, Share URL, Download Config buttons (P-009B)
 - Settings page: read-only server configuration display with card grid (P-009B)
 - Suspend, resume, and delete client actions with confirmation
+- Cat logo in sidebar navigation, cat+text logo on login page, favicon in browser tab
+- Transport visibility: Settings page shows transport config cards, Dashboard shows HARP session count, client table has Transport column
+- Traffic statistics: client table shows per-client sent/received bytes, Dashboard shows aggregate totals
+- HARP session management: dedicated Sessions page with session list, terminate action, and sidebar session count badge
 - Dark theme (automatic, no toggle needed)
 - Auto-refreshing dashboard (every 10 seconds)
 
 **Architecture:**
 - Single `assets/index.html` file embedded in binary via `include_str!`
+- Logo images embedded via `include_bytes!` and served at `/assets/logo_w.png` and `/assets/logo_w_text.png`
 - Preact + HTM loaded from esm.sh CDN (no build step, no bundler)
-- Hash-based client-side routing (`#/login`, `#/`, `#/clients`)
+- Hash-based client-side routing (`#/login`, `#/`, `#/sessions`, `#/settings`)
 - Zero runtime filesystem dependency — fully self-contained binary
 - All data fetched from the REST API endpoints (P-006)
 
@@ -763,12 +772,18 @@ Web API tests (P-006, P-009B):
 - 12 error mapping tests — `ApiError` variants and `RegistryError` conversion
 - 13 auth tests — Argon2id password verify, JWT create/verify/expired/tampered, login handler, auth middleware
 - 21 handler tests — server status, server config, client CRUD (list/get/create/delete/suspend/resume), stats overview, client traffic response
+- 4 HARP session handler tests — list empty, list with sessions (client name resolved), terminate, terminate not found
 - 7 integration tests — full CRUD flow through router, auth rejection, CORS, graceful shutdown, shared active count, server config auth + JSON response
+- 3 HARP session integration tests — list requires auth, list with auth returns data, terminate requires auth
 
 Web frontend tests (P-007, P-009B):
 
 - 8 SPA handler tests — returns HTML, contains Preact CDN import, app mount element, page title, Settings nav, QR button, Share URL button, Download Config button
-- 3 SPA routing tests — root serves HTML, fallback serves HTML, API routes not captured by fallback
+- 7 logo tests — logo_handler returns PNG with correct content-type and size, logo_text_handler returns PNG with correct content-type and size, SPA HTML contains sidebar logo, login logo, and favicon
+- 4 transport visibility SPA tests — transport section, HARP session card, transport column, getTransports API
+- 9 HARP session management SPA tests — sessions route, table headers, nav item, terminate button, session count badge, getHarpSessions API, terminateHarpSession API, active sessions title, empty state
+- 4 transport handler tests — transports endpoint returns list, MASQUE transport fields, server status includes HARP sessions, zero HARP sessions
+- 7 SPA routing tests — root serves HTML, fallback serves HTML, API routes not captured by fallback, logo route returns PNG, logo text route returns PNG, transports requires auth, transports returns list with auth
 
 CLI tests (P-009B):
 

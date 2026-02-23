@@ -12,7 +12,7 @@ General server settings.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `listen_addr` | String | `"0.0.0.0:443"` | Address and port to listen on (UDP) |
+| `listen_addr` | String | `"0.0.0.0:443"` | Address and port to listen on (TCP for HARP, UDP for MASQUE) |
 | `max_clients` | u32 | `100` | Maximum concurrent client connections |
 | `log_level` | String | `"info"` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
 | `data_dir` | String | `"/var/lib/prrr"` | Directory for database and runtime files |
@@ -40,15 +40,35 @@ Cryptographic key paths and rekeying.
 
 Keys are generated automatically on first run if the files don't exist. Public keys are saved alongside as `.pub` files.
 
-### `[transport]`
+### `[[transports]]`
 
-Transport protocol settings.
+Transport protocol settings. Multiple transports can be enabled simultaneously
+using TOML's array-of-tables syntax. Each entry has a `name` field that selects
+the transport type, plus transport-specific settings.
+
+If `[[transports]]` is absent, the server defaults to a single enabled HARP
+transport with all-default values.
+
+#### MASQUE Transport (`name = "masque"`)
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `protocol` | String | `"masque"` | Transport protocol |
-| `max_idle_timeout` | u64 | `300` | Connection idle timeout in seconds |
-| `keep_alive` | u64 | `25` | Keep-alive interval in seconds |
+| `name` | String | -- | Must be `"masque"` |
+| `enabled` | bool | `true` | Whether this transport is active |
+| `max_idle_timeout` | u64 | `300` | QUIC connection idle timeout in seconds |
+| `keep_alive` | u64 | `25` | QUIC keep-alive interval in seconds |
+| `tls_cert` | String | -- | Path to TLS certificate (PEM) for QUIC |
+| `tls_key` | String | -- | Path to TLS private key (PEM) for QUIC |
+
+#### HARP Transport (`name = "harp"`)
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `name` | String | -- | Must be `"harp"` |
+| `enabled` | bool | `true` | Whether this transport is active |
+| `websocket_enabled` | bool | `true` | Enable WebSocket streaming binding |
+| `polling_enabled` | bool | `true` | Enable HTTP polling fallback binding |
+| `session_idle_timeout` | u64 | `300` | HARP session idle timeout in seconds |
 
 ### `[obfuscation]`
 
@@ -162,12 +182,17 @@ Traffic routing rules.
 
 ### `[transport]`
 
-Client transport settings.
+Client transport settings. The client uses a single transport at a time.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `protocol` | String | Transport protocol |
-| `keep_alive` | u64 | Keep-alive interval in seconds |
+| `protocol` | String | Transport protocol: `"harp"` (default) or `"masque"` |
+| `keep_alive` | u64 | Keep-alive interval in seconds (MASQUE) |
+| `insecure_skip_verify` | bool | Skip TLS certificate verification (dev/test only) |
+| `preferred_binding` | String | HARP binding preference: `"stream"` (WebSocket) or `"poll"` (HTTP polling) |
+| `poll_interval_ms` | u64 | HARP polling interval in milliseconds |
+| `reconnect_backoff_ms` | u64 | Initial reconnection backoff delay in ms (default: 1000) |
+| `reconnect_max_backoff_ms` | u64 | Maximum reconnection backoff delay in ms (default: 30000) |
 
 ### `[obfuscation]`
 
@@ -228,10 +253,20 @@ identity_key_path = "/etc/prrr/keys/server_identity.key"
 pq_key_path = "/etc/prrr/keys/server_pq.key"
 rekey_interval = 3600
 
-[transport]
-protocol = "masque"
+[[transports]]
+name = "harp"
+enabled = true
+websocket_enabled = true
+polling_enabled = true
+session_idle_timeout = 300
+
+[[transports]]
+name = "masque"
+enabled = true
 max_idle_timeout = 300
 keep_alive = 25
+tls_cert = "/etc/prrr/tls/cert.pem"
+tls_key = "/etc/prrr/tls/key.pem"
 
 [obfuscation]
 enabled = true
@@ -288,8 +323,12 @@ all_traffic = true
 allowed_ips = ["0.0.0.0/0", "::/0"]
 
 [transport]
-protocol = "masque"
-keep_alive = 25
+protocol = "harp"   # or "masque" for QUIC-based transport
+# preferred_binding = "stream"  # HARP only: "stream" (WebSocket) or "poll" (HTTP)
+# poll_interval_ms = 500         # HARP polling only
+# keep_alive = 25                # MASQUE only
+# reconnect_backoff_ms = 1000    # Initial reconnection backoff (ms)
+# reconnect_max_backoff_ms = 30000  # Maximum reconnection backoff (ms)
 
 [obfuscation]
 enabled = true

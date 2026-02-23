@@ -28,6 +28,11 @@ help:
 	@echo "  clean            - Clean build artifacts"
 	@echo "  bench            - Run benchmarks"
 	@echo "  shellcheck       - Lint installation scripts"
+	@echo "  podman-build     - Build Podman E2E test image"
+	@echo "  podman-e2e       - Run Podman E2E test suite (all transports)"
+	@echo "  podman-e2e-masque - Run Podman E2E with MASQUE transport"
+	@echo "  podman-e2e-harp  - Run Podman E2E with HARP transport"
+	@echo "  podman-e2e-multi - Run Podman E2E with both transports"
 	@echo "  android-debug    - Build Android debug APK"
 	@echo "  android-release  - Build Android release AAB and APK"
 	@echo "  android-test     - Run Android unit tests"
@@ -80,12 +85,62 @@ audit:
 clean:
 	$(CARGO) clean
 
-# Shellcheck: lint installation scripts (P-011)
+# Shellcheck: lint installation scripts (P-011) and E2E scripts (Step 3)
 .PHONY: shellcheck
 shellcheck:
 	@echo "Running shellcheck on installation scripts..."
 	shellcheck scripts/install-server.sh scripts/install-client.sh
+	@echo "Running shellcheck on E2E scripts..."
+	shellcheck deploy/client/entrypoint.sh deploy/client/run-podman.sh
 	@echo "Shellcheck passed"
+
+# =============================================================================
+# Podman E2E targets (HARP Roadmap Step 3)
+# =============================================================================
+
+PODMAN_IMAGE ?= prrr-e2e
+PODMAN_TAG ?= latest
+
+## podman-build: Build Podman E2E test image
+.PHONY: podman-build
+podman-build:
+	@echo "Building Podman E2E image $(PODMAN_IMAGE):$(PODMAN_TAG)..."
+	podman build \
+		-t $(PODMAN_IMAGE):$(PODMAN_TAG) \
+		-f deploy/client/Containerfile .
+	@echo "Podman image built: $(PODMAN_IMAGE):$(PODMAN_TAG)"
+
+## podman-e2e: Run full Podman E2E test suite (all transports)
+.PHONY: podman-e2e
+podman-e2e: podman-e2e-multi
+
+## podman-e2e-masque: Run Podman E2E with MASQUE transport only
+.PHONY: podman-e2e-masque
+podman-e2e-masque:
+	@echo "Running Podman E2E test (MASQUE)..."
+	PRRR_IMAGE_NAME=$(PODMAN_IMAGE) PRRR_IMAGE_TAG=$(PODMAN_TAG) \
+		PRRR_TRANSPORT=masque ./deploy/client/run-podman.sh
+	@echo "Podman E2E (MASQUE) complete"
+
+## podman-e2e-harp: Run Podman E2E with HARP transport only
+.PHONY: podman-e2e-harp
+podman-e2e-harp:
+	@echo "Running Podman E2E test (HARP)..."
+	PRRR_IMAGE_NAME=$(PODMAN_IMAGE) PRRR_IMAGE_TAG=$(PODMAN_TAG) \
+		PRRR_TRANSPORT=harp ./deploy/client/run-podman.sh
+	@echo "Podman E2E (HARP) complete"
+
+## podman-e2e-multi: Run Podman E2E testing both transports sequentially
+.PHONY: podman-e2e-multi
+podman-e2e-multi:
+	@echo "Running Podman E2E multi-transport test..."
+	@echo "--- Phase 1: MASQUE ---"
+	PRRR_IMAGE_NAME=$(PODMAN_IMAGE) PRRR_IMAGE_TAG=$(PODMAN_TAG) \
+		PRRR_TRANSPORT=masque ./deploy/client/run-podman.sh
+	@echo "--- Phase 2: HARP ---"
+	PRRR_IMAGE_NAME=$(PODMAN_IMAGE) PRRR_IMAGE_TAG=$(PODMAN_TAG) \
+		PRRR_TRANSPORT=harp PRRR_SKIP_BUILD=1 ./deploy/client/run-podman.sh
+	@echo "Podman E2E multi-transport complete"
 
 # =============================================================================
 # Android targets (Feature 3.7)
