@@ -6,7 +6,7 @@ This guide walks you through installing prrr, starting a server, registering you
 
 - **Rust 1.85+** (edition 2024) for building from source
 - **Linux** for production TUN device support (tests run on any platform via MockTun)
-- **UDP port 443** open on the server (firewall must allow inbound UDP)
+- **TCP port 443** open on the server for HARP (default transport); optionally **UDP port 443** for MASQUE
 - **Root or CAP_NET_ADMIN** on the client for creating TUN devices
 
 ## Installation
@@ -86,7 +86,7 @@ The script supports Ubuntu 22.04+, Debian 11+, and Fedora 38+. Run with `--help`
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--admin-pass PASSWORD` | auto-generated | Web admin password |
-| `--port PORT` | `443` | VPN listen port (UDP) |
+| `--port PORT` | `443` | VPN listen port (TCP for HARP, UDP for MASQUE) |
 | `--web-port PORT` | `8443` | Web admin port (TCP) |
 | `--domain DOMAIN` | -- | Domain name for TLS |
 | `--no-web` | `false` | Skip web admin setup |
@@ -120,20 +120,21 @@ subnet = "10.66.66.0/24"
 dns_servers = ["1.1.1.1", "8.8.8.8"]
 mtu = 1280
 
-[transport]
-tls_cert = "/etc/letsencrypt/live/vpn.example.com/fullchain.pem"
-tls_key = "/etc/letsencrypt/live/vpn.example.com/privkey.pem"
+[[transports]]
+name = "harp"
+websocket_enabled = true
+polling_enabled = true
 
 [crypto]
 identity_key_path = "/etc/prrr/keys/server_identity.key"
 pq_key_path = "/etc/prrr/keys/server_pq.key"
 ```
 
-All fields are optional. Missing values use built-in defaults. See [Configuration Reference](configuration.md) for the complete list.
+All fields are optional. Missing values use built-in defaults. If `[[transports]]` is absent, the server defaults to a single HARP transport. See [Configuration Reference](configuration.md) for the complete list.
 
 **Important:** Set `server_name` to your server's public IP or domain name. This value is used in exported client configs as the connection endpoint. If left as `localhost`, clients won't be able to connect remotely.
 
-**TLS Certificates:** The `[transport]` section configures the QUIC/MASQUE transport layer. When `tls_cert` and `tls_key` are set, the server presents a CA-signed certificate to clients. This is critical for production deployments — without a real certificate, DPI systems can detect the self-signed fallback as anomalous traffic. See [Deployment Guide](deployment.md) for Let's Encrypt setup.
+**TLS Certificates:** For MASQUE transport, configure `tls_cert` and `tls_key` in the `[[transports]]` entry. When set, the server presents a CA-signed certificate to clients. This is critical for production MASQUE deployments — without a real certificate, DPI systems can detect the self-signed fallback as anomalous traffic. HARP transport uses the Axum HTTP server's TLS configuration instead. See [Deployment Guide](deployment.md) for Let's Encrypt setup.
 
 Start the server:
 
@@ -245,7 +246,8 @@ systemctl status prrr
 **6. Verify the server is listening:**
 
 ```bash
-ss -ulnp | grep 443     # VPN (UDP)
+ss -tlnp | grep 443     # VPN — HARP (TCP)
+ss -ulnp | grep 443     # VPN — MASQUE (UDP), if enabled
 ss -tlnp | grep 8443    # Web admin (TCP)
 ```
 
@@ -375,10 +377,19 @@ sudo systemctl enable prrr-client
 
 ### Verify Connection
 
-On the client side, you should see:
+On the client side, you should see (HARP, default):
 
 ```
-INFO prrr::client: connecting to 164.92.235.224:443
+INFO prrr::client: connecting to 164.92.235.224:443 via HARP
+INFO prrr::client: HARP session established (WebSocket)
+INFO prrr::client: hybrid handshake complete
+INFO prrr::client: tunnel pipeline running
+```
+
+Or with MASQUE transport:
+
+```
+INFO prrr::client: connecting to 164.92.235.224:443 via MASQUE
 INFO prrr::client: QUIC connection established to 164.92.235.224:443
 INFO prrr::client: MASQUE tunnel established
 INFO prrr::client: hybrid handshake complete
@@ -505,7 +516,7 @@ prrr handles graceful shutdown on SIGINT (Ctrl+C) and SIGTERM (systemd, Docker).
 ### Server won't start
 
 1. Run `prrr server doctor` to check configuration, keys, and port availability.
-2. Check that UDP port 443 is not in use: `ss -ulnp | grep 443`
+2. Check that TCP port 443 is not in use: `ss -tlnp | grep 443` (for HARP); also `ss -ulnp | grep 443` (for MASQUE).
 3. Verify the data directory is writable.
 4. Try `--log-level debug` for detailed output.
 

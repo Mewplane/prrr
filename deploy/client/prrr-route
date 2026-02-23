@@ -80,7 +80,7 @@ do_up() {
         if ip route show default | grep -q 'dev tun'; then
             echo "Warning: another VPN is active (tun device detected)." >&2
             echo "Full-tunnel mode will route traffic through prrr instead." >&2
-            echo "The prrr QUIC connection itself will continue through the existing VPN." >&2
+            echo "The prrr VPN connection itself will continue through the existing VPN." >&2
         fi
 
         echo "Setting up full-tunnel routing..."
@@ -88,7 +88,7 @@ do_up() {
         # 1. Pin the VPN server's IP to go through the CURRENT path.
         #    This uses `ip route get` result — if another VPN is active,
         #    the server route goes through that VPN. This prevents the
-        #    prrr QUIC connection from looping into its own tunnel.
+        #    prrr VPN connection from looping into its own tunnel.
         if [[ -n "$CURRENT_GW" ]]; then
             ip route add "$SERVER_ENDPOINT" via "$CURRENT_GW" dev "$CURRENT_IF" 2>/dev/null || true
         else

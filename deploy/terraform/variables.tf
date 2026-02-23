@@ -55,7 +55,7 @@ variable "admin_subdomain" {
 }
 
 variable "vpn_port" {
-  description = "VPN listen port (UDP)"
+  description = "VPN listen port (TCP for HARP, UDP for MASQUE)"
   type        = number
   default     = 443
 }

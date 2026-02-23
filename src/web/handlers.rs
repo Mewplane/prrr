@@ -31,6 +31,7 @@ pub struct ServerStatusResponse {
     pub version: String,
     pub connected_clients: u32,
     pub total_clients: usize,
+    pub active_harp_sessions: usize,
 }
 
 /// Client info in list/detail responses.
@@ -92,6 +93,34 @@ pub struct ClientStats {
     pub suspended: usize,
 }
 
+/// `GET /api/v1/stats/traffic` response — aggregate traffic across all clients.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TrafficStatsResponse {
+    pub total_bytes_sent: u64,
+    pub total_bytes_received: u64,
+    pub client_count: usize,
+}
+
+/// `GET /api/v1/harp/sessions` response.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HarpSessionListResponse {
+    pub sessions: Vec<HarpSessionInfoResponse>,
+}
+
+/// Individual HARP session info for the admin API.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HarpSessionInfoResponse {
+    pub session_id: String,
+    pub client_name: String,
+    pub client_id: String,
+    pub created_at: u64,
+    pub last_activity: u64,
+    pub idle_seconds: u64,
+}
+
+/// Number of hex characters to show from a session ID (truncated for safety).
+const SESSION_ID_DISPLAY_HEX_LEN: usize = 16;
+
 /// `GET /api/v1/server/config` response — non-sensitive server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfigResponse {
@@ -108,6 +137,66 @@ pub struct ServerConfigResponse {
     pub metrics_enabled: bool,
 }
 
+/// `GET /api/v1/server/transports` response.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TransportListResponse {
+    pub transports: Vec<TransportInfoResponse>,
+}
+
+/// Individual transport configuration info.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransportInfoResponse {
+    pub name: String,
+    pub protocol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub websocket_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub polling_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_idle_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_idle_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_alive: Option<u64>,
+}
+
+/// HARP transport protocol identifier.
+const HARP_PROTOCOL: &str = "https+ws";
+/// MASQUE transport protocol identifier.
+const MASQUE_PROTOCOL: &str = "quic+masque";
+/// Transport name for HARP.
+const HARP_TRANSPORT_NAME: &str = "harp";
+/// Transport name for MASQUE.
+const MASQUE_TRANSPORT_NAME: &str = "masque";
+
+impl TransportInfoResponse {
+    /// Create from a resolved HARP transport config.
+    pub fn from_harp(websocket_enabled: bool, polling_enabled: bool, session_idle_timeout: u64) -> Self {
+        Self {
+            name: HARP_TRANSPORT_NAME.to_string(),
+            protocol: HARP_PROTOCOL.to_string(),
+            websocket_enabled: Some(websocket_enabled),
+            polling_enabled: Some(polling_enabled),
+            session_idle_timeout: Some(session_idle_timeout),
+            max_idle_timeout: None,
+            keep_alive: None,
+        }
+    }
+
+    /// Create from a resolved MASQUE transport config.
+    pub fn from_masque(max_idle_timeout: u64, keep_alive: u64) -> Self {
+        Self {
+            name: MASQUE_TRANSPORT_NAME.to_string(),
+            protocol: MASQUE_PROTOCOL.to_string(),
+            websocket_enabled: None,
+            polling_enabled: None,
+            session_idle_timeout: None,
+            max_idle_timeout: Some(max_idle_timeout),
+            keep_alive: Some(keep_alive),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -118,6 +207,7 @@ pub async fn server_status(State(state): State<AppState>) -> Result<Json<ServerS
     let connected = state.active_connections.load(Ordering::Relaxed);
     let total = registry.count();
     let uptime = state.start_time.elapsed().as_secs();
+    let active_harp_sessions = state.harp_sessions.active_count();
 
     Ok(Json(ServerStatusResponse {
         status: "running".to_string(),
@@ -125,12 +215,20 @@ pub async fn server_status(State(state): State<AppState>) -> Result<Json<ServerS
         version: env!("CARGO_PKG_VERSION").to_string(),
         connected_clients: connected,
         total_clients: total,
+        active_harp_sessions,
     }))
 }
 
 /// `GET /api/v1/server/config`
 pub async fn server_config(State(state): State<AppState>) -> Result<Json<ServerConfigResponse>, ApiError> {
     Ok(Json((*state.server_config).clone()))
+}
+
+/// `GET /api/v1/server/transports`
+pub async fn server_transports(State(state): State<AppState>) -> Result<Json<TransportListResponse>, ApiError> {
+    Ok(Json(TransportListResponse {
+        transports: (*state.resolved_transports).clone(),
+    }))
 }
 
 /// `GET /api/v1/clients`
@@ -244,6 +342,89 @@ pub async fn stats_overview(State(state): State<AppState>) -> Result<Json<StatsO
         },
         uptime_seconds: uptime,
     }))
+}
+
+/// `GET /api/v1/stats/traffic`
+pub async fn stats_traffic(State(state): State<AppState>) -> Result<Json<TrafficStatsResponse>, ApiError> {
+    let registry = state.registry.lock().await;
+    let clients = registry.list();
+    let total_bytes_sent = clients.iter().map(|c| c.bytes_sent).sum();
+    let total_bytes_received = clients.iter().map(|c| c.bytes_received).sum();
+
+    Ok(Json(TrafficStatsResponse {
+        total_bytes_sent,
+        total_bytes_received,
+        client_count: clients.len(),
+    }))
+}
+
+/// `GET /api/v1/harp/sessions` — list active HARP sessions (admin).
+pub async fn list_harp_sessions(State(state): State<AppState>) -> Result<Json<HarpSessionListResponse>, ApiError> {
+    let registry = state.registry.lock().await;
+    let mut sessions = Vec::new();
+
+    for entry in state.harp_sessions.iter() {
+        let session = entry.value();
+        let client_name = registry.get(session.client_id).map(|r| r.name.clone()).unwrap_or_default();
+
+        let last_activity_ms = session.last_activity.load(std::sync::atomic::Ordering::Relaxed);
+        let last_activity_secs = last_activity_ms / 1000;
+        let idle_secs = session.idle_duration().as_secs();
+
+        let created_at_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(session.created_at.elapsed().as_secs());
+
+        let session_id_hex = session
+            .session_id
+            .iter()
+            .take(SESSION_ID_DISPLAY_HEX_LEN / 2)
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+
+        sessions.push(HarpSessionInfoResponse {
+            session_id: session_id_hex,
+            client_name,
+            client_id: session.client_id.to_string(),
+            created_at: created_at_secs,
+            last_activity: last_activity_secs,
+            idle_seconds: idle_secs,
+        });
+    }
+
+    Ok(Json(HarpSessionListResponse { sessions }))
+}
+
+/// `DELETE /api/v1/harp/sessions/{session_id_hex}` — terminate a HARP session.
+pub async fn terminate_harp_session(
+    State(state): State<AppState>,
+    Path(session_id_hex): Path<String>,
+) -> Result<Json<StatusResponse>, ApiError> {
+    // Find session by hex prefix match
+    let target = state.harp_sessions.iter().find(|entry| {
+        let hex: String = entry
+            .value()
+            .session_id
+            .iter()
+            .take(SESSION_ID_DISPLAY_HEX_LEN / 2)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        hex == session_id_hex
+    });
+
+    match target {
+        Some(entry) => {
+            let session_id = *entry.key();
+            drop(entry);
+            state.harp_sessions.remove(&session_id);
+            Ok(Json(StatusResponse {
+                status: "terminated".to_string(),
+            }))
+        }
+        None => Err(ApiError::NotFound(format!("session not found: {session_id_hex}"))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -406,6 +587,7 @@ mod tests {
 
     fn test_app_state() -> AppState {
         use crate::distribution::{ConfigTokenStore, ServerContext};
+        use crate::web::harp::HarpSessionStore;
         let registry = ClientRegistry::new("10.66.66.0/24").expect("valid subnet");
         AppState {
             registry: Arc::new(Mutex::new(registry)),
@@ -422,6 +604,12 @@ mod tests {
             }),
             config_tokens: Arc::new(ConfigTokenStore::new()),
             server_config: Arc::new(test_server_config()),
+            resolved_transports: Arc::new(vec![TransportInfoResponse::from_harp(true, true, 300)]),
+            harp_sessions: Arc::new(HarpSessionStore::new()),
+            server_noise_private_key: Arc::from([0u8; 32].as_slice()),
+            server_noise_public_key: [0u8; 32],
+            server_kem_dk_bytes: Arc::from([0u8; 0].as_slice()),
+            tunnel_spawner: None,
         }
     }
 
@@ -429,6 +617,7 @@ mod tests {
         Router::new()
             .route("/api/v1/server/status", get(server_status))
             .route("/api/v1/server/config", get(server_config))
+            .route("/api/v1/server/transports", get(server_transports))
             .route("/api/v1/clients", get(list_clients).post(create_client))
             .route("/api/v1/clients/{id}", get(get_client).delete(delete_client))
             .route("/api/v1/clients/{id}/suspend", post(suspend_client))
@@ -437,6 +626,12 @@ mod tests {
             .route("/api/v1/clients/{id}/qr", get(get_client_qr))
             .route("/api/v1/clients/{id}/config-url", post(create_config_url))
             .route("/api/v1/stats/overview", get(stats_overview))
+            .route("/api/v1/stats/traffic", get(stats_traffic))
+            .route("/api/v1/harp/sessions", get(list_harp_sessions))
+            .route(
+                "/api/v1/harp/sessions/{session_id_hex}",
+                axum::routing::delete(terminate_harp_session),
+            )
             .route("/c/{token}", get(get_config_by_token))
             .with_state(state)
     }
@@ -972,5 +1167,209 @@ mod tests {
         let body: ClientResponse = parse_json(resp).await;
         assert_eq!(body.bytes_sent, 12345);
         assert_eq!(body.bytes_received, 67890);
+    }
+
+    // ---- Transport visibility tests (FRD-20260223-transport-visibility-ui) ----
+
+    // AC-1: GET /api/v1/server/transports returns transport list
+    #[tokio::test]
+    async fn transports_endpoint_returns_list() {
+        let state = test_app_state();
+        let app = test_router(state);
+
+        let resp = app.oneshot(json_request("GET", "/api/v1/server/transports", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: TransportListResponse = parse_json(resp).await;
+        assert_eq!(body.transports.len(), 1);
+        assert_eq!(body.transports[0].name, "harp");
+        assert_eq!(body.transports[0].protocol, "https+ws");
+        assert_eq!(body.transports[0].websocket_enabled, Some(true));
+        assert_eq!(body.transports[0].polling_enabled, Some(true));
+        assert_eq!(body.transports[0].session_idle_timeout, Some(300));
+        assert!(body.transports[0].max_idle_timeout.is_none());
+        assert!(body.transports[0].keep_alive.is_none());
+    }
+
+    // AC-2: Transport entry has correct fields for MASQUE
+    #[tokio::test]
+    async fn transport_info_masque_fields() {
+        let info = TransportInfoResponse::from_masque(60, 25);
+        assert_eq!(info.name, "masque");
+        assert_eq!(info.protocol, "quic+masque");
+        assert_eq!(info.max_idle_timeout, Some(60));
+        assert_eq!(info.keep_alive, Some(25));
+        assert!(info.websocket_enabled.is_none());
+        assert!(info.polling_enabled.is_none());
+        assert!(info.session_idle_timeout.is_none());
+    }
+
+    // AC-4: Server status includes active_harp_sessions
+    #[tokio::test]
+    async fn server_status_includes_harp_sessions() {
+        let state = test_app_state();
+        // Create some HARP sessions
+        let _ = state.harp_sessions.create(uuid::Uuid::new_v4());
+        let _ = state.harp_sessions.create(uuid::Uuid::new_v4());
+
+        let app = test_router(state);
+
+        let resp = app.oneshot(json_request("GET", "/api/v1/server/status", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: ServerStatusResponse = parse_json(resp).await;
+        assert_eq!(body.active_harp_sessions, 2);
+    }
+
+    // Server status with zero HARP sessions
+    #[tokio::test]
+    async fn server_status_zero_harp_sessions() {
+        let state = test_app_state();
+        let app = test_router(state);
+
+        let resp = app.oneshot(json_request("GET", "/api/v1/server/status", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: ServerStatusResponse = parse_json(resp).await;
+        assert_eq!(body.active_harp_sessions, 0);
+    }
+
+    // ---- Traffic stats tests (FRD-20260223-client-traffic-stats-ui) ----
+
+    // AC-10: Traffic endpoint returns zero totals when no clients exist
+    #[tokio::test]
+    async fn traffic_stats_empty() {
+        let state = test_app_state();
+        let app = test_router(state);
+
+        let resp = app.oneshot(json_request("GET", "/api/v1/stats/traffic", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: TrafficStatsResponse = parse_json(resp).await;
+        assert_eq!(body.total_bytes_sent, 0);
+        assert_eq!(body.total_bytes_received, 0);
+        assert_eq!(body.client_count, 0);
+    }
+
+    // AC-8, AC-9: Traffic endpoint sums bytes across all clients
+    #[tokio::test]
+    async fn traffic_stats_with_clients() {
+        let state = test_app_state();
+        {
+            let mut reg = state.registry.lock().await;
+            let c1 = reg.add("alice", [0x01; PUBLIC_KEY_LEN], None).unwrap();
+            let c2 = reg.add("bob", [0x02; PUBLIC_KEY_LEN], None).unwrap();
+            reg.update_traffic(c1.id, 1000, 2000).unwrap();
+            reg.update_traffic(c2.id, 3000, 4000).unwrap();
+        }
+        let app = test_router(state);
+
+        let resp = app.oneshot(json_request("GET", "/api/v1/stats/traffic", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: TrafficStatsResponse = parse_json(resp).await;
+        assert_eq!(body.total_bytes_sent, 4000);
+        assert_eq!(body.total_bytes_received, 6000);
+        assert_eq!(body.client_count, 2);
+    }
+
+    // Traffic endpoint excludes revoked clients
+    #[tokio::test]
+    async fn traffic_stats_excludes_revoked() {
+        let state = test_app_state();
+        {
+            let mut reg = state.registry.lock().await;
+            let c1 = reg.add("alice", [0x01; PUBLIC_KEY_LEN], None).unwrap();
+            let c2 = reg.add("bob", [0x02; PUBLIC_KEY_LEN], None).unwrap();
+            reg.update_traffic(c1.id, 1000, 2000).unwrap();
+            reg.update_traffic(c2.id, 5000, 5000).unwrap();
+            reg.remove(c2.id).unwrap();
+        }
+        let app = test_router(state);
+
+        let resp = app.oneshot(json_request("GET", "/api/v1/stats/traffic", None)).await.unwrap();
+        let body: TrafficStatsResponse = parse_json(resp).await;
+        assert_eq!(body.total_bytes_sent, 1000);
+        assert_eq!(body.total_bytes_received, 2000);
+        assert_eq!(body.client_count, 1);
+    }
+
+    // ---- HARP session management tests (FRD-20260223-harp-session-management-ui) ----
+
+    // AC-1: Session list returns empty when no sessions
+    #[tokio::test]
+    async fn harp_sessions_list_empty() {
+        let state = test_app_state();
+        let app = test_router(state);
+
+        let resp = app.oneshot(json_request("GET", "/api/v1/harp/sessions", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: HarpSessionListResponse = parse_json(resp).await;
+        assert!(body.sessions.is_empty());
+    }
+
+    // AC-1, AC-3: Session list includes client name
+    #[tokio::test]
+    async fn harp_sessions_list_with_sessions() {
+        let state = test_app_state();
+        let client_id = {
+            let mut reg = state.registry.lock().await;
+            reg.add("alice", [0x01; PUBLIC_KEY_LEN], None).unwrap().id
+        };
+        let _ = state.harp_sessions.create(client_id);
+
+        let app = test_router(state);
+
+        let resp = app.oneshot(json_request("GET", "/api/v1/harp/sessions", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: HarpSessionListResponse = parse_json(resp).await;
+        assert_eq!(body.sessions.len(), 1);
+        assert_eq!(body.sessions[0].client_name, "alice");
+        assert_eq!(body.sessions[0].client_id, client_id.to_string());
+        assert_eq!(body.sessions[0].session_id.len(), SESSION_ID_DISPLAY_HEX_LEN);
+    }
+
+    // AC-4: Terminate session returns terminated status
+    #[tokio::test]
+    async fn harp_session_terminate() {
+        let state = test_app_state();
+        let client_id = uuid::Uuid::new_v4();
+        let _ = state.harp_sessions.create(client_id);
+        assert_eq!(state.harp_sessions.active_count(), 1);
+
+        // Get the session ID hex from the list
+        let app = test_router(state.clone());
+        let resp = app
+            .clone()
+            .oneshot(json_request("GET", "/api/v1/harp/sessions", None))
+            .await
+            .unwrap();
+        let body: HarpSessionListResponse = parse_json(resp).await;
+        let session_id_hex = &body.sessions[0].session_id;
+
+        let resp = app
+            .oneshot(json_request("DELETE", &format!("/api/v1/harp/sessions/{session_id_hex}"), None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body: StatusResponse = parse_json(resp).await;
+        assert_eq!(body.status, "terminated");
+        assert_eq!(state.harp_sessions.active_count(), 0);
+    }
+
+    // AC-5: Terminate unknown session returns 404
+    #[tokio::test]
+    async fn harp_session_terminate_not_found() {
+        let state = test_app_state();
+        let app = test_router(state);
+
+        let resp = app
+            .oneshot(json_request("DELETE", "/api/v1/harp/sessions/deadbeefdeadbeef", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

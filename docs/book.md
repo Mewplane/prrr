@@ -60,7 +60,7 @@ The censor can see you're sending data, but can't read it or easily tell what se
 
 **But there's a problem:** If the censor can *identify* that you're using a VPN, they can block it entirely.
 
-This is where prrr comes in.
+This is where prrr comes in. Its default transport, HARP, tunnels VPN traffic over standard HTTPS — making it impossible to block without breaking the entire web.
 
 ---
 
@@ -628,6 +628,10 @@ Now that we understand the building blocks, let's see how prrr puts them togethe
 
 ### The Complete Stack
 
+prrr supports two transports. HARP (the default) uses standard HTTPS,
+while MASQUE (legacy) uses QUIC/HTTP/3. Both share the same encryption
+and tunnel pipeline layers.
+
 ```
 ┌─────────────────────────────────────┐
 │  Your Application (browser, etc.)   │
@@ -654,24 +658,19 @@ Now that we understand the building blocks, let's see how prrr puts them togethe
 │  - Automatic rekeying               │
 └──────────────┬──────────────────────┘
                │
-               ↓
-┌─────────────────────────────────────┐
-│  MASQUE Framing                     │
-│  - Wraps as HTTP Datagrams          │
-└──────────────┬──────────────────────┘
-               │
-               ↓
-┌─────────────────────────────────────┐
-│  QUIC Transport                     │
-│  - TLS 1.3 encryption               │
-│  - Connection management            │
-└──────────────┬──────────────────────┘
-               │
-               ↓
-┌─────────────────────────────────────┐
-│  UDP Port 443                       │
-│  (Looks like HTTPS traffic)         │
-└─────────────────────────────────────┘
+       ┌───────┴───────┐
+       ↓               ↓
+┌──────────────┐ ┌──────────────┐
+│ HARP         │ │ MASQUE       │
+│ (default)    │ │ (legacy)     │
+│ WebSocket or │ │ HTTP Datagram│
+│ HTTP polling │ │ framing      │
+└──────┬───────┘ └──────┬───────┘
+       ↓               ↓
+┌──────────────┐ ┌──────────────┐
+│ HTTPS/TLS1.3 │ │ QUIC/TLS1.3  │
+│ TCP Port 443 │ │ UDP Port 443 │
+└──────────────┘ └──────────────┘
 ```
 
 ### The Two Phases
@@ -702,12 +701,13 @@ Client                          Server
 
 prrr uses **layers of protection**:
 
-1. **MASQUE over QUIC** - Looks like web traffic
-2. **TLS fingerprint mimicry** - Looks like Chrome/Firefox
-3. **Traffic morphing** - Packet sizes and timing look natural
-4. **Active probing resistance** - Won't respond to probes
-5. **Post-quantum crypto** - Secure against future attacks
-6. **Multiple encryption layers** - TLS + ChaCha20-Poly1305
+1. **HARP over HTTPS (default)** - Indistinguishable from regular web traffic (TCP)
+2. **MASQUE over QUIC (legacy)** - Looks like HTTP/3 web traffic (UDP)
+3. **TLS fingerprint mimicry** - Looks like Chrome/Firefox
+4. **Traffic morphing** - Packet sizes and timing look natural
+5. **Active probing resistance** - Won't respond to probes
+6. **Post-quantum crypto** - Secure against future attacks
+7. **Multiple encryption layers** - TLS + ChaCha20-Poly1305
 
 If one layer is compromised, others still protect you.
 
@@ -1259,7 +1259,7 @@ Prevents brute-force authentication attempts.
 
 ## Chapter 12: The Tunnel Pipeline
 
-The **Tunnel Pipeline** is where everything comes together—connecting the TUN device to the encrypted MASQUE channel.
+The **Tunnel Pipeline** is where everything comes together—connecting the TUN device to the encrypted transport channel (HARP or MASQUE).
 
 ### Two Concurrent Loops
 
@@ -1280,11 +1280,13 @@ The **Tunnel Pipeline** is where everything comes together—connecting the TUN 
 └──────────────┬──────────────────────┘
                ↓
 ┌─────────────────────────────────────┐
-│ 4. Frame as MASQUE datagram         │
+│ 4. Frame for transport              │
+│    └─ HARP: 4-byte header + WS/HTTP │
+│    └─ MASQUE: HTTP Datagram frame   │
 └──────────────┬──────────────────────┘
                ↓
 ┌─────────────────────────────────────┐
-│ 5. Send via QUIC                    │
+│ 5. Send via transport               │
 │    └─ To VPN server                 │
 └─────────────────────────────────────┘
 ```
@@ -1292,12 +1294,12 @@ The **Tunnel Pipeline** is where everything comes together—connecting the TUN 
 **Outbound loop (Network → TUN):**
 ```
 ┌─────────────────────────────────────┐
-│ 1. Receive QUIC datagram            │
+│ 1. Receive from transport           │
 │    └─ From VPN server               │
 └──────────────┬──────────────────────┘
                ↓
 ┌─────────────────────────────────────┐
-│ 2. Deframe MASQUE datagram          │
+│ 2. Deframe transport data           │
 └──────────────┬──────────────────────┘
                ↓
 ┌─────────────────────────────────────┐
@@ -2216,14 +2218,14 @@ probe_resist_key = "base64-encoded..."
 - Linux (Ubuntu 22.04+, Debian 11+, Fedora 38+)
 - 1 GB RAM (for ~10 clients)
 - Root access (for TUN device creation)
-- UDP port 443 open
+- TCP port 443 open (HARP, default); optionally UDP port 443 (MASQUE)
 - Public IP address
 - Domain name (for TLS certificate)
 
 **Client:**
 - Linux (any modern distro)
 - Sudo access (for TUN device and routes)
-- Internet connection allowing UDP
+- Internet connection allowing HTTPS (TCP 443)
 
 ### Installation Script
 
@@ -2297,7 +2299,8 @@ key_path = "/etc/letsencrypt/live/vpn.example.com/privkey.pem"
 # Allow SSH
 ufw allow 22/tcp
 
-# Allow prrr (UDP 443)
+# Allow prrr (TCP 443 for HARP, UDP 443 for MASQUE)
+ufw allow 443/tcp
 ufw allow 443/udp
 
 # Allow web admin (optional, bind to localhost and use SSH tunnel instead)
@@ -2315,7 +2318,8 @@ iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 # Allow SSH
 iptables -A INPUT -p tcp --dport 22 -j ACCEPT
 
-# Allow prrr
+# Allow prrr (HARP + MASQUE)
+iptables -A INPUT -p tcp --dport 443 -j ACCEPT
 iptables -A INPUT -p udp --dport 443 -j ACCEPT
 
 # Allow loopback
@@ -2794,11 +2798,11 @@ Rotation:
 prrr uses **multiple layers** of protection. If one fails, others remain:
 
 ```
-Layer 1: MASQUE/QUIC camouflage
-  If defeated → Still protected by layers 2-6
+Layer 1: HARP/HTTPS camouflage (default) or MASQUE/QUIC camouflage
+  If defeated → Still protected by layers 2-7
 
-Layer 2: TLS 1.3 (QUIC transport encryption)
-  If defeated → Still protected by layers 3-6
+Layer 2: TLS 1.3 (transport encryption)
+  If defeated → Still protected by layers 3-7
 
 Layer 3: Hybrid handshake (X25519 + ML-KEM)
   If one algorithm broken → Other still protects
@@ -2811,6 +2815,9 @@ Layer 5: Traffic obfuscation (padding, timing, dummy)
 
 Layer 6: Active probing resistance (token auth)
   If bypassed → Handshake still authenticates
+
+Layer 7: Pluggable transports (switch HARP ↔ MASQUE)
+  If one transport blocked → Switch to the other
 ```
 
 **Principle:** No single point of failure in cryptography.
@@ -2838,7 +2845,7 @@ You now understand:
 
 prrr is built on these principles:
 
-**1. Standards-based** - Uses IETF protocols (QUIC, MASQUE) not custom formats
+**1. Standards-based** - Uses IETF protocols (HTTPS, QUIC, MASQUE) not custom formats
 **2. Defense in depth** - Multiple layers of protection
 **3. Post-quantum ready** - Hybrid cryptography for future-proofing
 **4. Operational simplicity** - Single binary, built-in diagnostics
@@ -2889,8 +2896,8 @@ prrr is built on these principles:
                     ↓
 ┌─────────────────────────────────────────────────────┐
 │          Tunnel Pipeline                             │
-│  Inbound:  TUN → Encrypt → MASQUE → Network         │
-│  Outbound: Network → MASQUE → Decrypt → TUN         │
+│  Inbound:  TUN → Encrypt → Transport → Network      │
+│  Outbound: Network → Transport → Decrypt → TUN      │
 └───────────────────┬─────────────────────────────────┘
                     │
                     ↓
@@ -2902,27 +2909,20 @@ prrr is built on these principles:
 │  • Automatic rekeying (every 2^32 packets)          │
 └───────────────────┬─────────────────────────────────┘
                     │
-                    ↓
-┌─────────────────────────────────────────────────────┐
-│         MASQUE Framing                               │
-│  HTTP Datagram: [Stream ID][Context][Payload]       │
-│  Wraps encrypted packets as HTTP/3 datagrams        │
-└───────────────────┬─────────────────────────────────┘
-                    │
-                    ↓
-┌─────────────────────────────────────────────────────┐
-│          QUIC Transport                              │
-│  • TLS 1.3 encryption (rustls)                      │
-│  • ALPN: h3 (HTTP/3)                                │
-│  • Datagram extension (RFC 9221)                    │
-│  • Connection migration support                     │
-└───────────────────┬─────────────────────────────────┘
-                    │
-                    ↓
-┌─────────────────────────────────────────────────────┐
-│           UDP Port 443                               │
-│   Indistinguishable from HTTPS Traffic              │
-└─────────────────────────────────────────────────────┘
+          ┌─────────┴─────────┐
+          ↓                   ↓
+┌──────────────────┐ ┌──────────────────────────────┐
+│  HARP (default)  │ │  MASQUE (legacy)              │
+│  • WebSocket or  │ │  • HTTP Datagram framing      │
+│    HTTP polling  │ │  • QUIC DATAGRAMs (quinn)     │
+│  • 4-byte frame  │ │  • ALPN: h3 (HTTP/3)          │
+│    header        │ │  • Connection migration        │
+└────────┬─────────┘ └──────────────┬───────────────┘
+         ↓                          ↓
+┌──────────────────┐ ┌──────────────────────────────┐
+│  TCP Port 443    │ │  UDP Port 443                 │
+│  (HTTPS traffic) │ │  (HTTP/3 traffic)             │
+└──────────────────┘ └──────────────────────────────┘
 ```
 
 ### Command Cheatsheet
@@ -3102,6 +3102,8 @@ Total: 56 bytes → base64url encoded
 **DPI** - Deep Packet Inspection. Technology that examines packet contents to identify traffic type.
 
 **Forward Secrecy** - Property where compromising long-term keys doesn't reveal past session keys.
+
+**HARP** - HTTPS API Relay Protocol. prrr's default transport that tunnels VPN traffic over standard HTTPS using WebSocket or HTTP polling (TCP port 443).
 
 **HKDF** - HMAC-based Key Derivation Function. Standard way to derive multiple keys from one secret.
 

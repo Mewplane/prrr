@@ -59,13 +59,16 @@ pub const DEFAULT_PQ_KEY_PATH: &str = "/etc/prrr/keys/server_pq.key";
 pub const DEFAULT_REKEY_INTERVAL: u64 = 3600;
 
 /// Default transport protocol.
-pub const DEFAULT_TRANSPORT_PROTOCOL: &str = "masque";
+pub const DEFAULT_TRANSPORT_PROTOCOL: &str = "harp";
 
 /// Default QUIC max idle timeout in seconds.
 pub const DEFAULT_MAX_IDLE_TIMEOUT: u64 = 300;
 
 /// Default QUIC keep-alive interval in seconds.
 pub const DEFAULT_KEEP_ALIVE: u64 = 25;
+
+/// Default HARP session idle timeout in seconds.
+pub const DEFAULT_HARP_SESSION_IDLE_TIMEOUT: u64 = 300;
 
 /// Default padding strategy for traffic obfuscation.
 pub const DEFAULT_PADDING_STRATEGY: &str = "power-of-two";
@@ -271,8 +274,8 @@ pub struct ServerConfig {
     pub network: Option<NetworkSection>,
     /// Cryptographic key paths and intervals.
     pub crypto: Option<CryptoSection>,
-    /// QUIC/MASQUE transport settings.
-    pub transport: Option<TransportSection>,
+    /// Transport configurations (replaces legacy `[transport]`).
+    pub transports: Option<Vec<TransportEntry>>,
     /// Traffic obfuscation and anti-censorship settings.
     pub obfuscation: Option<ObfuscationSection>,
     /// Web administration interface settings.
@@ -320,11 +323,25 @@ pub struct CryptoSection {
     pub rekey_interval: Option<u64>,
 }
 
-/// `[transport]` section — QUIC/MASQUE settings.
+/// A transport entry in the `[[transports]]` array.
+///
+/// Uses serde tag dispatch on the `name` field to select the transport type.
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(tag = "name")]
+pub enum TransportEntry {
+    /// QUIC/MASQUE transport.
+    #[serde(rename = "masque")]
+    Masque(MasqueTransportConfig),
+    /// HARP (HTTPS API Relay Protocol) transport.
+    #[serde(rename = "harp")]
+    Harp(HarpTransportConfig),
+}
+
+/// MASQUE transport configuration within `[[transports]]`.
 #[derive(Debug, Deserialize, Default, PartialEq)]
-pub struct TransportSection {
-    /// Transport protocol (`"masque"`).
-    pub protocol: Option<String>,
+pub struct MasqueTransportConfig {
+    /// Whether this transport is enabled (default: true).
+    pub enabled: Option<bool>,
     /// Max idle timeout in seconds before connection close.
     pub max_idle_timeout: Option<u64>,
     /// Keep-alive interval in seconds.
@@ -333,6 +350,19 @@ pub struct TransportSection {
     pub tls_cert: Option<String>,
     /// Path to TLS private key file (PEM).
     pub tls_key: Option<String>,
+}
+
+/// HARP transport configuration within `[[transports]]`.
+#[derive(Debug, Deserialize, Default, PartialEq)]
+pub struct HarpTransportConfig {
+    /// Whether this transport is enabled (default: true).
+    pub enabled: Option<bool>,
+    /// Enable WebSocket streaming mode.
+    pub websocket_enabled: Option<bool>,
+    /// Enable HTTP polling fallback mode.
+    pub polling_enabled: Option<bool>,
+    /// Seconds before idle HARP sessions are cleaned up.
+    pub session_idle_timeout: Option<u64>,
 }
 
 /// `[obfuscation]` section — traffic shaping and anti-censorship.
@@ -488,10 +518,18 @@ pub struct RoutingSection {
 pub struct ClientTransportSection {
     /// Transport protocol.
     pub protocol: Option<String>,
-    /// Keep-alive interval in seconds.
+    /// Keep-alive interval in seconds (MASQUE).
     pub keep_alive: Option<u64>,
     /// Skip TLS certificate verification (insecure, dev/test only).
     pub insecure_skip_verify: Option<bool>,
+    /// Preferred HARP binding: `"stream"` (WebSocket) or `"poll"` (HTTP polling).
+    pub preferred_binding: Option<String>,
+    /// HARP polling interval in milliseconds (with jitter applied by client).
+    pub poll_interval_ms: Option<u64>,
+    /// Initial reconnection backoff delay in milliseconds.
+    pub reconnect_backoff_ms: Option<u64>,
+    /// Maximum reconnection backoff delay in milliseconds.
+    pub reconnect_max_backoff_ms: Option<u64>,
 }
 
 /// `[obfuscation]` section in client config.
@@ -601,6 +639,81 @@ pub fn load_client_config(path: Option<&PathBuf>) -> anyhow::Result<ClientConfig
     let text = std::fs::read_to_string(path)?;
     let config: ClientConfigFile = toml::from_str(&text)?;
     Ok(config)
+}
+
+// ---------------------------------------------------------------------------
+// Transport resolution
+// ---------------------------------------------------------------------------
+
+/// A resolved transport configuration with defaults applied.
+///
+/// Produced by [`resolve_server_transports`] from raw config entries.
+#[derive(Debug, PartialEq)]
+pub enum ResolvedTransport {
+    /// QUIC/MASQUE transport with resolved settings.
+    Masque {
+        /// Max idle timeout in seconds.
+        max_idle_timeout: u64,
+        /// Keep-alive interval in seconds.
+        keep_alive: u64,
+        /// Optional TLS certificate path.
+        tls_cert: Option<String>,
+        /// Optional TLS key path.
+        tls_key: Option<String>,
+    },
+    /// HARP transport with resolved settings.
+    Harp {
+        /// Whether WebSocket streaming is enabled.
+        websocket_enabled: bool,
+        /// Whether HTTP polling fallback is enabled.
+        polling_enabled: bool,
+        /// Session idle timeout in seconds.
+        session_idle_timeout: u64,
+    },
+}
+
+/// Resolve the effective list of enabled server transports from config.
+///
+/// If `[[transports]]` is absent, returns a single default MASQUE transport.
+/// Disabled entries (`enabled = false`) are filtered out.
+pub fn resolve_server_transports(config: &ServerConfig) -> Vec<ResolvedTransport> {
+    let entries = match config.transports.as_deref() {
+        Some(entries) if !entries.is_empty() => entries,
+        _ => {
+            return vec![ResolvedTransport::Harp {
+                websocket_enabled: true,
+                polling_enabled: true,
+                session_idle_timeout: DEFAULT_HARP_SESSION_IDLE_TIMEOUT,
+            }];
+        }
+    };
+
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            TransportEntry::Masque(m) => {
+                if m.enabled == Some(false) {
+                    return None;
+                }
+                Some(ResolvedTransport::Masque {
+                    max_idle_timeout: m.max_idle_timeout.unwrap_or(DEFAULT_MAX_IDLE_TIMEOUT),
+                    keep_alive: m.keep_alive.unwrap_or(DEFAULT_KEEP_ALIVE),
+                    tls_cert: m.tls_cert.clone(),
+                    tls_key: m.tls_key.clone(),
+                })
+            }
+            TransportEntry::Harp(h) => {
+                if h.enabled == Some(false) {
+                    return None;
+                }
+                Some(ResolvedTransport::Harp {
+                    websocket_enabled: h.websocket_enabled.unwrap_or(true),
+                    polling_enabled: h.polling_enabled.unwrap_or(true),
+                    session_idle_timeout: h.session_idle_timeout.unwrap_or(DEFAULT_HARP_SESSION_IDLE_TIMEOUT),
+                })
+            }
+        })
+        .collect()
 }
 
 /// Initialize the tracing subscriber with the given log level directive.
@@ -744,6 +857,33 @@ mod tests {
         }
     }
 
+    // FRD: specs/frds/FRD-20260223-pluggable-transport-config.md
+    // T-STEP13-1: Client transport preferred_binding parses from TOML
+    #[test]
+    fn client_transport_preferred_binding() {
+        let toml_str = r#"
+[transport]
+protocol = "harp"
+preferred_binding = "poll"
+"#;
+        let config: ClientConfigFile = toml::from_str(toml_str).expect("parse client transport");
+        let transport = config.transport.expect("transport section present");
+        assert_eq!(transport.preferred_binding.as_deref(), Some("poll"));
+    }
+
+    // T-STEP13-2: Client transport poll_interval_ms parses from TOML
+    #[test]
+    fn client_transport_poll_interval() {
+        let toml_str = r#"
+[transport]
+protocol = "harp"
+poll_interval_ms = 200
+"#;
+        let config: ClientConfigFile = toml::from_str(toml_str).expect("parse client transport");
+        let transport = config.transport.expect("transport section present");
+        assert_eq!(transport.poll_interval_ms, Some(200));
+    }
+
     // T-DPI003-3: Client transport config parses insecure_skip_verify
     #[test]
     fn client_transport_insecure_skip_verify() {
@@ -767,6 +907,34 @@ protocol = "masque"
         let config: ClientConfigFile = toml::from_str(toml_str).expect("parse client transport");
         let transport = config.transport.expect("transport section present");
         assert!(transport.insecure_skip_verify.is_none());
+    }
+
+    // T-STEP15-1: Client transport reconnect_backoff_ms parses from TOML
+    #[test]
+    fn client_transport_reconnect_backoff() {
+        let toml_str = r#"
+[transport]
+protocol = "harp"
+reconnect_backoff_ms = 2000
+reconnect_max_backoff_ms = 60000
+"#;
+        let config: ClientConfigFile = toml::from_str(toml_str).expect("parse client transport");
+        let transport = config.transport.expect("transport section present");
+        assert_eq!(transport.reconnect_backoff_ms, Some(2000));
+        assert_eq!(transport.reconnect_max_backoff_ms, Some(60000));
+    }
+
+    // T-STEP15-2: Client transport reconnect fields default to None when absent
+    #[test]
+    fn client_transport_reconnect_defaults() {
+        let toml_str = r#"
+[transport]
+protocol = "masque"
+"#;
+        let config: ClientConfigFile = toml::from_str(toml_str).expect("parse client transport");
+        let transport = config.transport.expect("transport section present");
+        assert!(transport.reconnect_backoff_ms.is_none());
+        assert!(transport.reconnect_max_backoff_ms.is_none());
     }
 
     // T-DPI005-1: Client --server-name is None when not provided
@@ -1012,12 +1180,17 @@ identity_key_path = "/etc/prrr/keys/server_identity.key"
 pq_key_path = "/etc/prrr/keys/server_pq.key"
 rekey_interval = 3600
 
-[transport]
-protocol = "masque"
+[[transports]]
+name = "masque"
+enabled = true
 max_idle_timeout = 300
 keep_alive = 25
 tls_cert = "/etc/prrr/tls/fullchain.pem"
 tls_key = "/etc/prrr/tls/privkey.pem"
+
+[[transports]]
+name = "harp"
+enabled = true
 
 [obfuscation]
 enabled = true
@@ -1074,12 +1247,19 @@ log_retention_days = 7
         assert_eq!(crypto.pq_key_path.as_deref(), Some(DEFAULT_PQ_KEY_PATH));
         assert_eq!(crypto.rekey_interval, Some(DEFAULT_REKEY_INTERVAL));
 
-        let transport = config.transport.expect("transport section");
-        assert_eq!(transport.protocol.as_deref(), Some(DEFAULT_TRANSPORT_PROTOCOL));
-        assert_eq!(transport.max_idle_timeout, Some(DEFAULT_MAX_IDLE_TIMEOUT));
-        assert_eq!(transport.keep_alive, Some(DEFAULT_KEEP_ALIVE));
-        assert_eq!(transport.tls_cert.as_deref(), Some("/etc/prrr/tls/fullchain.pem"));
-        assert_eq!(transport.tls_key.as_deref(), Some("/etc/prrr/tls/privkey.pem"));
+        let transports = config.transports.expect("transports section");
+        assert_eq!(transports.len(), 2);
+        match &transports[0] {
+            TransportEntry::Masque(m) => {
+                assert_eq!(m.enabled, Some(true));
+                assert_eq!(m.max_idle_timeout, Some(DEFAULT_MAX_IDLE_TIMEOUT));
+                assert_eq!(m.keep_alive, Some(DEFAULT_KEEP_ALIVE));
+                assert_eq!(m.tls_cert.as_deref(), Some("/etc/prrr/tls/fullchain.pem"));
+                assert_eq!(m.tls_key.as_deref(), Some("/etc/prrr/tls/privkey.pem"));
+            }
+            _ => panic!("expected Masque entry at index 0"),
+        }
+        assert!(matches!(&transports[1], TransportEntry::Harp(_)));
 
         let obfs = config.obfuscation.expect("obfuscation section");
         assert_eq!(obfs.enabled, Some(true));
@@ -1128,40 +1308,50 @@ max_clients = 50
         assert!(srv.listen_addr.is_none());
         assert!(config.network.is_none());
         assert!(config.crypto.is_none());
-        assert!(config.transport.is_none());
+        assert!(config.transports.is_none());
         assert!(config.obfuscation.is_none());
         assert!(config.web_admin.is_none());
         assert!(config.messaging.is_none());
         assert!(config.monitoring.is_none());
     }
 
-    // AC-DPI002: Transport section without TLS fields parses to None
+    // AC-DPI002: MASQUE transport without TLS fields parses to None
     #[test]
-    fn transport_without_tls_fields_parses_to_none() {
+    fn masque_transport_without_tls_fields_parses_to_none() {
         let toml_str = r#"
-[transport]
-protocol = "masque"
+[[transports]]
+name = "masque"
 max_idle_timeout = 300
 keep_alive = 25
 "#;
-        let config: ServerConfig = toml::from_str(toml_str).expect("parse transport without tls");
-        let transport = config.transport.expect("transport section present");
-        assert_eq!(transport.protocol.as_deref(), Some("masque"));
-        assert!(transport.tls_cert.is_none());
-        assert!(transport.tls_key.is_none());
+        let config: ServerConfig = toml::from_str(toml_str).expect("parse masque without tls");
+        let transports = config.transports.expect("transports present");
+        match &transports[0] {
+            TransportEntry::Masque(m) => {
+                assert!(m.tls_cert.is_none());
+                assert!(m.tls_key.is_none());
+            }
+            _ => panic!("expected Masque entry"),
+        }
     }
 
-    // AC-DPI002b: Transport section with only tls_cert parses correctly
+    // AC-DPI002b: MASQUE transport with only tls_cert parses correctly
     #[test]
-    fn transport_with_tls_cert_only() {
+    fn masque_transport_with_tls_cert_only() {
         let toml_str = r#"
-[transport]
+[[transports]]
+name = "masque"
 tls_cert = "/etc/prrr/tls/fullchain.pem"
 "#;
-        let config: ServerConfig = toml::from_str(toml_str).expect("parse transport with cert only");
-        let transport = config.transport.expect("transport section present");
-        assert_eq!(transport.tls_cert.as_deref(), Some("/etc/prrr/tls/fullchain.pem"));
-        assert!(transport.tls_key.is_none());
+        let config: ServerConfig = toml::from_str(toml_str).expect("parse masque with cert only");
+        let transports = config.transports.expect("transports present");
+        match &transports[0] {
+            TransportEntry::Masque(m) => {
+                assert_eq!(m.tls_cert.as_deref(), Some("/etc/prrr/tls/fullchain.pem"));
+                assert!(m.tls_key.is_none());
+            }
+            _ => panic!("expected Masque entry"),
+        }
     }
 
     // AC-4: Unknown fields in TOML are silently ignored
@@ -1232,7 +1422,7 @@ allowed_ips = ["0.0.0.0/0", "::/0"]
 excluded_ips = ["192.168.0.0/16", "10.0.0.0/8"]
 
 [transport]
-protocol = "masque"
+protocol = "harp"
 keep_alive = 25
 
 [obfuscation]
@@ -1371,6 +1561,186 @@ x = 1
         assert!(result.is_err());
     }
 
+    // FRD: specs/frds/FRD-20260223-pluggable-transport-config.md
+    // T-STEP13-3: Server config parses [[transports]] with both MASQUE and HARP
+    #[test]
+    fn server_config_transports_array() {
+        let toml_str = r#"
+[[transports]]
+name = "masque"
+enabled = true
+max_idle_timeout = 300
+keep_alive = 25
+tls_cert = "/etc/prrr/tls/fullchain.pem"
+tls_key = "/etc/prrr/tls/privkey.pem"
+
+[[transports]]
+name = "harp"
+enabled = true
+websocket_enabled = true
+polling_enabled = false
+session_idle_timeout = 600
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).expect("parse transports array");
+        let transports = config.transports.expect("transports present");
+        assert_eq!(transports.len(), 2);
+        match &transports[0] {
+            TransportEntry::Masque(m) => {
+                assert_eq!(m.enabled, Some(true));
+                assert_eq!(m.max_idle_timeout, Some(DEFAULT_MAX_IDLE_TIMEOUT));
+                assert_eq!(m.keep_alive, Some(DEFAULT_KEEP_ALIVE));
+                assert_eq!(m.tls_cert.as_deref(), Some("/etc/prrr/tls/fullchain.pem"));
+                assert_eq!(m.tls_key.as_deref(), Some("/etc/prrr/tls/privkey.pem"));
+            }
+            _ => panic!("expected Masque entry at index 0"),
+        }
+        match &transports[1] {
+            TransportEntry::Harp(h) => {
+                assert_eq!(h.enabled, Some(true));
+                assert_eq!(h.websocket_enabled, Some(true));
+                assert_eq!(h.polling_enabled, Some(false));
+                assert_eq!(h.session_idle_timeout, Some(600));
+            }
+            _ => panic!("expected Harp entry at index 1"),
+        }
+    }
+
+    // T-STEP13-4: Server config parses [[transports]] with only MASQUE
+    #[test]
+    fn server_config_transports_masque_only() {
+        let toml_str = r#"
+[[transports]]
+name = "masque"
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).expect("parse masque-only");
+        let transports = config.transports.expect("transports present");
+        assert_eq!(transports.len(), 1);
+        assert!(matches!(&transports[0], TransportEntry::Masque(_)));
+    }
+
+    // T-STEP13-5: Server config parses [[transports]] with only HARP
+    #[test]
+    fn server_config_transports_harp_only() {
+        let toml_str = r#"
+[[transports]]
+name = "harp"
+session_idle_timeout = 300
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).expect("parse harp-only");
+        let transports = config.transports.expect("transports present");
+        assert_eq!(transports.len(), 1);
+        match &transports[0] {
+            TransportEntry::Harp(h) => {
+                assert_eq!(h.session_idle_timeout, Some(300));
+            }
+            _ => panic!("expected Harp entry"),
+        }
+    }
+
+    // T-STEP13-6: Empty server config has no transports (None)
+    #[test]
+    fn server_config_no_transports_defaults() {
+        let config: ServerConfig = toml::from_str("").expect("parse empty");
+        assert!(config.transports.is_none());
+    }
+
+    // T-STEP13-7: resolve_server_transports with both entries returns both
+    #[test]
+    fn resolve_transports_from_array() {
+        let toml_str = r#"
+[[transports]]
+name = "masque"
+max_idle_timeout = 200
+keep_alive = 10
+
+[[transports]]
+name = "harp"
+session_idle_timeout = 400
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).expect("parse");
+        let resolved = resolve_server_transports(&config);
+        assert_eq!(resolved.len(), 2);
+        match &resolved[0] {
+            ResolvedTransport::Masque {
+                max_idle_timeout,
+                keep_alive,
+                ..
+            } => {
+                assert_eq!(*max_idle_timeout, 200);
+                assert_eq!(*keep_alive, 10);
+            }
+            _ => panic!("expected Masque"),
+        }
+        match &resolved[1] {
+            ResolvedTransport::Harp { session_idle_timeout, .. } => {
+                assert_eq!(*session_idle_timeout, 400);
+            }
+            _ => panic!("expected Harp"),
+        }
+    }
+
+    // T-STEP13-8: resolve_server_transports with no transports defaults to HARP
+    #[test]
+    fn resolve_transports_default() {
+        let config: ServerConfig = toml::from_str("").expect("parse empty");
+        let resolved = resolve_server_transports(&config);
+        assert_eq!(resolved.len(), 1);
+        match &resolved[0] {
+            ResolvedTransport::Harp {
+                websocket_enabled,
+                polling_enabled,
+                session_idle_timeout,
+            } => {
+                assert!(*websocket_enabled);
+                assert!(*polling_enabled);
+                assert_eq!(*session_idle_timeout, DEFAULT_HARP_SESSION_IDLE_TIMEOUT);
+            }
+            _ => panic!("expected default Harp"),
+        }
+    }
+
+    // T-STEP13-9: resolve_server_transports filters out disabled entries
+    #[test]
+    fn resolve_transports_disabled_filtered() {
+        let toml_str = r#"
+[[transports]]
+name = "masque"
+enabled = false
+
+[[transports]]
+name = "harp"
+enabled = true
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).expect("parse");
+        let resolved = resolve_server_transports(&config);
+        assert_eq!(resolved.len(), 1);
+        assert!(matches!(&resolved[0], ResolvedTransport::Harp { .. }));
+    }
+
+    // T-STEP13-10: HARP defaults: websocket=true, polling=true, timeout=300
+    #[test]
+    fn resolve_transports_harp_defaults() {
+        let toml_str = r#"
+[[transports]]
+name = "harp"
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).expect("parse");
+        let resolved = resolve_server_transports(&config);
+        assert_eq!(resolved.len(), 1);
+        match &resolved[0] {
+            ResolvedTransport::Harp {
+                websocket_enabled,
+                polling_enabled,
+                session_idle_timeout,
+            } => {
+                assert!(*websocket_enabled);
+                assert!(*polling_enabled);
+                assert_eq!(*session_idle_timeout, DEFAULT_HARP_SESSION_IDLE_TIMEOUT);
+            }
+            _ => panic!("expected Harp"),
+        }
+    }
+
     // AC-11: All default constants match SPEC.md values
     #[test]
     fn defaults_match_spec() {
@@ -1385,7 +1755,7 @@ x = 1
         assert_eq!(DEFAULT_IDENTITY_KEY_PATH, "/etc/prrr/keys/server_identity.key");
         assert_eq!(DEFAULT_PQ_KEY_PATH, "/etc/prrr/keys/server_pq.key");
         assert_eq!(DEFAULT_REKEY_INTERVAL, 3600);
-        assert_eq!(DEFAULT_TRANSPORT_PROTOCOL, "masque");
+        assert_eq!(DEFAULT_TRANSPORT_PROTOCOL, "harp");
         assert_eq!(DEFAULT_MAX_IDLE_TIMEOUT, 300);
         assert_eq!(DEFAULT_KEEP_ALIVE, 25);
         assert_eq!(DEFAULT_PADDING_STRATEGY, "power-of-two");

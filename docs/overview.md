@@ -6,7 +6,7 @@ This document describes the architecture of prrr, its core concepts, and how the
 
 prrr is designed around three principles:
 
-1. **Indistinguishable from HTTPS** -- All VPN traffic tunnels through MASQUE/QUIC on UDP port 443, making it look like regular HTTP/3 web browsing to network observers and DPI systems.
+1. **Indistinguishable from HTTPS** -- VPN traffic tunnels through HARP over TCP port 443 (default) or MASQUE/QUIC over UDP port 443, making it look like regular web browsing to network observers and DPI systems.
 2. **Post-quantum security** -- Hybrid X25519 + ML-KEM-768 key exchange protects sessions against both classical and future quantum attacks.
 3. **Operational simplicity** -- A single binary handles server, client, key management, diagnostics, and administration.
 
@@ -20,19 +20,54 @@ prrr is designed around three principles:
                           |
 +--------+          +-----+-----+          +--------+
 | Client | <------> |   Server  | <------> | Client |
-| (prrr) |  QUIC/   |   (prrr)  |  QUIC/   | (prrr) |
-+--------+  443/UDP +-----+-----+  443/UDP +--------+
-                          |
+| (prrr) |  HARP/   |   (prrr)  |  HARP/   | (prrr) |
++--------+  443/TCP +-----+-----+  443/TCP +--------+
+            (or MASQUE    |        (or MASQUE
+             443/UDP)     |         443/UDP)
                     +-----+-----+
                     |  Registry |  (SQLite)
                     +-----------+
 ```
 
-Each client maintains an independent QUIC connection to the server. The server spawns a per-client task that owns its own TUN device, encrypted channel, and MASQUE tunnel.
+Each client maintains an independent connection to the server via HARP (HTTPS/WebSocket, default) or MASQUE (QUIC). The server spawns a per-client task that owns its own TUN device, encrypted channel, and transport tunnel.
 
 ## Protocol Stack
 
-Traffic flows through six layers, each adding a specific capability:
+Traffic flows through layered encryption and framing. The transport layer
+is pluggable -- HARP is the default, MASQUE is available as an alternative.
+
+### HARP Transport (Default)
+
+HARP (HTTPS API Relay Protocol) is the default transport. It tunnels
+encrypted VPN packets over standard HTTPS using WebSocket streaming or
+HTTP polling. Since HTTPS/TCP cannot be blocked without breaking the web,
+HARP is highly resistant to DPI-based protocol blocking.
+
+```text
+Application (IP packets from TUN device)
+     |
+TunnelPipeline: TUN <-> encrypt <-> HARP
+     |
+EncryptedChannel: ChaCha20-Poly1305 + replay protection
+     |
+HARP framing: 4-byte header [version | type | length] + payload
+     |
+WebSocket (streaming) or HTTP POST/GET (polling)
+     |
+TLS 1.3: indistinguishable from HTTPS
+     |
+TCP/IP: standard port 443 traffic
+```
+
+HARP uses a minimal 4-byte frame header (version, type, payload length)
+to encapsulate `EncryptedChannel` output. The frame codec lives in
+`transport::harp`. See `docs/tunnel.md` for the frame format details.
+
+### MASQUE Transport (Legacy)
+
+MASQUE (RFC 9297/9298) is a standard HTTP/3 mechanism for proxying UDP
+traffic. It remains available for environments where UDP/QUIC performs
+better than TCP/HTTPS.
 
 ```text
 Application (IP packets from TUN device)
@@ -50,9 +85,9 @@ TLS 1.3 (ALPN=h3): indistinguishable from HTTP/3
 UDP/IP: standard port 443 traffic
 ```
 
-### Why MASQUE?
-
-MASQUE (RFC 9297/9298) is a standard HTTP/3 mechanism for proxying UDP traffic. By framing VPN packets as MASQUE datagrams, prrr traffic is structurally identical to HTTP/3 web traffic. DPI systems cannot distinguish prrr from a browser loading a website over QUIC.
+> **Note:** MASQUE/QUIC is available as an alternative transport but is no
+> longer the default. QUIC (UDP) is increasingly blocked by DPI systems,
+> so HARP (TCP/HTTPS) is preferred for most deployments.
 
 ## Module Map
 
@@ -67,11 +102,11 @@ The codebase is organized into focused modules:
 | `keys` | Persistent server key storage |
 | `crypto` | Cryptographic primitives (AEAD, KDF, X25519, hybrid KEX) |
 | `handshake` | Noise IK + ML-KEM-768 hybrid handshake |
-| `transport` | QUIC, MASQUE framing, encrypted channels |
+| `transport` | HARP framing, QUIC (legacy), MASQUE (legacy), encrypted channels |
 | `tunnel` | TUN device abstraction and packet pipeline |
 | `obfuscation` | TLS mimicry, traffic padding, probe resistance |
 | `messaging` | Whisper: PQXDH, double ratchet, relay |
-| `web` | REST API, JWT auth, embedded SPA frontend |
+| `web` | REST API, JWT auth, embedded SPA frontend, HARP session management |
 | `metrics` | Prometheus metrics and health endpoint |
 | `diagnostics` | Server and client diagnostic checks |
 | `distribution` | Client config export, QR codes, token URLs |
@@ -99,12 +134,12 @@ After the handshake, a bidirectional `EncryptedChannel` handles all packet encry
 
 ### Tunnel Pipeline
 
-The `TunnelPipeline` bridges the TUN device and the encrypted MASQUE channel with two concurrent loops:
+The `TunnelPipeline` bridges the TUN device and the encrypted transport channel with two concurrent loops:
 
-- **Inbound:** TUN device recv -> encrypt -> MASQUE send_datagram
-- **Outbound:** MASQUE recv_datagram -> decrypt -> TUN device send
+- **Inbound:** TUN device recv -> encrypt -> transport send
+- **Outbound:** transport recv -> decrypt -> TUN device send
 
-Each client gets an independent pipeline with its own TUN device and traffic counters.
+Each client gets an independent pipeline with its own TUN device and traffic counters. The pipeline is transport-agnostic -- it works identically with HARP or MASQUE via the `DatagramSender`/`DatagramReceiver` traits.
 
 ### Client Registry
 
@@ -139,6 +174,26 @@ Whisper provides end-to-end encrypted messaging over the VPN tunnel:
 
 ## Connection Lifecycle
 
+### HARP (Default)
+
+```text
+Client                                          Server
+------                                          ------
+1. Parse CLI / load config                      1. Parse CLI / load config
+2. Init tracing                                 2. Init tracing, start HTTP server
+                                                3. Accept connection loop
+3. HTTPS POST /session            ---------->   4. Check max_clients limit
+4. WebSocket upgrade (or polling) ---------->   5. HARP session established
+5. Hybrid handshake (initiator)   <--------->   6. Hybrid handshake (responder)
+                                                7. Authenticate client key
+6. EncryptedChannel created                     8. EncryptedChannel created
+                                                9. Create TUN device
+7. TunnelPipeline::run(cancel)    <--------->   10. TunnelPipeline::run(cancel)
+8. Signal -> cancel -> shutdown                 11. Persist traffic stats
+```
+
+### MASQUE (Legacy)
+
 ```text
 Client                                          Server
 ------                                          ------
@@ -171,6 +226,7 @@ The SPA is embedded in the binary via `include_str!`, so the web admin works wit
 |------|-----------|
 | **AEAD** | Authenticated Encryption with Associated Data (ChaCha20-Poly1305) |
 | **DPI** | Deep Packet Inspection -- network-level traffic analysis |
+| **HARP** | HTTPS API Relay Protocol — tunnels VPN traffic over standard HTTPS |
 | **HKDF** | HMAC-based Key Derivation Function |
 | **KEM** | Key Encapsulation Mechanism (ML-KEM-768) |
 | **MASQUE** | Multiplexed Application Substrate over QUIC Encryption (RFC 9297) |

@@ -170,7 +170,8 @@ mod tests {
 
     fn test_app_state() -> AppState {
         use crate::distribution::{ConfigTokenStore, ServerContext};
-        use crate::web::handlers::ServerConfigResponse;
+        use crate::web::handlers::{ServerConfigResponse, TransportInfoResponse};
+        use crate::web::harp::HarpSessionStore;
         let registry = ClientRegistry::new("10.66.66.0/24").expect("valid subnet");
         AppState {
             registry: Arc::new(Mutex::new(registry)),
@@ -199,6 +200,12 @@ mod tests {
                 web_admin_enabled: true,
                 metrics_enabled: false,
             }),
+            resolved_transports: Arc::new(vec![TransportInfoResponse::from_harp(true, true, 300)]),
+            harp_sessions: Arc::new(HarpSessionStore::new()),
+            server_noise_private_key: Arc::from([0u8; 32].as_slice()),
+            server_noise_public_key: [0u8; 32],
+            server_kem_dk_bytes: Arc::from([0u8; 0].as_slice()),
+            tunnel_spawner: None,
         }
     }
 

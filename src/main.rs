@@ -6,6 +6,7 @@ use clap::Parser;
 use tokio_util::sync::CancellationToken;
 
 use prrr::config::{Cli, Command, init_tracing};
+use prrr::transport::ServerTransport as _;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -83,6 +84,9 @@ async fn main() -> anyhow::Result<()> {
             let server_noise_pub = *key_store.noise_keypair().public_key();
             let server_kem_pub = key_store.kem_keypair().encapsulation_key_bytes();
 
+            let server_noise_private_key: std::sync::Arc<[u8]> = std::sync::Arc::from(key_store.noise_keypair().private_key_bytes());
+            let server_kem_dk_bytes: std::sync::Arc<[u8]> = std::sync::Arc::from(key_store.kem_keypair().dk_bytes().as_slice());
+
             let (noise_keypair, kem_keypair) = key_store.into_parts();
 
             let subnet = config
@@ -144,11 +148,23 @@ async fn main() -> anyhow::Result<()> {
                     .map(|d| d.iter().map(String::clone).collect())
                     .unwrap_or_else(|| prrr::config::DEFAULT_DNS_SERVERS.iter().map(|s| (*s).to_string()).collect());
                 let mtu = config.network.as_ref().and_then(|n| n.mtu).unwrap_or(prrr::config::DEFAULT_MTU);
-                let transport_protocol = config
-                    .transport
-                    .as_ref()
-                    .and_then(|t| t.protocol.clone())
-                    .unwrap_or_else(|| prrr::config::DEFAULT_TRANSPORT_PROTOCOL.to_string());
+                let transport_protocol = {
+                    let names: Vec<&str> = config
+                        .transports
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .map(|e| match e {
+                            prrr::config::TransportEntry::Masque(_) => "masque",
+                            prrr::config::TransportEntry::Harp(_) => "harp",
+                        })
+                        .collect();
+                    if names.is_empty() {
+                        prrr::config::DEFAULT_TRANSPORT_PROTOCOL.to_string()
+                    } else {
+                        names.join(",")
+                    }
+                };
                 let obfuscation_enabled = config.obfuscation.as_ref().and_then(|o| o.enabled).unwrap_or(false);
                 let metrics_enabled = config.monitoring.as_ref().and_then(|m| m.metrics_enabled).unwrap_or(false);
 
@@ -177,6 +193,32 @@ async fn main() -> anyhow::Result<()> {
                     server_context: std::sync::Arc::clone(&server_context),
                     config_tokens: std::sync::Arc::clone(&config_tokens),
                     server_config,
+                    resolved_transports: std::sync::Arc::new(
+                        prrr::config::resolve_server_transports(&config)
+                            .into_iter()
+                            .map(|rt| match rt {
+                                prrr::config::ResolvedTransport::Harp {
+                                    websocket_enabled,
+                                    polling_enabled,
+                                    session_idle_timeout,
+                                } => prrr::web::handlers::TransportInfoResponse::from_harp(
+                                    websocket_enabled,
+                                    polling_enabled,
+                                    session_idle_timeout,
+                                ),
+                                prrr::config::ResolvedTransport::Masque {
+                                    max_idle_timeout,
+                                    keep_alive,
+                                    ..
+                                } => prrr::web::handlers::TransportInfoResponse::from_masque(max_idle_timeout, keep_alive),
+                            })
+                            .collect(),
+                    ),
+                    harp_sessions: std::sync::Arc::new(prrr::web::harp::HarpSessionStore::new()),
+                    server_noise_private_key: std::sync::Arc::clone(&server_noise_private_key),
+                    server_noise_public_key: server_noise_pub,
+                    server_kem_dk_bytes: std::sync::Arc::clone(&server_kem_dk_bytes),
+                    tunnel_spawner: None,
                 };
                 tracing::info!(%listen_addr, "starting web admin server");
                 Some(tokio::spawn(prrr::web::run_web_server(listen_addr, app_state)))
@@ -204,25 +246,70 @@ async fn main() -> anyhow::Result<()> {
                 None
             };
 
-            let tls_cert_path = config.transport.as_ref().and_then(|t| t.tls_cert.as_deref());
-            let tls_key_path = config.transport.as_ref().and_then(|t| t.tls_key.as_deref());
+            // Resolve enabled transports from config
+            let resolved_transports = prrr::config::resolve_server_transports(&config);
+            if resolved_transports.is_empty() {
+                anyhow::bail!("no transports enabled in configuration");
+            }
 
-            let vpn_result = prrr::server::run_multi_server(
-                args.listen,
-                &args.server_name,
-                &noise_keypair,
-                kem_keypair,
-                tls_cert_path,
-                tls_key_path,
-                prrr::server::MultiServerParams {
-                    registry,
-                    max_clients,
-                    tun_factory,
-                    cancel,
-                    active_connections,
-                },
-            )
-            .await;
+            // Get subnet gateway before spawning transports
+            let subnet_gateway = {
+                let reg = registry.lock().await;
+                reg.gateway_addr()
+            };
+
+            // Build shared server state for all transports
+            let shared = std::sync::Arc::new(prrr::transport::SharedServerState {
+                registry,
+                noise_keypair: std::sync::Arc::new(noise_keypair),
+                kem_keypair: std::sync::Arc::new(kem_keypair),
+                active_connections,
+                max_clients,
+                subnet_gateway,
+                cancel: cancel.clone(),
+            });
+
+            // Spawn each enabled transport
+            let mut transport_tasks = tokio::task::JoinSet::new();
+            for resolved in &resolved_transports {
+                match resolved {
+                    prrr::config::ResolvedTransport::Masque { tls_cert, tls_key, .. } => {
+                        let transport = prrr::server::MasqueServerTransport::new(
+                            args.listen,
+                            args.server_name.clone(),
+                            tls_cert.clone(),
+                            tls_key.clone(),
+                            std::sync::Arc::clone(&tun_factory),
+                        );
+                        let shared = std::sync::Arc::clone(&shared);
+                        let cancel = cancel.clone();
+                        tracing::info!("starting MASQUE transport on {}", args.listen);
+                        transport_tasks.spawn(async move { transport.run(shared, cancel).await });
+                    }
+                    prrr::config::ResolvedTransport::Harp { .. } => {
+                        let transport = prrr::web::harp::HarpServerTransport::new(args.listen, std::sync::Arc::clone(&tun_factory));
+                        let shared = std::sync::Arc::clone(&shared);
+                        let cancel = cancel.clone();
+                        tracing::info!("starting HARP transport on {}", args.listen);
+                        transport_tasks.spawn(async move { transport.run(shared, cancel).await });
+                    }
+                }
+            }
+
+            // Wait for first transport to finish (error or cancellation)
+            let vpn_result = if let Some(result) = transport_tasks.join_next().await {
+                match result {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(e),
+                    Err(e) => Err(anyhow::anyhow!("transport task panicked: {e}")),
+                }
+            } else {
+                Ok(())
+            };
+
+            // Cancel remaining transports
+            cancel.cancel();
+            while transport_tasks.join_next().await.is_some() {}
 
             if let Some(task) = web_task {
                 let _ = task.await;
@@ -336,16 +423,60 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("failed to create TUN device (need root/CAP_NET_ADMIN): {e}"))?;
             tracing::info!(name = tun_config.name, address = %tun_address, gateway = %gateway, mtu = tun_mtu, "TUN device created");
 
-            prrr::client::run_client(
-                server_addr,
-                server_name,
+            // Resolve transport protocol: config > default ("harp")
+            let transport_protocol = config
+                .transport
+                .as_ref()
+                .and_then(|t| t.protocol.as_deref())
+                .unwrap_or(prrr::config::DEFAULT_TRANSPORT_PROTOCOL);
+
+            // Build transport via trait-based dispatch
+            let transport: Box<dyn prrr::transport::ClientTransport> = match transport_protocol {
+                "harp" => {
+                    tracing::info!("using HARP transport");
+                    Box::new(prrr::client::HarpClientTransport::new(
+                        server_addr.to_string(),
+                        server_name.to_string(),
+                        insecure,
+                    ))
+                }
+                _ => {
+                    tracing::info!("using MASQUE transport");
+                    Box::new(prrr::client::MasqueClientTransport::new(
+                        server_addr,
+                        server_name.to_string(),
+                        25,
+                        300,
+                        insecure,
+                    ))
+                }
+            };
+
+            // Resolve reconnection config from client transport section
+            let reconnect_config = prrr::reconnect::ReconnectConfig {
+                backoff_initial_ms: config
+                    .transport
+                    .as_ref()
+                    .and_then(|t| t.reconnect_backoff_ms)
+                    .unwrap_or(prrr::reconnect::DEFAULT_BACKOFF_INITIAL_MS),
+                backoff_max_ms: config
+                    .transport
+                    .as_ref()
+                    .and_then(|t| t.reconnect_max_backoff_ms)
+                    .unwrap_or(prrr::reconnect::DEFAULT_BACKOFF_MAX_MS),
+            };
+
+            // Wrap TUN in Arc for persistence across reconnections
+            let tun = std::sync::Arc::new(tun);
+
+            // Run with automatic reconnection on transport failure
+            prrr::reconnect::run_with_reconnect(
+                transport.as_ref(),
                 &noise_keypair,
                 &server_noise_pub,
                 &server_kem_pub,
                 tun,
-                25,
-                300,
-                insecure,
+                &reconnect_config,
                 cancel,
             )
             .await

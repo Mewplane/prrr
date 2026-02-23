@@ -3,15 +3,17 @@
     <head>
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <title>prrr VPN - Admin</title>
+        <title>prrr - Admin</title>
+        <link rel="icon" type="image/png" href="/assets/logo_w.png" />
         <style>
             :root {
-                --bg: #0f172a;
-                --surface: #1e293b;
-                --border: #334155;
-                --text: #f1f5f9;
-                --text-dim: #94a3b8;
-                --primary: #38bdf8;
+                --bg: #000000;
+                --surface: #111111;
+                --border: #333333;
+                --text: #ffffff;
+                --text-dim: #a0a0a0;
+                --primary: #ffffff;
+                --primary-text: #000000;
                 --success: #22c55e;
                 --warning: #f59e0b;
                 --danger: #ef4444;
@@ -36,8 +38,8 @@
             }
 
             a {
-                color: var(--primary);
-                text-decoration: none;
+                color: var(--text-dim);
+                text-decoration: underline;
             }
             a:hover {
                 text-decoration: underline;
@@ -63,7 +65,7 @@
                 border-bottom: 1px solid var(--border);
                 font-size: 1.25rem;
                 font-weight: 700;
-                color: var(--primary);
+                color: var(--text);
                 letter-spacing: 0.05em;
             }
 
@@ -89,12 +91,12 @@
             }
 
             .nav-item:hover {
-                background: rgba(56, 189, 248, 0.08);
+                background: rgba(255, 255, 255, 0.06);
                 color: var(--text);
             }
             .nav-item.active {
-                color: var(--primary);
-                background: rgba(56, 189, 248, 0.12);
+                color: var(--text);
+                background: rgba(255, 255, 255, 0.1);
             }
 
             .sidebar-footer {
@@ -193,7 +195,7 @@
                 border-bottom: none;
             }
             tr:hover td {
-                background: rgba(56, 189, 248, 0.04);
+                background: rgba(255, 255, 255, 0.03);
             }
 
             /* Status badges */
@@ -248,12 +250,12 @@
             .btn-primary {
                 background: var(--primary);
                 border-color: var(--primary);
-                color: var(--bg);
+                color: var(--primary-text);
             }
 
             .btn-primary:hover {
-                background: #7dd3fc;
-                border-color: #7dd3fc;
+                background: #e0e0e0;
+                border-color: #e0e0e0;
             }
 
             .btn-danger {
@@ -361,7 +363,7 @@
                 text-align: center;
                 font-size: 1.5rem;
                 font-weight: 700;
-                color: var(--primary);
+                color: var(--text);
                 margin-bottom: 0.5rem;
             }
 
@@ -461,6 +463,8 @@
             const SECONDS_PER_MINUTE = 60;
             const SECONDS_PER_HOUR = 3600;
             const SECONDS_PER_DAY = 86400;
+            const BYTES_UNITS = ["B", "KB", "MB", "GB", "TB"];
+            const BYTES_DIVISOR = 1024;
             const STATUS_ACTIVE = "active";
             const STATUS_SUSPENDED = "suspended";
 
@@ -540,6 +544,20 @@
                 getServerConfig() {
                     return this.request("/server/config");
                 },
+                getTransports() {
+                    return this.request("/server/transports");
+                },
+                getTrafficStats() {
+                    return this.request("/stats/traffic");
+                },
+                getHarpSessions() {
+                    return this.request("/harp/sessions");
+                },
+                terminateHarpSession(id) {
+                    return this.request("/harp/sessions/" + id, {
+                        method: "DELETE",
+                    });
+                },
                 async getClientQr(id) {
                     const token = this.getToken();
                     const headers = {};
@@ -598,6 +616,21 @@
                 return new Date(unixTimestamp * 1000).toLocaleString();
             }
 
+            function formatBytes(bytes) {
+                if (bytes === 0) return "0 B";
+                let value = bytes;
+                let unitIndex = 0;
+                while (
+                    value >= BYTES_DIVISOR &&
+                    unitIndex < BYTES_UNITS.length - 1
+                ) {
+                    value /= BYTES_DIVISOR;
+                    unitIndex++;
+                }
+                if (unitIndex === 0) return bytes + " B";
+                return value.toFixed(1) + " " + BYTES_UNITS[unitIndex];
+            }
+
             function getRoute() {
                 return window.location.hash.slice(1) || "/";
             }
@@ -629,9 +662,15 @@
                     return html`
                         <div class="login-container">
                             <div class="login-box">
-                                <div class="login-title">prrr</div>
+                                <div class="login-title">
+                                    <img
+                                        src="/assets/logo_w_text.png"
+                                        alt="prrr"
+                                        style="height: 120px; width: auto;"
+                                    />
+                                </div>
                                 <div class="login-subtitle">
-                                    VPN Server Administration
+                                    Server Administration
                                 </div>
                                 ${error &&
                                 html`<div class="alert alert-error">
@@ -956,7 +995,12 @@
             }
 
             class SettingsPage extends Component {
-                state = { config: null, error: null, loading: true };
+                state = {
+                    config: null,
+                    transports: [],
+                    error: null,
+                    loading: true,
+                };
 
                 componentDidMount() {
                     this.loadConfig();
@@ -964,14 +1008,22 @@
 
                 async loadConfig() {
                     try {
-                        const config = await api.getServerConfig();
-                        this.setState({ config, loading: false, error: null });
+                        const [config, transportData] = await Promise.all([
+                            api.getServerConfig(),
+                            api.getTransports(),
+                        ]);
+                        this.setState({
+                            config,
+                            transports: transportData.transports,
+                            loading: false,
+                            error: null,
+                        });
                     } catch (err) {
                         this.setState({ error: err.message, loading: false });
                     }
                 }
 
-                render(_, { config, error, loading }) {
+                render(_, { config, transports, error, loading }) {
                     if (loading) {
                         return html`<div>
                             <h2 style="margin-bottom:1.5rem">Settings</h2>
@@ -1029,6 +1081,201 @@
                                     `,
                                 )}
                             </div>
+                            ${transports.length > 0 &&
+                            html`
+                                <h3 style="margin:2rem 0 1rem">Transports</h3>
+                                <div
+                                    class="card-grid"
+                                    style="grid-template-columns:repeat(auto-fit,minmax(250px,1fr))"
+                                >
+                                    ${transports.map(
+                                        (t) => html`
+                                            <div class="card" key=${t.name}>
+                                                <div class="card-label">
+                                                    ${t.name.toUpperCase()}
+                                                </div>
+                                                <div
+                                                    class="card-value text-dim"
+                                                    style="font-size:0.875rem"
+                                                >
+                                                    <div>
+                                                        Protocol: ${t.protocol}
+                                                    </div>
+                                                    ${t.websocket_enabled !=
+                                                        null &&
+                                                    html`<div>
+                                                        WebSocket:
+                                                        ${t.websocket_enabled
+                                                            ? "On"
+                                                            : "Off"}
+                                                    </div>`}
+                                                    ${t.polling_enabled !=
+                                                        null &&
+                                                    html`<div>
+                                                        Polling:
+                                                        ${t.polling_enabled
+                                                            ? "On"
+                                                            : "Off"}
+                                                    </div>`}
+                                                    ${t.session_idle_timeout !=
+                                                        null &&
+                                                    html`<div>
+                                                        Idle timeout:
+                                                        ${t.session_idle_timeout}s
+                                                    </div>`}
+                                                    ${t.max_idle_timeout !=
+                                                        null &&
+                                                    html`<div>
+                                                        Max idle:
+                                                        ${t.max_idle_timeout}s
+                                                    </div>`}
+                                                    ${t.keep_alive != null &&
+                                                    html`<div>
+                                                        Keep-alive:
+                                                        ${t.keep_alive}s
+                                                    </div>`}
+                                                </div>
+                                            </div>
+                                        `,
+                                    )}
+                                </div>
+                            `}
+                        </div>
+                    `;
+                }
+            }
+
+            class SessionsPage extends Component {
+                state = {
+                    sessions: [],
+                    error: null,
+                    loading: true,
+                };
+                _interval = null;
+
+                componentDidMount() {
+                    this.loadSessions();
+                    this._interval = setInterval(
+                        () => this.loadSessions(),
+                        REFRESH_INTERVAL_MS,
+                    );
+                }
+                componentWillUnmount() {
+                    if (this._interval) clearInterval(this._interval);
+                }
+
+                async loadSessions() {
+                    try {
+                        const data = await api.getHarpSessions();
+                        this.setState({
+                            sessions: data.sessions,
+                            loading: false,
+                            error: null,
+                        });
+                    } catch (err) {
+                        this.setState({ error: err.message, loading: false });
+                    }
+                }
+
+                onTerminate = async (sessionId) => {
+                    if (!confirm("Terminate session " + sessionId + "?"))
+                        return;
+                    try {
+                        await api.terminateHarpSession(sessionId);
+                        await this.loadSessions();
+                    } catch (err) {
+                        this.setState({ error: err.message });
+                    }
+                };
+
+                render(_, { sessions, error, loading }) {
+                    if (loading) {
+                        return html`<div>
+                            <h2 style="margin-bottom:1.5rem">Sessions</h2>
+                            <p class="text-dim">Loading...</p>
+                        </div>`;
+                    }
+                    return html`
+                        <div>
+                            <h2 style="margin-bottom:1.5rem">Sessions</h2>
+                            ${error &&
+                            html`<div class="alert alert-error">${error}</div>`}
+                            <div class="table-wrap">
+                                <div class="table-header">
+                                    <span class="table-title"
+                                        >Active HARP Sessions</span
+                                    >
+                                </div>
+                                ${sessions.length === 0
+                                    ? html`
+                                          <div class="empty-state">
+                                              No active sessions.
+                                          </div>
+                                      `
+                                    : html`
+                                          <table>
+                                              <thead>
+                                                  <tr>
+                                                      <th>Client</th>
+                                                      <th>Session ID</th>
+                                                      <th>Started</th>
+                                                      <th>Last Active</th>
+                                                      <th>Idle</th>
+                                                      <th>Actions</th>
+                                                  </tr>
+                                              </thead>
+                                              <tbody>
+                                                  ${sessions.map(
+                                                      (s) => html`
+                                                          <tr
+                                                              key=${s.session_id}
+                                                          >
+                                                              <td>
+                                                                  ${s.client_name ||
+                                                                  "\u2014"}
+                                                              </td>
+                                                              <td
+                                                                  style="font-family:monospace"
+                                                              >
+                                                                  ${s.session_id}
+                                                              </td>
+                                                              <td
+                                                                  class="text-dim text-sm"
+                                                              >
+                                                                  ${formatDate(
+                                                                      s.created_at,
+                                                                  )}
+                                                              </td>
+                                                              <td
+                                                                  class="text-dim text-sm"
+                                                              >
+                                                                  ${formatDate(
+                                                                      s.last_activity,
+                                                                  )}
+                                                              </td>
+                                                              <td
+                                                                  class="text-dim text-sm"
+                                                              >
+                                                                  ${s.idle_seconds}s
+                                                              </td>
+                                                              <td>
+                                                                  <button
+                                                                      class="btn btn-sm btn-danger"
+                                                                      onClick=${() =>
+                                                                          this.onTerminate(
+                                                                              s.session_id,
+                                                                          )}
+                                                                  >
+                                                                      Terminate
+                                                                  </button>
+                                                              </td>
+                                                          </tr>
+                                                      `,
+                                                  )}
+                                              </tbody>
+                                          </table>
+                                      `}
+                            </div>
                         </div>
                     `;
                 }
@@ -1039,6 +1286,7 @@
                     status: null,
                     clients: [],
                     stats: null,
+                    traffic: null,
                     error: null,
                     showAdd: false,
                 };
@@ -1057,15 +1305,18 @@
 
                 async loadData() {
                     try {
-                        const [status, clientData, stats] = await Promise.all([
-                            api.getStatus(),
-                            api.getClients(),
-                            api.getStats(),
-                        ]);
+                        const [status, clientData, stats, traffic] =
+                            await Promise.all([
+                                api.getStatus(),
+                                api.getClients(),
+                                api.getStats(),
+                                api.getTrafficStats(),
+                            ]);
                         this.setState({
                             status,
                             clients: clientData.clients,
                             stats,
+                            traffic,
                             error: null,
                         });
                     } catch (err) {
@@ -1088,7 +1339,7 @@
                     }
                 };
 
-                render(_, { status, clients, stats, error, showAdd }) {
+                render(_, { status, clients, stats, traffic, error, showAdd }) {
                     return html`
                         <div>
                             <h2 style="margin-bottom: 1.5rem;">Dashboard</h2>
@@ -1120,6 +1371,36 @@
                                         ${status
                                             ? formatUptime(
                                                   status.uptime_seconds,
+                                              )
+                                            : "..."}
+                                    </div>
+                                </div>
+                                <div class="card">
+                                    <div class="card-label">HARP Sessions</div>
+                                    <div class="card-value">
+                                        ${status
+                                            ? String(
+                                                  status.active_harp_sessions,
+                                              )
+                                            : "..."}
+                                    </div>
+                                </div>
+                                <div class="card">
+                                    <div class="card-label">Total Sent</div>
+                                    <div class="card-value">
+                                        ${traffic
+                                            ? formatBytes(
+                                                  traffic.total_bytes_sent,
+                                              )
+                                            : "..."}
+                                    </div>
+                                </div>
+                                <div class="card">
+                                    <div class="card-label">Total Received</div>
+                                    <div class="card-value">
+                                        ${traffic
+                                            ? formatBytes(
+                                                  traffic.total_bytes_received,
                                               )
                                             : "..."}
                                     </div>
@@ -1158,6 +1439,8 @@
                                                   <tr>
                                                       <th>Name</th>
                                                       <th>IP Address</th>
+                                                      <th>Transport</th>
+                                                      <th>Traffic</th>
                                                       <th>Status</th>
                                                       <th>Last Seen</th>
                                                       <th>Actions</th>
@@ -1172,6 +1455,24 @@
                                                                   style="font-family:monospace"
                                                               >
                                                                   ${c.ip_address}
+                                                              </td>
+                                                              <td
+                                                                  class="text-dim text-sm"
+                                                              >
+                                                                  ${c.transport_type ||
+                                                                  "harp"}
+                                                              </td>
+                                                              <td
+                                                                  class="text-dim text-sm"
+                                                                  style="white-space:nowrap"
+                                                              >
+                                                                  ${formatBytes(
+                                                                      c.bytes_sent,
+                                                                  )}
+                                                                  /
+                                                                  ${formatBytes(
+                                                                      c.bytes_received,
+                                                                  )}
                                                               </td>
                                                               <td>
                                                                   <span
@@ -1262,12 +1563,38 @@
             }
 
             class App extends Component {
-                state = { route: getRoute(), loggedIn: !!api.getToken() };
+                state = {
+                    route: getRoute(),
+                    loggedIn: !!api.getToken(),
+                    sessionCount: null,
+                };
+                _sessionInterval = null;
 
                 componentDidMount() {
                     window.addEventListener("hashchange", () => {
                         this.setState({ route: getRoute() });
                     });
+                    this.loadSessionCount();
+                    this._sessionInterval = setInterval(
+                        () => this.loadSessionCount(),
+                        REFRESH_INTERVAL_MS,
+                    );
+                }
+                componentWillUnmount() {
+                    if (this._sessionInterval)
+                        clearInterval(this._sessionInterval);
+                }
+
+                async loadSessionCount() {
+                    if (!api.getToken()) return;
+                    try {
+                        const data = await api.getHarpSessions();
+                        this.setState({
+                            sessionCount: data.sessions.length,
+                        });
+                    } catch (_) {
+                        // ignore — badge just won't update
+                    }
                 }
 
                 onLogin = () => {
@@ -1289,7 +1616,13 @@
                     return html`
                         <div class="layout">
                             <nav class="sidebar">
-                                <div class="sidebar-brand">prrr</div>
+                                <div class="sidebar-brand">
+                                    <img
+                                        src="/assets/logo_w.png"
+                                        alt="prrr"
+                                        style="height: 32px; width: auto;"
+                                    />
+                                </div>
                                 <div class="sidebar-nav">
                                     <button
                                         class="nav-item ${route === "/"
@@ -1300,6 +1633,22 @@
                                         }}
                                     >
                                         Dashboard
+                                    </button>
+                                    <button
+                                        class="nav-item ${route === "/sessions"
+                                            ? "active"
+                                            : ""}"
+                                        onClick=${() => {
+                                            window.location.hash = "#/sessions";
+                                        }}
+                                    >
+                                        Sessions${this.state.sessionCount !=
+                                            null &&
+                                        html`<span
+                                            class="badge badge-active"
+                                            style="margin-left:0.5rem"
+                                            >${this.state.sessionCount}</span
+                                        >`}
                                     </button>
                                     <button
                                         class="nav-item ${route === "/settings"
@@ -1323,9 +1672,11 @@
                                 </div>
                             </nav>
                             <main class="main-content">
-                                ${route === "/settings"
-                                    ? html`<${SettingsPage} />`
-                                    : html`<${Dashboard} />`}
+                                ${route === "/sessions"
+                                    ? html`<${SessionsPage} />`
+                                    : route === "/settings"
+                                      ? html`<${SettingsPage} />`
+                                      : html`<${Dashboard} />`}
                             </main>
                         </div>
                     `;

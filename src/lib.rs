@@ -31,6 +31,9 @@ pub mod obfuscation;
 /// Prometheus metrics server and health endpoint.
 pub mod metrics;
 
+/// Transport-agnostic client reconnection with exponential backoff.
+pub mod reconnect;
+
 /// Client registry for authorized VPN clients.
 pub mod registry;
 

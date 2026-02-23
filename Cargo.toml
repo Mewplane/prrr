@@ -47,14 +47,22 @@ x509-parser = "0.18.0"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 zeroize = { version = "1.8.2", features = ["derive"] }
 
+# HARP session store (concurrent map)
+dashmap = "6"
+
 # Web admin REST API (P-006)
 argon2 = "0.5"
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 jsonwebtoken = "9"
 tower-http = { version = "0.6", features = ["cors"] }
 
 # Client distribution — QR code generation (P-009)
 qrcode = "0.14"
+
+# HARP client transport (Step 8)
+futures-util = "0.3.31"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 
 # SQLite persistence & metrics (P-008)
 metrics = "0.24"

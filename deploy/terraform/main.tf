@@ -62,7 +62,13 @@ resource "digitalocean_firewall" "prrr_vpn" {
     source_addresses = var.admin_ip_addresses
   }
 
-  # VPN — open to all (MASQUE/QUIC over UDP 443)
+  # VPN — open to all (HARP over TCP 443, MASQUE/QUIC over UDP 443)
+  inbound_rule {
+    protocol         = "tcp"
+    port_range       = "443"
+    source_addresses = ["0.0.0.0/0", "::/0"]
+  }
+
   inbound_rule {
     protocol         = "udp"
     port_range       = "443"

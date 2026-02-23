@@ -377,6 +377,93 @@ pub fn bind_ephemeral_server(server_name: &str) -> anyhow::Result<(quinn::Endpoi
     Ok((endpoint, local_addr))
 }
 
+// ---------------------------------------------------------------------------
+// MASQUE Server Transport Adapter (Step 11)
+// ---------------------------------------------------------------------------
+
+use crate::transport::traits::{ServerTransport, SharedServerState};
+
+/// Human-readable name for the MASQUE server transport.
+const MASQUE_SERVER_TRANSPORT_NAME: &str = "masque";
+
+/// MASQUE server transport implementing [`ServerTransport`].
+///
+/// Wraps the existing QUIC/MASQUE accept loop (`run_multi_server_on_endpoint`)
+/// behind the pluggable transport trait interface. Holds a generic
+/// `TunFactory` for creating per-client TUN devices.
+pub struct MasqueServerTransport<F: TunFactory> {
+    /// Server listen address for QUIC (UDP).
+    listen_addr: SocketAddr,
+    /// Server name for TLS certificate generation.
+    server_name: String,
+    /// Optional path to a PEM TLS certificate.
+    tls_cert_path: Option<String>,
+    /// Optional path to a PEM TLS private key.
+    tls_key_path: Option<String>,
+    /// Factory for creating per-client TUN devices.
+    tun_factory: Arc<F>,
+}
+
+impl<F: TunFactory> MasqueServerTransport<F> {
+    /// Create a new MASQUE server transport with the given configuration.
+    pub fn new(
+        listen_addr: SocketAddr,
+        server_name: String,
+        tls_cert_path: Option<String>,
+        tls_key_path: Option<String>,
+        tun_factory: Arc<F>,
+    ) -> Self {
+        Self {
+            listen_addr,
+            server_name,
+            tls_cert_path,
+            tls_key_path,
+            tun_factory,
+        }
+    }
+}
+
+impl<F: TunFactory + 'static> ServerTransport for MasqueServerTransport<F>
+where
+    F::Tun: 'static,
+    F::Handle: 'static,
+{
+    fn name(&self) -> &str {
+        MASQUE_SERVER_TRANSPORT_NAME
+    }
+
+    fn run(
+        &self,
+        shared: Arc<SharedServerState>,
+        cancel: CancellationToken,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            let noise_keypair = KeyPair::from_private_key(shared.noise_keypair.private_key_bytes())?;
+            let kem_keypair =
+                KemKeyPair::from_dk_bytes(&shared.kem_keypair.dk_bytes()).map_err(|e| anyhow::anyhow!("KEM key reconstruction: {e}"))?;
+
+            let params = MultiServerParams {
+                registry: Arc::clone(&shared.registry),
+                max_clients: shared.max_clients,
+                tun_factory: Arc::clone(&self.tun_factory),
+                cancel: cancel.clone(),
+                active_connections: Arc::clone(&shared.active_connections),
+            };
+
+            run_multi_server(
+                self.listen_addr,
+                &self.server_name,
+                &noise_keypair,
+                kem_keypair,
+                self.tls_cert_path.as_deref(),
+                self.tls_key_path.as_deref(),
+                params,
+            )
+            .await
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1228,5 +1315,91 @@ mod tests {
         cancel.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(TEST_TIMEOUT_SECS), server_task).await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(TEST_TIMEOUT_SECS), client_task).await;
+    }
+
+    // FRD: specs/frds/FRD-20260223-masque-transport-traits.md
+    // T-S11-1: MasqueServerTransport::name() returns "masque"
+    #[test]
+    fn masque_server_transport_name() {
+        use crate::transport::traits::ServerTransport;
+        use crate::tunnel::MockTunFactory;
+        use crate::tunnel::tun_device::DEFAULT_TUNNEL_MTU;
+
+        let transport = MasqueServerTransport::new(
+            TEST_LISTEN_ADDR.parse().expect("valid addr"),
+            TEST_SERVER_NAME.to_string(),
+            None,
+            None,
+            Arc::new(MockTunFactory::new(DEFAULT_TUNNEL_MTU)),
+        );
+
+        assert_eq!(transport.name(), MASQUE_SERVER_TRANSPORT_NAME);
+    }
+
+    // T-S11-2: MasqueServerTransport can be used as Box<dyn ServerTransport>
+    #[test]
+    fn masque_server_transport_trait_object() {
+        use crate::transport::traits::ServerTransport;
+        use crate::tunnel::MockTunFactory;
+        use crate::tunnel::tun_device::DEFAULT_TUNNEL_MTU;
+
+        let transport: Box<dyn ServerTransport> = Box::new(MasqueServerTransport::new(
+            TEST_LISTEN_ADDR.parse().expect("valid addr"),
+            TEST_SERVER_NAME.to_string(),
+            None,
+            None,
+            Arc::new(MockTunFactory::new(DEFAULT_TUNNEL_MTU)),
+        ));
+
+        assert_eq!(transport.name(), MASQUE_SERVER_TRANSPORT_NAME);
+    }
+
+    // T-S11-3: MasqueServerTransport::run() starts and shuts down cleanly
+    #[tokio::test]
+    async fn masque_server_transport_run_shutdown() {
+        use crate::transport::traits::{ServerTransport, SharedServerState};
+        use crate::tunnel::MockTunFactory;
+        use crate::tunnel::tun_device::DEFAULT_TUNNEL_MTU;
+
+        init_crypto_provider();
+
+        let noise_kp = Arc::new(KeyPair::generate().expect("noise keypair"));
+        let kem_kp = Arc::new(KemKeyPair::generate());
+        let registry = Arc::new(tokio::sync::Mutex::new(ClientRegistry::new(TEST_SUBNET).expect("registry")));
+        let cancel = CancellationToken::new();
+
+        let shared = Arc::new(SharedServerState {
+            registry,
+            noise_keypair: noise_kp,
+            kem_keypair: kem_kp,
+            active_connections: Arc::new(AtomicU32::new(0)),
+            max_clients: TEST_MAX_CLIENTS,
+            subnet_gateway: std::net::Ipv4Addr::new(10, 66, 66, 1),
+            cancel: cancel.clone(),
+        });
+
+        let transport = MasqueServerTransport::new(
+            TEST_LISTEN_ADDR.parse().expect("valid addr"),
+            TEST_SERVER_NAME.to_string(),
+            None,
+            None,
+            Arc::new(MockTunFactory::new(DEFAULT_TUNNEL_MTU)),
+        );
+
+        let cancel_clone = cancel.clone();
+        let server_task = tokio::spawn(async move { transport.run(shared, cancel_clone).await });
+
+        // Let server bind and start accept loop
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Cancel before any client connects
+        cancel.cancel();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(TEST_TIMEOUT_SECS), server_task)
+            .await
+            .expect("server should stop within timeout")
+            .expect("task join");
+
+        assert!(result.is_ok(), "transport should shut down cleanly: {result:?}");
     }
 }

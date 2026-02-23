@@ -110,6 +110,9 @@ const DANGEROUS_SNI_VALUE: &str = "www.google.com";
 /// Check name: TLS certificate.
 const CHECK_TLS_CERT: &str = "TLS certificate";
 
+/// Check name for transport configuration.
+const CHECK_TRANSPORTS_ENABLED: &str = "Transports enabled";
+
 /// Number of days before cert expiry to warn.
 const CERT_EXPIRY_WARN_DAYS: i64 = 30;
 
@@ -215,6 +218,10 @@ pub fn run_server_doctor(config: &ServerConfig, listen_addr: SocketAddr) -> Diag
     // 1. Config valid (already parsed if we got here)
     checks.push(check_server_config_valid());
 
+    // 1b. Transports enabled
+    let resolved = crate::config::resolve_server_transports(config);
+    checks.push(check_transports_enabled(&resolved));
+
     // 2. Keys present and valid
     let identity_key_path = config
         .crypto
@@ -251,9 +258,15 @@ pub fn run_server_doctor(config: &ServerConfig, listen_addr: SocketAddr) -> Diag
     let db_path = Path::new(data_dir).join(crate::registry::DATABASE_FILENAME);
     checks.push(check_stale_clients(subnet, &db_path));
 
-    // 7. TLS certificate
-    let tls_cert = config.transport.as_ref().and_then(|t| t.tls_cert.as_deref());
-    let tls_key = config.transport.as_ref().and_then(|t| t.tls_key.as_deref());
+    // 7. TLS certificate (from first MASQUE transport entry, if any)
+    let masque_config = config.transports.as_ref().and_then(|entries| {
+        entries.iter().find_map(|e| match e {
+            crate::config::TransportEntry::Masque(m) => Some(m),
+            _ => None,
+        })
+    });
+    let tls_cert = masque_config.and_then(|m| m.tls_cert.as_deref());
+    let tls_key = masque_config.and_then(|m| m.tls_key.as_deref());
     let server_name = config.server.as_ref().and_then(|s| s.server_name.as_deref());
     checks.push(check_tls_cert(tls_cert, tls_key, server_name));
 
@@ -299,6 +312,30 @@ fn check_server_config_valid() -> CheckResult {
         name: CHECK_CONFIG_VALID,
         status: CheckStatus::Pass,
         message: CHECK_CONFIG_VALID.to_string(),
+    }
+}
+
+/// Check that at least one transport is enabled after resolution.
+fn check_transports_enabled(resolved: &[crate::config::ResolvedTransport]) -> CheckResult {
+    if resolved.is_empty() {
+        CheckResult {
+            name: CHECK_TRANSPORTS_ENABLED,
+            status: CheckStatus::Warn,
+            message: "No transports enabled — server will not accept connections".to_string(),
+        }
+    } else {
+        let names: Vec<&str> = resolved
+            .iter()
+            .map(|r| match r {
+                crate::config::ResolvedTransport::Masque { .. } => "masque",
+                crate::config::ResolvedTransport::Harp { .. } => "harp",
+            })
+            .collect();
+        CheckResult {
+            name: CHECK_TRANSPORTS_ENABLED,
+            status: CheckStatus::Pass,
+            message: format!("{CHECK_TRANSPORTS_ENABLED}: {}", names.join(", ")),
+        }
     }
 }
 
@@ -1593,15 +1630,56 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
         let report = run_server_doctor(&config, addr);
 
-        // Should have 7 checks (config, keys, port, disk, memory, stale clients, TLS cert)
-        assert_eq!(report.checks.len(), 7);
+        // Should have 8 checks (config, transports, keys, port, disk, memory, stale clients, TLS cert)
+        assert_eq!(report.checks.len(), 8);
         assert_eq!(report.checks[0].name, CHECK_CONFIG_VALID);
-        assert_eq!(report.checks[1].name, CHECK_KEYS_PRESENT);
-        assert_eq!(report.checks[2].name, CHECK_PORT_AVAILABLE);
-        assert_eq!(report.checks[3].name, CHECK_DISK_SPACE);
-        assert_eq!(report.checks[4].name, CHECK_MEMORY);
-        assert_eq!(report.checks[5].name, CHECK_STALE_CLIENTS);
-        assert_eq!(report.checks[6].name, CHECK_TLS_CERT);
+        assert_eq!(report.checks[1].name, CHECK_TRANSPORTS_ENABLED);
+        assert_eq!(report.checks[2].name, CHECK_KEYS_PRESENT);
+        assert_eq!(report.checks[3].name, CHECK_PORT_AVAILABLE);
+        assert_eq!(report.checks[4].name, CHECK_DISK_SPACE);
+        assert_eq!(report.checks[5].name, CHECK_MEMORY);
+        assert_eq!(report.checks[6].name, CHECK_STALE_CLIENTS);
+        assert_eq!(report.checks[7].name, CHECK_TLS_CERT);
+    }
+
+    // FRD: specs/frds/FRD-20260223-pluggable-transport-config.md
+    // T-STEP13-11: Doctor warns if no transports are enabled
+    #[test]
+    fn server_doctor_warns_no_transports() {
+        let config = ServerConfig {
+            transports: Some(vec![crate::config::TransportEntry::Masque(crate::config::MasqueTransportConfig {
+                enabled: Some(false),
+                ..Default::default()
+            })]),
+            ..Default::default()
+        };
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
+        let report = run_server_doctor(&config, addr);
+        let transport_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == CHECK_TRANSPORTS_ENABLED)
+            .expect("transport check");
+        assert!(matches!(transport_check.status, CheckStatus::Warn));
+    }
+
+    // T-STEP13-12: Doctor passes when transports are enabled
+    #[test]
+    fn server_doctor_passes_with_transports() {
+        let config = ServerConfig {
+            transports: Some(vec![crate::config::TransportEntry::Masque(
+                crate::config::MasqueTransportConfig::default(),
+            )]),
+            ..Default::default()
+        };
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
+        let report = run_server_doctor(&config, addr);
+        let transport_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == CHECK_TRANSPORTS_ENABLED)
+            .expect("transport check");
+        assert!(matches!(transport_check.status, CheckStatus::Pass));
     }
 
     // -----------------------------------------------------------------------

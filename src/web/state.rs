@@ -1,6 +1,8 @@
 // FRD: specs/frds/FRD-P006.md
 // FRD: specs/frds/FRD-P009.md
 // FRD: specs/frds/FRD-P009B.md
+// FRD: specs/frds/FRD-20260223-harp-tunnel-orchestration.md
+// FRD: specs/frds/FRD-20260223-transport-visibility-ui.md
 
 //! Shared application state for web API handlers.
 
@@ -12,7 +14,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::distribution::{ConfigTokenStore, ServerContext};
 use crate::registry::ClientRegistry;
-use crate::web::handlers::ServerConfigResponse;
+use crate::web::handlers::{ServerConfigResponse, TransportInfoResponse};
+use crate::web::harp::{HarpSessionStore, HarpTunnelSpawner};
 
 /// Shared state accessible to all web API handlers.
 ///
@@ -40,4 +43,18 @@ pub struct AppState {
     pub config_tokens: Arc<ConfigTokenStore>,
     /// Non-sensitive server configuration for read-only display (P-009B).
     pub server_config: Arc<ServerConfigResponse>,
+    /// Resolved transport configurations for API exposure.
+    pub resolved_transports: Arc<Vec<TransportInfoResponse>>,
+    /// HARP session store for active VPN tunnel sessions.
+    pub harp_sessions: Arc<HarpSessionStore>,
+    /// Server Noise X25519 private key bytes (for HARP handshake).
+    pub server_noise_private_key: Arc<[u8]>,
+    /// Server Noise X25519 public key (for HARP handshake).
+    pub server_noise_public_key: [u8; 32],
+    /// Server ML-KEM-768 decapsulation key bytes (for HARP handshake).
+    pub server_kem_dk_bytes: Arc<[u8]>,
+    /// Tunnel spawner for creating per-client VPN pipelines on HARP sessions.
+    ///
+    /// `None` when the web admin runs without VPN server (e.g., standalone mode).
+    pub tunnel_spawner: Option<Arc<dyn HarpTunnelSpawner>>,
 }

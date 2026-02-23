@@ -201,6 +201,30 @@ pub trait TunDevice: Send + Sync {
     fn send(&self, buf: &[u8]) -> impl std::future::Future<Output = std::io::Result<usize>> + Send;
 }
 
+/// Blanket implementation allowing a TUN device wrapped in [`Arc`] to be
+/// shared across reconnection attempts. Each reconnect creates a new
+/// [`TunnelPipeline`] with a clone of the `Arc`, while the underlying
+/// TUN device persists.
+///
+/// [`TunnelPipeline`]: crate::tunnel::TunnelPipeline
+impl<T: TunDevice> TunDevice for std::sync::Arc<T> {
+    fn name(&self) -> &str {
+        (**self).name()
+    }
+
+    fn mtu(&self) -> u16 {
+        (**self).mtu()
+    }
+
+    async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (**self).recv(buf).await
+    }
+
+    async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
+        (**self).send(buf).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

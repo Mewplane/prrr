@@ -2,11 +2,11 @@
 
 **Censorship-resistant VPN protocol with integrated messaging.**
 
-prrr combines post-quantum cryptography, traffic obfuscation, and a MASQUE/QUIC transport layer to provide a VPN that is indistinguishable from regular HTTPS traffic. It resists deep packet inspection, active probing, and traffic analysis attacks while maintaining high throughput on standard UDP port 443.
+prrr combines post-quantum cryptography, traffic obfuscation, and pluggable transports (HARP over HTTPS and MASQUE over QUIC) to provide a VPN that is indistinguishable from regular web traffic. It resists deep packet inspection, active probing, and traffic analysis attacks while maintaining high throughput on standard port 443.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-edition%202024-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/Tests-582%20passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/Tests-774%20passing-brightgreen.svg)](#testing)
 
 ---
 
@@ -15,7 +15,8 @@ prrr combines post-quantum cryptography, traffic obfuscation, and a MASQUE/QUIC 
 - **Post-Quantum Security** -- Hybrid X25519 + ML-KEM-768 key exchange protects against both classical and quantum attacks.
 - **Traffic Obfuscation** -- TLS fingerprint mimicry (Chrome/Firefox profiles), adaptive padding, and timing jitter make VPN traffic indistinguishable from regular HTTPS.
 - **Active Probing Resistance** -- HMAC-BLAKE2s token authentication with decoy responses prevents server fingerprinting.
-- **MASQUE/QUIC Transport** -- Tunnels over HTTP/3 on UDP port 443, blending with normal web traffic.
+- **HARP Transport (Default)** -- Tunnels over HTTPS/WebSocket on TCP port 443, indistinguishable from regular web traffic and resistant to UDP blocking.
+- **MASQUE/QUIC Transport (Legacy)** -- Alternative transport over HTTP/3 on UDP port 443 for environments where QUIC performs better.
 - **Integrated Messaging** -- End-to-end encrypted messaging (Whisper) with PQXDH and double-ratchet protocol.
 - **Web Admin Panel** -- Single-page application for server management, client provisioning, and real-time monitoring.
 - **Client Distribution** -- QR codes, shareable URLs, and TOML config export for easy client onboarding.
@@ -71,17 +72,23 @@ See [Getting Started](docs/getting-started.md) for a complete walkthrough with t
 ```text
 Application (IP packets from TUN device)
      |
-TunnelPipeline: TUN <-> encrypt <-> MASQUE
+TunnelPipeline: TUN <-> encrypt <-> transport
      |
 EncryptedChannel: ChaCha20-Poly1305 + replay protection
      |
-MASQUE framing: HTTP Datagram [Quarter Stream ID | Context ID | payload]
-     |
-QUIC DATAGRAMs: quinn native datagram API
-     |
-TLS 1.3 (ALPN=h3): indistinguishable from HTTP/3
-     |
-UDP/IP: standard port 443 traffic
+     ├── HARP (default): 4-byte frame header + WebSocket/HTTP polling
+     │        |
+     │   TLS 1.3: indistinguishable from HTTPS
+     │        |
+     │   TCP/IP: standard port 443 traffic
+     │
+     └── MASQUE (legacy): HTTP Datagram framing
+              |
+         QUIC DATAGRAMs: quinn native datagram API
+              |
+         TLS 1.3 (ALPN=h3): indistinguishable from HTTP/3
+              |
+         UDP/IP: standard port 443 traffic
 ```
 
 ### Cryptographic Stack
@@ -133,7 +140,7 @@ The binary is at `target/release/prrr`.
 
 ## Testing
 
-prrr has 582 tests covering the full protocol stack, including an end-to-end data flow test that verifies packets traverse the complete encrypted pipeline.
+prrr has 774+ tests covering the full protocol stack, including end-to-end data flow tests that verify packets traverse the complete encrypted pipeline across both HARP and MASQUE transports.
 
 ```bash
 make test          # Run all tests

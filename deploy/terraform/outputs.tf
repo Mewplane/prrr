@@ -12,7 +12,7 @@ output "web_admin_url" {
 }
 
 output "vpn_endpoint" {
-  description = "VPN endpoint for client configuration"
+  description = "VPN endpoint for client configuration (HARP default, MASQUE available)"
   value       = var.domain != "" ? "${var.domain}:${var.vpn_port}" : "${digitalocean_droplet.prrr_vpn.ipv4_address}:${var.vpn_port}"
 }
 

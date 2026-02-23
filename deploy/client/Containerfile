@@ -1,0 +1,83 @@
+# Multi-stage build for prrr VPN (server + client)
+#
+# Requirements:
+#   --cap-add=NET_ADMIN   (CAP_NET_ADMIN for TUN device creation and routing)
+#   --device=/dev/net/tun  (TUN character device)
+#
+# Build:
+#   podman build -t prrr-e2e -f deploy/client/Containerfile .
+#
+# Run (server):
+#   podman run --cap-add=NET_ADMIN --device=/dev/net/tun \
+#     -e PRRR_MODE=server prrr-e2e
+#
+# Run (client):
+#   podman run --cap-add=NET_ADMIN --device=/dev/net/tun \
+#     -e PRRR_MODE=client prrr-e2e
+
+# ---------- Builder stage ----------
+ARG RUST_VERSION=1.88
+FROM docker.io/rust:${RUST_VERSION}-bookworm AS builder
+
+WORKDIR /build
+
+# Cache dependency layer: copy manifests first, build deps
+COPY Cargo.toml Cargo.lock ./
+COPY prrr-mobile/Cargo.toml prrr-mobile/Cargo.toml
+
+# Create stub source and bench files so cargo can resolve the workspace
+RUN mkdir -p src prrr-mobile/src benches tests \
+    && echo 'fn main() {}' > src/main.rs \
+    && echo '' > src/lib.rs \
+    && echo '' > prrr-mobile/src/lib.rs \
+    && echo 'fn main() {}' > benches/crypto_benchmarks.rs \
+    && echo 'fn main() {}' > benches/handshake_benchmarks.rs \
+    && echo 'fn main() {}' > benches/transport_benchmarks.rs \
+    && echo 'fn main() {}' > benches/messaging_benchmarks.rs \
+    && cargo build --release --bin prrr 2>/dev/null || true
+
+# Copy real source and rebuild
+# touch forces cargo to detect source changes over stubs
+COPY src/ src/
+COPY prrr-mobile/ prrr-mobile/
+COPY benches/ benches/
+COPY tests/ tests/
+COPY assets/ assets/
+RUN touch src/main.rs src/lib.rs && cargo build --release --bin prrr
+
+# Strip debug symbols and verify binary
+RUN strip target/release/prrr \
+    && test -f target/release/prrr \
+    && ldd target/release/prrr
+
+# ---------- Runtime stage ----------
+FROM docker.io/debian:bookworm-slim AS runtime
+
+# Runtime dependencies for TUN/routing
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+    iproute2 \
+    iptables \
+    ca-certificates \
+    iputils-ping \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create directories
+RUN mkdir -p /etc/prrr/keys /var/lib/prrr /shared
+
+# Copy binary and entrypoint
+COPY --from=builder /build/target/release/prrr /usr/local/bin/prrr
+COPY deploy/client/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Environment defaults
+ENV PRRR_MODE=server \
+    PRRR_LISTEN_ADDR=0.0.0.0:443 \
+    PRRR_SUBNET=10.66.66.0/24 \
+    PRRR_MAX_CLIENTS=10 \
+    PRRR_LOG_LEVEL=debug \
+    PRRR_DATA_DIR=/var/lib/prrr \
+    PRRR_SHARED_DIR=/shared \
+    PRRR_CLIENT_NAME=e2e-test-client
+
+ENTRYPOINT ["/entrypoint.sh"]

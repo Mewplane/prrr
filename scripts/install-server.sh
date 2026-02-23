@@ -408,20 +408,38 @@ enabled = false"
         effective_server_name="${DOMAIN}"
     fi
 
-    # Build transport section with TLS cert paths when domain is configured
+    # Build transport section — HARP is default, MASQUE available as alternative
     local transport_section
     if [[ -n "${DOMAIN}" ]]; then
-        transport_section="[transport]
-protocol = \"masque\"
-max_idle_timeout = 300
-keep_alive = 25
-tls_cert = \"/etc/letsencrypt/live/${DOMAIN}/fullchain.pem\"
-tls_key = \"/etc/letsencrypt/live/${DOMAIN}/privkey.pem\""
+        transport_section="[[transports]]
+name = \"harp\"
+enabled = true
+websocket_enabled = true
+polling_enabled = true
+session_idle_timeout = 300
+
+# Optional: enable MASQUE (QUIC) transport as alternative
+# [[transports]]
+# name = \"masque\"
+# enabled = true
+# max_idle_timeout = 300
+# keep_alive = 25
+# tls_cert = \"/etc/letsencrypt/live/${DOMAIN}/fullchain.pem\"
+# tls_key = \"/etc/letsencrypt/live/${DOMAIN}/privkey.pem\""
     else
-        transport_section="[transport]
-protocol = \"masque\"
-max_idle_timeout = 300
-keep_alive = 25"
+        transport_section="[[transports]]
+name = \"harp\"
+enabled = true
+websocket_enabled = true
+polling_enabled = true
+session_idle_timeout = 300
+
+# Optional: enable MASQUE (QUIC) transport as alternative
+# [[transports]]
+# name = \"masque\"
+# enabled = true
+# max_idle_timeout = 300
+# keep_alive = 25"
     fi
 
     cat > "${config_file}" <<EOF
@@ -533,8 +551,9 @@ configure_firewall_ufw() {
     # Ensure SSH is allowed before enabling (prevent lockout)
     ufw allow 22/tcp comment "SSH" > /dev/null 2>&1
 
-    # VPN port
-    ufw allow "${PORT}/udp" comment "prrr VPN" > /dev/null 2>&1
+    # VPN port (TCP for HARP, UDP for MASQUE)
+    ufw allow "${PORT}/tcp" comment "prrr VPN (HARP)" > /dev/null 2>&1
+    ufw allow "${PORT}/udp" comment "prrr VPN (MASQUE)" > /dev/null 2>&1
 
     # Web admin port (if enabled)
     if [[ "${NO_WEB}" == false ]]; then
@@ -554,7 +573,8 @@ configure_firewall_firewalld() {
     systemctl start firewalld 2>/dev/null || true
     systemctl enable firewalld 2>/dev/null || true
 
-    # VPN port
+    # VPN port (TCP for HARP, UDP for MASQUE)
+    firewall-cmd --permanent --add-port="${PORT}/tcp" > /dev/null 2>&1
     firewall-cmd --permanent --add-port="${PORT}/udp" > /dev/null 2>&1
 
     # Web admin port (if enabled)
