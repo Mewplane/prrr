@@ -867,13 +867,23 @@ pub struct HarpServerTransport<F: TunFactory> {
     listen_addr: std::net::SocketAddr,
     /// Factory for creating per-client TUN devices.
     tun_factory: Arc<F>,
+    /// Optional TLS certificate path (PEM).
+    tls_cert: Option<String>,
+    /// Optional TLS key path (PEM).
+    tls_key: Option<String>,
 }
 
 impl<F: TunFactory> HarpServerTransport<F> {
     /// Create a new HARP server transport with the given listen address
-    /// and TUN factory.
-    pub fn new(listen_addr: std::net::SocketAddr, tun_factory: Arc<F>) -> Self {
-        Self { listen_addr, tun_factory }
+    /// and TUN factory. When `tls_cert` and `tls_key` are both `Some`,
+    /// the transport serves HTTPS; otherwise plain HTTP.
+    pub fn new(listen_addr: std::net::SocketAddr, tun_factory: Arc<F>, tls_cert: Option<String>, tls_key: Option<String>) -> Self {
+        Self {
+            listen_addr,
+            tun_factory,
+            tls_cert,
+            tls_key,
+        }
     }
 }
 
@@ -904,8 +914,12 @@ where
                 cancel: cancel.clone(),
                 server_context: Arc::new(crate::distribution::ServerContext {
                     endpoint: String::new(),
+                    server_name: String::new(),
                     noise_public_key: *shared.noise_keypair.public_key(),
                     kem_public_key: shared.kem_keypair.encapsulation_key_bytes(),
+                    dns_servers: Vec::new(),
+                    mtu: 0,
+                    transport_protocol: HARP_SERVER_TRANSPORT_NAME.to_string(),
                 }),
                 config_tokens: Arc::new(crate::distribution::ConfigTokenStore::new()),
                 server_config: Arc::new(crate::web::handlers::ServerConfigResponse {
@@ -929,7 +943,10 @@ where
                 tunnel_spawner: Some(Arc::new(spawner)),
             };
 
-            super::run_web_server(self.listen_addr, state).await
+            match (&self.tls_cert, &self.tls_key) {
+                (Some(cert), Some(key)) => super::run_web_server_tls(self.listen_addr, state, cert, key).await,
+                _ => super::run_web_server(self.listen_addr, state).await,
+            }
         })
     }
 }
@@ -986,8 +1003,12 @@ mod tests {
             cancel: tokio_util::sync::CancellationToken::new(),
             server_context: Arc::new(ServerContext {
                 endpoint: "127.0.0.1:443".to_string(),
+                server_name: "test.example.com".to_string(),
                 noise_public_key: server_noise_public_key,
                 kem_public_key: kem_public_key.clone(),
+                dns_servers: vec!["1.1.1.1".to_string()],
+                mtu: 1280,
+                transport_protocol: "harp".to_string(),
             }),
             config_tokens: Arc::new(ConfigTokenStore::new()),
             server_config: Arc::new(ServerConfigResponse {
@@ -2505,6 +2526,8 @@ mod tests {
         let transport = HarpServerTransport::new(
             "127.0.0.1:0".parse().expect("valid addr"),
             Arc::new(MockTunFactory::new(DEFAULT_TUNNEL_MTU)),
+            None,
+            None,
         );
 
         assert_eq!(transport.name(), HARP_SERVER_TRANSPORT_NAME);
@@ -2520,6 +2543,8 @@ mod tests {
         let transport: Box<dyn ServerTransport> = Box::new(HarpServerTransport::new(
             "127.0.0.1:0".parse().expect("valid addr"),
             Arc::new(MockTunFactory::new(DEFAULT_TUNNEL_MTU)),
+            None,
+            None,
         ));
 
         assert_eq!(transport.name(), HARP_SERVER_TRANSPORT_NAME);
@@ -2554,6 +2579,8 @@ mod tests {
         let transport = HarpServerTransport::new(
             "127.0.0.1:0".parse().expect("valid addr"),
             Arc::new(MockTunFactory::new(DEFAULT_TUNNEL_MTU)),
+            None,
+            None,
         );
 
         let cancel_clone = cancel.clone();

@@ -116,11 +116,48 @@ async fn main() -> anyhow::Result<()> {
             let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
 
             // Build server context for client config distribution (P-009)
-            let server_endpoint = format!("{}", args.listen);
+            // Resolve server_name from config, falling back to CLI arg.
+            // Use the resolved name (not the bind address) for the client endpoint.
+            let dist_server_name = config
+                .server
+                .as_ref()
+                .and_then(|s| s.server_name.as_deref())
+                .unwrap_or(&args.server_name);
+            let server_endpoint = format!("{dist_server_name}:{}", args.listen.port());
+            let dist_dns_servers = config
+                .network
+                .as_ref()
+                .and_then(|n| n.dns_servers.as_ref())
+                .map(|d| d.clone())
+                .unwrap_or_else(|| prrr::config::DEFAULT_DNS_SERVERS.iter().map(|s| (*s).to_string()).collect());
+            let dist_mtu = config.network.as_ref().and_then(|n| n.mtu).unwrap_or(prrr::config::DEFAULT_MTU);
+            let dist_transport_protocol = {
+                let names: Vec<&str> = config
+                    .transports
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter_map(|e| match e {
+                        prrr::config::TransportEntry::Harp(h) if h.enabled != Some(false) => Some("harp"),
+                        prrr::config::TransportEntry::Masque(m) if m.enabled != Some(false) => Some("masque"),
+                        _ => None,
+                    })
+                    .collect();
+                if names.is_empty() {
+                    prrr::config::DEFAULT_TRANSPORT_PROTOCOL.to_string()
+                } else {
+                    // Prefer first enabled transport as default for clients
+                    names[0].to_string()
+                }
+            };
             let server_context = std::sync::Arc::new(prrr::distribution::ServerContext {
                 endpoint: server_endpoint,
+                server_name: dist_server_name.to_string(),
                 noise_public_key: server_noise_pub,
                 kem_public_key: server_kem_pub,
+                dns_servers: dist_dns_servers,
+                mtu: dist_mtu,
+                transport_protocol: dist_transport_protocol,
             });
             let config_tokens = std::sync::Arc::new(prrr::distribution::ConfigTokenStore::new());
 
@@ -201,6 +238,7 @@ async fn main() -> anyhow::Result<()> {
                                     websocket_enabled,
                                     polling_enabled,
                                     session_idle_timeout,
+                                    ..
                                 } => prrr::web::handlers::TransportInfoResponse::from_harp(
                                     websocket_enabled,
                                     polling_enabled,
@@ -286,8 +324,13 @@ async fn main() -> anyhow::Result<()> {
                         tracing::info!("starting MASQUE transport on {}", args.listen);
                         transport_tasks.spawn(async move { transport.run(shared, cancel).await });
                     }
-                    prrr::config::ResolvedTransport::Harp { .. } => {
-                        let transport = prrr::web::harp::HarpServerTransport::new(args.listen, std::sync::Arc::clone(&tun_factory));
+                    prrr::config::ResolvedTransport::Harp { tls_cert, tls_key, .. } => {
+                        let transport = prrr::web::harp::HarpServerTransport::new(
+                            args.listen,
+                            std::sync::Arc::clone(&tun_factory),
+                            tls_cert.clone(),
+                            tls_key.clone(),
+                        );
                         let shared = std::sync::Arc::clone(&shared);
                         let cancel = cancel.clone();
                         tracing::info!("starting HARP transport on {}", args.listen);
@@ -342,7 +385,8 @@ async fn main() -> anyhow::Result<()> {
             let config = prrr::config::load_client_config(args.config.as_ref())?;
 
             // Resolve server address: CLI flag > config endpoint
-            let server_addr = match args.server {
+            // Supports both IP:port and hostname:port (with DNS resolution).
+            let server_addr: std::net::SocketAddr = match args.server {
                 Some(addr) => addr,
                 None => {
                     let endpoint = config
@@ -350,9 +394,12 @@ async fn main() -> anyhow::Result<()> {
                         .as_ref()
                         .and_then(|s| s.endpoint.as_deref())
                         .ok_or_else(|| anyhow::anyhow!(prrr::config::ERR_MISSING_SERVER_ADDR))?;
+                    use std::net::ToSocketAddrs;
                     endpoint
-                        .parse()
-                        .map_err(|e| anyhow::anyhow!("invalid server endpoint '{endpoint}': {e}"))?
+                        .to_socket_addrs()
+                        .map_err(|e| anyhow::anyhow!("failed to resolve server endpoint '{endpoint}': {e}"))?
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("server endpoint '{endpoint}' resolved to no addresses"))?
                 }
             };
 
@@ -430,6 +477,14 @@ async fn main() -> anyhow::Result<()> {
                 .and_then(|t| t.protocol.as_deref())
                 .unwrap_or(prrr::config::DEFAULT_TRANSPORT_PROTOCOL);
 
+            // Resolve fwmark for policy routing
+            let fwmark = config
+                .routing
+                .as_ref()
+                .and_then(|r| r.fwmark)
+                .unwrap_or(prrr::routing::DEFAULT_FWMARK);
+            let fwmark_opt = Some(fwmark);
+
             // Build transport via trait-based dispatch
             let transport: Box<dyn prrr::transport::ClientTransport> = match transport_protocol {
                 "harp" => {
@@ -438,6 +493,7 @@ async fn main() -> anyhow::Result<()> {
                         server_addr.to_string(),
                         server_name.to_string(),
                         insecure,
+                        fwmark_opt,
                     ))
                 }
                 _ => {
@@ -448,6 +504,7 @@ async fn main() -> anyhow::Result<()> {
                         25,
                         300,
                         insecure,
+                        fwmark_opt,
                     ))
                 }
             };
@@ -469,6 +526,44 @@ async fn main() -> anyhow::Result<()> {
             // Wrap TUN in Arc for persistence across reconnections
             let tun = std::sync::Arc::new(tun);
 
+            // Build RouteManager for binary-driven routing lifecycle
+            let all_traffic = config.routing.as_ref().and_then(|r| r.all_traffic).unwrap_or(false);
+            let dns_servers = config.interface.as_ref().and_then(|i| i.dns.as_ref()).cloned().unwrap_or_default();
+            let allowed_ips = config
+                .routing
+                .as_ref()
+                .and_then(|r| r.allowed_ips.as_ref())
+                .map(|v| v.clone())
+                .unwrap_or_default();
+            let excluded_ips = config
+                .routing
+                .as_ref()
+                .and_then(|r| r.excluded_ips.as_ref())
+                .map(|v| v.clone())
+                .unwrap_or_default();
+            let hook_script = config
+                .routing
+                .as_ref()
+                .and_then(|r| r.hook_script.as_deref())
+                .unwrap_or(prrr::routing::DEFAULT_ROUTE_HOOK_SCRIPT)
+                .to_string();
+
+            let route_params = prrr::routing::RouteParams {
+                tun_device: tun_config.name.clone(),
+                client_ip: tun_address,
+                gateway_ip: gateway,
+                server_ip: std::net::IpAddr::from(server_addr.ip()),
+                server_endpoint: server_name.to_string(),
+                all_traffic,
+                dns_servers,
+                allowed_ips,
+                excluded_ips,
+                fwmark,
+            };
+
+            let mut route_manager = prrr::routing::RouteManager::new(route_params, hook_script);
+            tracing::info!(fwmark, "route manager ready");
+
             // Run with automatic reconnection on transport failure
             prrr::reconnect::run_with_reconnect(
                 transport.as_ref(),
@@ -477,6 +572,7 @@ async fn main() -> anyhow::Result<()> {
                 &server_kem_pub,
                 tun,
                 &reconnect_config,
+                Some(&mut route_manager),
                 cancel,
             )
             .await

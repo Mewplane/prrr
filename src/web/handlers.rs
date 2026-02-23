@@ -599,8 +599,12 @@ mod tests {
             cancel: CancellationToken::new(),
             server_context: Arc::new(ServerContext {
                 endpoint: "127.0.0.1:443".to_string(),
+                server_name: "localhost".to_string(),
                 noise_public_key: [0xAA; 32],
                 kem_public_key: vec![0xBB; 64],
+                dns_servers: vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
+                mtu: 1280,
+                transport_protocol: "harp".to_string(),
             }),
             config_tokens: Arc::new(ConfigTokenStore::new()),
             server_config: Arc::new(test_server_config()),

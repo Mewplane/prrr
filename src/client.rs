@@ -355,7 +355,7 @@ impl HarpPollSender {
     /// 4. Parses the response for piggybacked download frames
     /// 5. Forwards piggybacked frames to `piggyback_tx`
     pub fn new(
-        http_client: reqwest::Client,
+        http_client: MarkedHttpClient,
         upload_url: String,
         poll_interval_ms: u64,
         piggyback_tx: mpsc::Sender<Vec<u8>>,
@@ -383,14 +383,8 @@ impl HarpPollSender {
                 }
 
                 // POST frames to upload endpoint
-                let resp = match http_client
-                    .post(&upload_url)
-                    .header("content-type", "application/octet-stream")
-                    .body(body)
-                    .send()
-                    .await
-                {
-                    Ok(r) => r,
+                let resp_bytes = match http_client.post_bytes(&upload_url, body).await {
+                    Ok(b) => b,
                     Err(e) => {
                         tracing::warn!("HARP poll upload failed: {e}");
                         continue;
@@ -398,14 +392,6 @@ impl HarpPollSender {
                 };
 
                 // Parse piggybacked download frames from response
-                let resp_bytes = match resp.bytes().await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::warn!("HARP poll upload response read failed: {e}");
-                        continue;
-                    }
-                };
-
                 if !resp_bytes.is_empty() {
                     forward_piggybacked_frames(&resp_bytes, &piggyback_tx).await;
                 }
@@ -442,7 +428,7 @@ impl HarpPollReceiver {
     /// Returns the receiver and the `piggyback_tx` sender that the
     /// `HarpPollSender` should use to forward piggybacked frames.
     pub fn new(
-        http_client: reqwest::Client,
+        http_client: MarkedHttpClient,
         download_url: String,
         poll_interval_ms: u64,
         cancel: CancellationToken,
@@ -461,24 +447,10 @@ impl HarpPollReceiver {
                 }
 
                 // POST to download endpoint (empty body)
-                let resp = match http_client
-                    .post(&download_url)
-                    .header("content-type", "application/octet-stream")
-                    .body(Vec::new())
-                    .send()
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!("HARP poll download failed: {e}");
-                        continue;
-                    }
-                };
-
-                let resp_bytes = match resp.bytes().await {
+                let resp_bytes = match http_client.post_bytes(&download_url, Vec::new()).await {
                     Ok(b) => b,
                     Err(e) => {
-                        tracing::warn!("HARP poll download response read failed: {e}");
+                        tracing::warn!("HARP poll download failed: {e}");
                         continue;
                     }
                 };
@@ -543,7 +515,7 @@ async fn forward_piggybacked_frames(data: &[u8], tx: &mpsc::Sender<Vec<u8>>) {
 ///
 /// Returns the session keys and session ID on success.
 pub async fn establish_harp_session(
-    http_client: &reqwest::Client,
+    http_client: &MarkedHttpClient,
     base_url: &str,
     noise_keypair: &KeyPair,
     server_noise_pub: &[u8; 32],
@@ -564,14 +536,9 @@ pub async fn establish_harp_session(
     // POST to session endpoint
     let url = format!("{base_url}/api/v1/harp/session");
     let response: HarpSessionResponse = http_client
-        .post(&url)
-        .json(&request)
-        .send()
+        .post_json(&url, &request)
         .await
-        .map_err(|e| anyhow::anyhow!("HARP session POST failed: {e}"))?
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("HARP session response parse failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("HARP session POST failed: {e}"))?;
 
     // Decode noise_msg2 and complete handshake
     let noise_msg2_bytes = BASE64
@@ -597,25 +564,216 @@ pub async fn establish_harp_session(
 /// Build a `reqwest::Client` with appropriate TLS configuration.
 ///
 /// When `insecure` is true, TLS certificate verification is disabled.
+/// Only used in tests — production code uses [`MarkedHttpClient`].
+#[cfg(test)]
 pub fn build_harp_http_client(insecure: bool) -> anyhow::Result<reqwest::Client> {
     let builder = reqwest::Client::builder().danger_accept_invalid_certs(insecure);
     builder.build().map_err(|e| anyhow::anyhow!("failed to build HTTP client: {e}"))
 }
 
-/// Connect a WebSocket to the HARP stream endpoint.
+// ---------------------------------------------------------------------------
+// MarkedHttpClient — HTTP client with SO_MARK support
+// ---------------------------------------------------------------------------
+
+/// HTTP client that creates TCP connections with SO_MARK set for fwmark
+/// policy routing. Replaces `reqwest::Client` for HARP transport traffic.
 ///
-/// Returns the split (sender, receiver) pair.
+/// Each request creates a fresh TCP connection with the fwmark applied
+/// before the SYN packet, ensuring all traffic (including the TCP handshake)
+/// is marked for routing bypass.
+#[derive(Clone)]
+pub struct MarkedHttpClient {
+    /// Firewall mark for SO_MARK. `None` means no marking (tests).
+    fwmark: Option<u32>,
+    /// Skip TLS certificate verification.
+    insecure: bool,
+    /// Cached TLS connector (shared across requests).
+    tls_connector: tokio_rustls::TlsConnector,
+}
+
+impl MarkedHttpClient {
+    /// Create a new marked HTTP client.
+    pub fn new(fwmark: Option<u32>, insecure: bool) -> anyhow::Result<Self> {
+        let tls_config = if insecure {
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(InsecureCertVerifier))
+                .with_no_client_auth()
+        } else {
+            let root_store = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        };
+
+        let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+        Ok(Self {
+            fwmark,
+            insecure,
+            tls_connector,
+        })
+    }
+
+    /// POST JSON body and parse JSON response.
+    pub async fn post_json<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(&self, url: &str, body: &Req) -> anyhow::Result<Resp> {
+        let body_bytes = serde_json::to_vec(body).map_err(|e| anyhow::anyhow!("failed to serialize request: {e}"))?;
+
+        let resp_bytes = self.do_request(url, &body_bytes, "application/json").await?;
+
+        serde_json::from_slice(&resp_bytes).map_err(|e| anyhow::anyhow!("failed to parse JSON response: {e}"))
+    }
+
+    /// POST raw bytes and return raw response bytes.
+    pub async fn post_bytes(&self, url: &str, body: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+        self.do_request(url, &body, "application/octet-stream").await
+    }
+
+    /// Perform an HTTP POST request on a marked TCP connection.
+    async fn do_request(&self, url: &str, body: &[u8], content_type: &str) -> anyhow::Result<Vec<u8>> {
+        let parsed: hyper::Uri = url.parse().map_err(|e| anyhow::anyhow!("invalid URL '{url}': {e}"))?;
+
+        let host = parsed.host().ok_or_else(|| anyhow::anyhow!("URL missing host: {url}"))?;
+        let port = parsed
+            .port_u16()
+            .unwrap_or(if parsed.scheme_str() == Some("https") { 443 } else { 80 });
+        let use_tls = parsed.scheme_str() == Some("https");
+        let path = parsed.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+
+        // Resolve hostname to IP
+        let addr: std::net::SocketAddr = {
+            use std::net::ToSocketAddrs;
+            format!("{host}:{port}")
+                .to_socket_addrs()
+                .map_err(|e| anyhow::anyhow!("DNS resolution failed for {host}: {e}"))?
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("no addresses for {host}"))?
+        };
+
+        // Create marked TCP socket
+        let domain = if addr.is_ipv4() {
+            socket2::Domain::IPV4
+        } else {
+            socket2::Domain::IPV6
+        };
+        let socket = crate::routing::create_marked_tcp_socket(domain, self.fwmark)
+            .map_err(|e| anyhow::anyhow!("failed to create marked socket: {e}"))?;
+
+        // Connect (blocking connect on socket2, then convert to tokio)
+        socket
+            .set_nonblocking(true)
+            .map_err(|e| anyhow::anyhow!("set_nonblocking failed: {e}"))?;
+        let _ = socket.connect(&addr.into()); // non-blocking connect returns EINPROGRESS
+        let std_stream: std::net::TcpStream = socket.into();
+        let tcp_stream = tokio::net::TcpStream::from_std(std_stream).map_err(|e| anyhow::anyhow!("TcpStream::from_std failed: {e}"))?;
+
+        // Wait for connect to complete
+        tcp_stream
+            .writable()
+            .await
+            .map_err(|e| anyhow::anyhow!("TCP connect to {addr} failed: {e}"))?;
+
+        // Check for connect errors
+        if let Some(err) = tcp_stream.take_error()? {
+            return Err(anyhow::anyhow!("TCP connect to {addr} failed: {err}"));
+        }
+
+        // TLS handshake (if HTTPS)
+        let (status, resp_body) = if use_tls {
+            let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+                .map_err(|e| anyhow::anyhow!("invalid server name '{host}': {e}"))?;
+            let tls_stream = self
+                .tls_connector
+                .connect(server_name, tcp_stream)
+                .await
+                .map_err(|e| anyhow::anyhow!("TLS handshake with {host} failed: {e}"))?;
+
+            self.send_http1_request(tls_stream, host, path, body, content_type).await?
+        } else {
+            self.send_http1_request(tcp_stream, host, path, body, content_type).await?
+        };
+
+        if !status.is_success() {
+            let body_str = String::from_utf8_lossy(&resp_body);
+            return Err(anyhow::anyhow!("HTTP {status} from {url}: {body_str}"));
+        }
+
+        Ok(resp_body)
+    }
+
+    /// Send an HTTP/1.1 POST request over the given stream.
+    async fn send_http1_request<S>(
+        &self,
+        stream: S,
+        host: &str,
+        path: &str,
+        body: &[u8],
+        content_type: &str,
+    ) -> anyhow::Result<(hyper::StatusCode, Vec<u8>)>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let io = hyper_util::rt::TokioIo::new(stream);
+
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .map_err(|e| anyhow::anyhow!("HTTP handshake failed: {e}"))?;
+
+        // Spawn connection driver
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                tracing::debug!("HTTP connection closed: {e}");
+            }
+        });
+
+        let req = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(path)
+            .header("host", host)
+            .header("content-type", content_type)
+            .header("content-length", body.len())
+            .body(http_body_util::Full::new(hyper::body::Bytes::copy_from_slice(body)))
+            .map_err(|e| anyhow::anyhow!("failed to build HTTP request: {e}"))?;
+
+        let resp = sender
+            .send_request(req)
+            .await
+            .map_err(|e| anyhow::anyhow!("HTTP request failed: {e}"))?;
+
+        let status = resp.status();
+        let resp_body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read response body: {e}"))?
+            .to_bytes()
+            .to_vec();
+
+        Ok((status, resp_body))
+    }
+}
+
+/// Type alias for a boxed WebSocket sink (type-erased for TLS/plain duality).
+type BoxedWsSink = std::pin::Pin<
+    Box<dyn futures_util::Sink<tokio_tungstenite::tungstenite::Message, Error = tokio_tungstenite::tungstenite::Error> + Send>,
+>;
+
+/// Type alias for a boxed WebSocket stream (type-erased for TLS/plain duality).
+type BoxedWsStream = std::pin::Pin<
+    Box<dyn futures_util::Stream<Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>> + Send>,
+>;
+
+/// Connect a WebSocket to the HARP stream endpoint using a marked socket.
+///
+/// When `fwmark` is `Some`, the TCP socket has SO_MARK set before the SYN
+/// packet, ensuring all WebSocket traffic (including handshake) is marked
+/// for fwmark policy routing.
+///
+/// Returns the split (sender, receiver) pair as boxed trait objects since
+/// the TLS and plain-TCP branches produce different concrete types.
 async fn connect_harp_websocket(
     base_url: &str,
     session_id: &str,
     insecure: bool,
-) -> anyhow::Result<(
-    impl futures_util::Sink<tokio_tungstenite::tungstenite::Message, Error = tokio_tungstenite::tungstenite::Error> + Send + Unpin + 'static,
-    impl futures_util::Stream<Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>>
-    + Send
-    + Unpin
-    + 'static,
-)> {
+    fwmark: Option<u32>,
+) -> anyhow::Result<(BoxedWsSink, BoxedWsStream)> {
     // Decode session_id from standard base64 to raw bytes, then re-encode as URL-safe
     let session_id_bytes = BASE64
         .decode(session_id)
@@ -629,25 +787,84 @@ async fn connect_harp_websocket(
         base_url.replacen("http://", "ws://", 1)
     };
     let url = format!("{ws_url}/api/v1/harp/stream/{session_id_urlsafe}");
+    let use_tls = base_url.starts_with("https://");
 
     tracing::debug!(url = %url, "HARP: connecting WebSocket");
 
-    let connector = if insecure {
-        let tls_config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(InsecureCertVerifier))
-            .with_no_client_auth();
-        Some(tokio_tungstenite::Connector::Rustls(Arc::new(tls_config)))
-    } else {
-        None // use default TLS
+    // Parse host and port from URL for DNS resolution and TLS
+    let parsed: hyper::Uri = url.parse().map_err(|e| anyhow::anyhow!("invalid WebSocket URL: {e}"))?;
+    let host = parsed.host().ok_or_else(|| anyhow::anyhow!("WebSocket URL missing host"))?;
+    let port = parsed.port_u16().unwrap_or(if use_tls { 443 } else { 80 });
+
+    // Resolve hostname to IP
+    let addr: std::net::SocketAddr = {
+        use std::net::ToSocketAddrs;
+        format!("{host}:{port}")
+            .to_socket_addrs()
+            .map_err(|e| anyhow::anyhow!("DNS resolution failed for {host}: {e}"))?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no addresses for {host}"))?
     };
 
-    let (ws_stream, _response) = tokio_tungstenite::connect_async_tls_with_config(url, None, false, connector)
+    // Create marked TCP socket
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let socket = crate::routing::create_marked_tcp_socket(domain, fwmark)
+        .map_err(|e| anyhow::anyhow!("failed to create marked WebSocket socket: {e}"))?;
+    socket.set_nonblocking(true).map_err(|e| anyhow::anyhow!("set_nonblocking: {e}"))?;
+    let _ = socket.connect(&addr.into()); // non-blocking: EINPROGRESS
+    let std_stream: std::net::TcpStream = socket.into();
+    let tcp_stream = tokio::net::TcpStream::from_std(std_stream).map_err(|e| anyhow::anyhow!("TcpStream::from_std: {e}"))?;
+    tcp_stream
+        .writable()
         .await
-        .map_err(|e| anyhow::anyhow!("HARP WebSocket connection failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("TCP connect to {addr}: {e}"))?;
+    if let Some(err) = tcp_stream.take_error()? {
+        return Err(anyhow::anyhow!("TCP connect to {addr}: {err}"));
+    }
 
-    tracing::info!("HARP WebSocket connected");
-    Ok(ws_stream.split())
+    if use_tls {
+        // TLS handshake on marked stream
+        let tls_config = if insecure {
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(InsecureCertVerifier))
+                .with_no_client_auth()
+        } else {
+            let root_store = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        };
+        let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+        let server_name =
+            rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|e| anyhow::anyhow!("invalid server name '{host}': {e}"))?;
+        let tls_stream = tls_connector
+            .connect(server_name, tcp_stream)
+            .await
+            .map_err(|e| anyhow::anyhow!("TLS handshake for WebSocket failed: {e}"))?;
+
+        // WebSocket upgrade on TLS stream
+        let (ws_stream, _response) = tokio_tungstenite::client_async(url, tls_stream)
+            .await
+            .map_err(|e| anyhow::anyhow!("HARP WebSocket upgrade failed: {e}"))?;
+
+        tracing::info!("HARP WebSocket connected (TLS, marked)");
+        let (sink, stream) = ws_stream.split();
+        Ok((Box::pin(sink), Box::pin(stream)))
+    } else {
+        // WebSocket upgrade on plain TCP stream
+        let (ws_stream, _response) = tokio_tungstenite::client_async(url, tcp_stream)
+            .await
+            .map_err(|e| anyhow::anyhow!("HARP WebSocket upgrade failed: {e}"))?;
+
+        tracing::info!("HARP WebSocket connected (plain, marked)");
+        let (sink, stream) = ws_stream.split();
+        Ok((Box::pin(sink), Box::pin(stream)))
+    }
 }
 
 /// Parameters for running the HARP VPN client.
@@ -687,8 +904,7 @@ pub async fn run_harp_client<T: TunDevice>(tun: T, params: HarpClientParams<'_>)
         tracing::warn!("TLS certificate verification disabled (--insecure). Do NOT use in production.");
     }
 
-    // Build HTTP client with SNI override when server_name differs from endpoint host
-    let http_client = build_harp_http_client(insecure)?;
+    let http_client = MarkedHttpClient::new(None, insecure)?;
 
     // Determine base URL: use server_name for TLS SNI, fall back to endpoint
     let scheme = if insecure { "http" } else { "https" };
@@ -704,7 +920,7 @@ pub async fn run_harp_client<T: TunDevice>(tun: T, params: HarpClientParams<'_>)
     // Step 3: Try WebSocket streaming, fall back to polling on failure
     let stats = Arc::new(crate::tunnel::pipeline::TrafficStats::new());
 
-    match connect_harp_websocket(&base_url, &session.session_id, insecure).await {
+    match connect_harp_websocket(&base_url, &session.session_id, insecure, None).await {
         Ok((ws_sink, ws_stream)) => {
             tracing::info!("HARP transport: WebSocket streaming");
             let sender = HarpWsSender::new(ws_sink, cancel.child_token());
@@ -837,17 +1053,27 @@ pub struct MasqueClientTransport {
     max_idle_timeout: u64,
     /// Skip TLS certificate verification.
     insecure: bool,
+    /// Firewall mark for SO_MARK on transport sockets.
+    fwmark: Option<u32>,
 }
 
 impl MasqueClientTransport {
     /// Create a new MASQUE client transport with the given configuration.
-    pub fn new(server_addr: SocketAddr, server_name: String, keep_alive_interval: u64, max_idle_timeout: u64, insecure: bool) -> Self {
+    pub fn new(
+        server_addr: SocketAddr,
+        server_name: String,
+        keep_alive_interval: u64,
+        max_idle_timeout: u64,
+        insecure: bool,
+        fwmark: Option<u32>,
+    ) -> Self {
         Self {
             server_addr,
             server_name,
             keep_alive_interval,
             max_idle_timeout,
             insecure,
+            fwmark,
         }
     }
 }
@@ -868,7 +1094,11 @@ impl ClientTransport for MasqueClientTransport {
 
             let client_config = build_masque_client_config(self.keep_alive_interval, self.max_idle_timeout, self.insecure)?;
 
-            let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse::<SocketAddr>()?)?;
+            // Create UDP socket with fwmark for policy routing
+            let udp_socket = crate::routing::create_marked_udp_socket(self.fwmark)
+                .map_err(|e| anyhow::anyhow!("failed to create marked UDP socket: {e}"))?;
+            let runtime = Arc::new(quinn::TokioRuntime);
+            let mut endpoint = quinn::Endpoint::new(quinn::EndpointConfig::default(), None, udp_socket, runtime)?;
             endpoint.set_default_client_config(client_config);
 
             tracing::info!("connecting to {}", self.server_addr);
@@ -911,15 +1141,18 @@ pub struct HarpClientTransport {
     server_name: String,
     /// Skip TLS certificate verification.
     insecure: bool,
+    /// Firewall mark for SO_MARK on transport sockets.
+    fwmark: Option<u32>,
 }
 
 impl HarpClientTransport {
     /// Create a new HARP client transport with the given configuration.
-    pub fn new(server_endpoint: String, server_name: String, insecure: bool) -> Self {
+    pub fn new(server_endpoint: String, server_name: String, insecure: bool, fwmark: Option<u32>) -> Self {
         Self {
             server_endpoint,
             server_name,
             insecure,
+            fwmark,
         }
     }
 }
@@ -938,12 +1171,13 @@ impl ClientTransport for HarpClientTransport {
                 tracing::warn!("TLS certificate verification disabled (--insecure). Do NOT use in production.");
             }
 
-            let http_client = build_harp_http_client(self.insecure)?;
+            let http_client = MarkedHttpClient::new(self.fwmark, self.insecure)?;
 
             let scheme = if self.insecure { "http" } else { "https" };
-            let host = extract_host(&self.server_endpoint);
             let port = extract_port(&self.server_endpoint);
-            let base_url = format!("{scheme}://{host}:{port}");
+            // Use server_name (hostname) for TLS URL so the cert matches.
+            // The DNS resolution already happened when resolving server_endpoint.
+            let base_url = format!("{scheme}://{}:{port}", self.server_name);
             tracing::debug!(endpoint = %self.server_endpoint, server_name = %self.server_name, %base_url, "HARP connecting");
 
             let session = establish_harp_session(
@@ -956,7 +1190,7 @@ impl ClientTransport for HarpClientTransport {
             .await?;
             tracing::info!(mode = %session.transport_mode, "HARP handshake complete");
 
-            match connect_harp_websocket(&base_url, &session.session_id, self.insecure).await {
+            match connect_harp_websocket(&base_url, &session.session_id, self.insecure, self.fwmark).await {
                 Ok((ws_sink, ws_stream)) => {
                     tracing::info!("HARP transport: WebSocket streaming");
                     let sender = HarpWsSender::new(ws_sink, params.cancel.child_token());
@@ -1217,7 +1451,7 @@ mod tests {
         });
 
         // Build HTTP client and call establish_harp_session
-        let http_client = build_harp_http_client(true).expect("http client");
+        let http_client = MarkedHttpClient::new(None, true).expect("http client");
         let base_url = format!("http://{addr}");
 
         let result = establish_harp_session(
@@ -1259,7 +1493,7 @@ mod tests {
 
         // Create an unregistered client
         let client_noise = KeyPair::generate().expect("keypair");
-        let http_client = build_harp_http_client(true).expect("http client");
+        let http_client = MarkedHttpClient::new(None, true).expect("http client");
         let base_url = format!("http://{addr}");
 
         let result = establish_harp_session(
@@ -1328,8 +1562,12 @@ mod tests {
             cancel: CancellationToken::new(),
             server_context: Arc::new(ServerContext {
                 endpoint: "127.0.0.1:443".to_string(),
+                server_name: "test.example.com".to_string(),
                 noise_public_key: server_noise_public_key,
                 kem_public_key,
+                dns_servers: vec!["1.1.1.1".to_string()],
+                mtu: 1280,
+                transport_protocol: "harp".to_string(),
             }),
             config_tokens: Arc::new(ConfigTokenStore::new()),
             server_config: Arc::new(ServerConfigResponse {
@@ -1368,7 +1606,7 @@ mod tests {
         // Use a dummy URL — the background task won't fire during this test
         // because we cancel before the jitter sleep completes
         let sender = HarpPollSender::new(
-            reqwest::Client::new(),
+            MarkedHttpClient::new(None, true).expect("http client"),
             "http://localhost:1/noop".to_string(),
             60_000, // very long interval so background task doesn't fire
             piggyback_tx,
@@ -1393,7 +1631,7 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let sender = HarpPollSender::new(
-            reqwest::Client::new(),
+            MarkedHttpClient::new(None, true).expect("http client"),
             "http://localhost:1/noop".to_string(),
             60_000,
             piggyback_tx,
@@ -1521,7 +1759,7 @@ mod tests {
         let upload_url = format!("{base_url}/upload/{session_id_b64}");
         let download_url = format!("{base_url}/download/{session_id_b64}");
 
-        let http_client = reqwest::Client::new();
+        let http_client = MarkedHttpClient::new(None, true).expect("http client");
         let cancel = CancellationToken::new();
         let poll_interval_ms: u64 = 10; // fast for testing
 
@@ -1572,7 +1810,14 @@ mod tests {
     /// AC-2: MasqueClientTransport::name() returns "masque".
     #[test]
     fn masque_client_transport_name() {
-        let transport = MasqueClientTransport::new("127.0.0.1:443".parse().expect("addr"), "localhost".to_string(), 25, 300, false);
+        let transport = MasqueClientTransport::new(
+            "127.0.0.1:443".parse().expect("addr"),
+            "localhost".to_string(),
+            25,
+            300,
+            false,
+            None,
+        );
         assert_eq!(transport.name(), MASQUE_TRANSPORT_NAME);
     }
 
@@ -1625,7 +1870,7 @@ mod tests {
             })
         };
 
-        let transport = MasqueClientTransport::new(actual_addr, "localhost".to_string(), 25, 300, true);
+        let transport = MasqueClientTransport::new(actual_addr, "localhost".to_string(), 25, 300, true, None);
 
         let params = ClientConnectParams {
             noise_keypair: &client_noise,
@@ -1653,6 +1898,7 @@ mod tests {
             25,
             300,
             true,
+            None,
         ));
         assert_eq!(transport.name(), MASQUE_TRANSPORT_NAME);
     }
@@ -1665,7 +1911,7 @@ mod tests {
     // T-S12-1: HarpClientTransport::name() returns "harp"
     #[test]
     fn harp_client_transport_name() {
-        let transport = HarpClientTransport::new("127.0.0.1:443".to_string(), "localhost".to_string(), false);
+        let transport = HarpClientTransport::new("127.0.0.1:443".to_string(), "localhost".to_string(), false, None);
         assert_eq!(transport.name(), HARP_TRANSPORT_NAME_TEST);
     }
 
@@ -1676,6 +1922,7 @@ mod tests {
             "127.0.0.1:443".to_string(),
             "localhost".to_string(),
             false,
+            None,
         ));
         assert_eq!(transport.name(), HARP_TRANSPORT_NAME_TEST);
     }

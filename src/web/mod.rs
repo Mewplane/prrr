@@ -88,6 +88,38 @@ pub async fn run_web_server(listen_addr: SocketAddr, state: AppState) -> anyhow:
     Ok(())
 }
 
+/// Start the web server with TLS (HTTPS).
+///
+/// Uses `axum-server` with rustls to serve the same router over HTTPS.
+/// `tls_cert` and `tls_key` are paths to PEM-encoded certificate chain and
+/// private key files (e.g. from Let's Encrypt).
+pub async fn run_web_server_tls(listen_addr: SocketAddr, state: AppState, tls_cert: &str, tls_key: &str) -> anyhow::Result<()> {
+    let app = build_router(state.clone());
+    let cancel = state.cancel.clone();
+
+    let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(tls_cert, tls_key)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to load TLS config: {e}"))?;
+
+    let handle = axum_server::Handle::new();
+    let shutdown_handle = handle.clone();
+
+    tokio::spawn(async move {
+        cancel.cancelled().await;
+        shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+    });
+
+    tracing::info!("HARP transport listening on https://{listen_addr}");
+
+    axum_server::bind_rustls(listen_addr, rustls_config)
+        .handle(handle)
+        .serve(app.into_make_service())
+        .await?;
+
+    tracing::info!("HARP TLS server stopped");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     // FRD: specs/frds/FRD-P006.md
@@ -130,8 +162,12 @@ mod tests {
             cancel: CancellationToken::new(),
             server_context: Arc::new(ServerContext {
                 endpoint: "127.0.0.1:443".to_string(),
+                server_name: "localhost".to_string(),
                 noise_public_key: [0xAA; 32],
                 kem_public_key: vec![0xBB; 64],
+                dns_servers: vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
+                mtu: 1280,
+                transport_protocol: "harp".to_string(),
             }),
             config_tokens: Arc::new(ConfigTokenStore::new()),
             server_config: Arc::new(ServerConfigResponse {

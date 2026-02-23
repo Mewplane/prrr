@@ -53,6 +53,7 @@ dashmap = "6"
 # Web admin REST API (P-006)
 argon2 = "0.5"
 axum = { version = "0.8", features = ["ws"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 jsonwebtoken = "9"
 tower-http = { version = "0.6", features = ["cors"] }
 
@@ -61,7 +62,12 @@ qrcode = "0.14"
 
 # HARP client transport (Step 8)
 futures-util = "0.3.31"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+socket2 = { version = "0.5", features = ["all"] }
+tokio-rustls = "0.26"
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 
 # SQLite persistence & metrics (P-008)

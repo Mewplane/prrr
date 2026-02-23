@@ -2,157 +2,143 @@
 # prrr-route: Set up / tear down VPN routing and DNS
 # Usage: prrr-route up|down
 #
-# Configuration is read from /etc/prrr/client.toml or environment variables:
-#   PRRR_CONFIG      - path to client config (default: /etc/prrr/client.toml)
-#   PRRR_ALL_TRAFFIC - route all traffic through VPN (default: false)
+# Called by the prrr binary after transport connects (up) and before
+# disconnect/reconnect (down). All parameters are sourced from
+# /run/prrr/env, written by the binary.
+#
+# Uses fwmark-based policy routing (WireGuard-style):
+#   - VPN transport sockets are marked with SO_MARK by the binary
+#   - ip rule routes unmarked traffic through the VPN tunnel
+#   - Marked packets (VPN protocol traffic) bypass the tunnel via main table
+#
+# This eliminates pinned host routes and works with DNS round-robin,
+# reconnection to different IPs, and multi-VPN setups.
 
 set -euo pipefail
 
-PRRR_CONFIG="${PRRR_CONFIG:-/etc/prrr/client.toml}"
-PRRR_DEVICE="prrr0"
-STATE_DIR="/run/prrr"
+ENV_FILE="/run/prrr/env"
 
-# Parse minimal config values from TOML
-parse_config() {
-    local config_file="$1"
-    if [[ ! -f "$config_file" ]]; then
-        echo "Error: config file not found: $config_file" >&2
+# Source structured env from binary
+load_env() {
+    if [[ -f "$ENV_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$ENV_FILE"
+    else
+        echo "Error: env file not found: $ENV_FILE" >&2
+        echo "prrr-route should be called by the prrr binary, not manually." >&2
         exit 1
     fi
-
-    # Extract interface address (strip /32 CIDR if present)
-    CLIENT_IP=$(grep -E '^\s*address\s*=' "$config_file" | head -1 | sed 's/.*=\s*"\?\([^"/]*\).*/\1/')
-    # Extract server endpoint (IP or hostname, without port)
-    SERVER_ENDPOINT=$(grep -E '^\s*endpoint\s*=' "$config_file" | head -1 | sed 's/.*=\s*"\?\([^"]*\)"\?/\1/' | cut -d: -f1)
-    # Extract DNS servers
-    DNS_SERVERS=$(grep -E '^\s*dns\s*=' "$config_file" | head -1 | sed 's/.*\[//;s/\].*//;s/"//g;s/,/ /g')
-    # Extract all_traffic
-    ALL_TRAFFIC=$(grep -E '^\s*all_traffic\s*=' "$config_file" | head -1 | sed 's/.*=\s*//' || echo "false")
-
-    # Derive gateway from client IP
-    local octets
-    IFS='.' read -ra octets <<< "$CLIENT_IP"
-    GATEWAY_IP="${octets[0]}.${octets[1]}.${octets[2]}.1"
 }
 
-# Detect how to reach the prrr server right now (before we change routing).
-# This finds the current route to the server — could be direct, via another VPN, etc.
-detect_server_route() {
-    parse_config "$PRRR_CONFIG"
-
-    # `ip route get` tells us exactly how the kernel would route to the server right now
-    local route_info
-    route_info=$(ip route get "$SERVER_ENDPOINT" 2>/dev/null | head -1)
-
-    CURRENT_GW=$(echo "$route_info" | grep -oP 'via \K[0-9.]+' || true)
-    CURRENT_IF=$(echo "$route_info" | grep -oP 'dev \K\S+' || true)
-
-    if [[ -z "$CURRENT_IF" ]]; then
-        echo "Warning: could not determine route to $SERVER_ENDPOINT" >&2
-    fi
-}
-
-do_up() {
-    detect_server_route
-
-    mkdir -p "$STATE_DIR"
-
-    # Save how the server is currently reached (for teardown)
-    echo "$CURRENT_GW" > "$STATE_DIR/current_gw"
-    echo "$CURRENT_IF" > "$STATE_DIR/current_if"
-
-    # Wait for the TUN device to come up (ExecStartPost runs after ExecStart forks)
+# Wait for the TUN device to appear (safety check)
+wait_for_tun() {
     local tries=0
     while ! ip link show "$PRRR_DEVICE" &>/dev/null; do
-        sleep 0.5
+        sleep 0.2
         tries=$((tries + 1))
-        if [[ $tries -ge 20 ]]; then
+        if [[ $tries -ge 50 ]]; then
             echo "Error: TUN device $PRRR_DEVICE did not appear within 10s" >&2
             exit 1
         fi
     done
+}
 
-    # Override ALL_TRAFFIC from env if set
-    ALL_TRAFFIC="${PRRR_ALL_TRAFFIC:-$ALL_TRAFFIC}"
+do_up() {
+    load_env
 
-    if [[ "$ALL_TRAFFIC" == "true" ]]; then
-        # Check if another VPN is already handling default traffic
-        if ip route show default | grep -q 'dev tun'; then
-            echo "Warning: another VPN is active (tun device detected)." >&2
-            echo "Full-tunnel mode will route traffic through prrr instead." >&2
-            echo "The prrr VPN connection itself will continue through the existing VPN." >&2
-        fi
+    local fwmark="${PRRR_FWMARK:-51820}"
+    local route_table="$fwmark"
 
-        echo "Setting up full-tunnel routing..."
+    wait_for_tun
 
-        # 1. Pin the VPN server's IP to go through the CURRENT path.
-        #    This uses `ip route get` result — if another VPN is active,
-        #    the server route goes through that VPN. This prevents the
-        #    prrr VPN connection from looping into its own tunnel.
-        if [[ -n "$CURRENT_GW" ]]; then
-            ip route add "$SERVER_ENDPOINT" via "$CURRENT_GW" dev "$CURRENT_IF" 2>/dev/null || true
-        else
-            ip route add "$SERVER_ENDPOINT" dev "$CURRENT_IF" 2>/dev/null || true
-        fi
-        echo "$SERVER_ENDPOINT" > "$STATE_DIR/server_route"
+    if [[ "${PRRR_ALL_TRAFFIC}" == "true" ]]; then
+        echo "Setting up full-tunnel routing (fwmark=$fwmark)..."
 
-        # 2. Add two /1 routes that are more specific than any default route.
-        #    This is the same technique used by WireGuard and OpenVPN.
-        #    0.0.0.0/1 covers 0.0.0.0-127.255.255.255
-        #    128.0.0.0/1 covers 128.0.0.0-255.255.255.255
-        #    Together they cover all IPs but are more specific than 0.0.0.0/0.
-        ip route add 0.0.0.0/1 via "$GATEWAY_IP" dev "$PRRR_DEVICE" 2>/dev/null || true
-        ip route add 128.0.0.0/1 via "$GATEWAY_IP" dev "$PRRR_DEVICE" 2>/dev/null || true
+        # fwmark policy routing (WireGuard-style):
+        # 1. Default route through TUN in a separate table
+        ip -4 route add default dev "$PRRR_DEVICE" table "$route_table" 2>/dev/null || true
 
-        echo "full-tunnel" > "$STATE_DIR/mode"
+        # 2. Unmarked packets use the VPN table; marked packets (SO_MARK) skip it
+        ip -4 rule add not fwmark "$fwmark" table "$route_table" priority 32765 2>/dev/null || true
+
+        # 3. Suppress default route in main table so local/LAN routes still work
+        ip -4 rule add table main suppress_prefixlength 0 priority 32764 2>/dev/null || true
     else
-        echo "Setting up split-tunnel routing (VPN subnet only)..."
+        echo "Setting up split-tunnel routing..."
         # Only the VPN subnet is routed through the tunnel (default from TUN setup)
-        echo "split-tunnel" > "$STATE_DIR/mode"
     fi
 
-    # Set up DNS if servers are configured
-    if [[ -n "$DNS_SERVERS" ]]; then
-        if command -v resolvectl &>/dev/null; then
-            # shellcheck disable=SC2086
-            resolvectl dns "$PRRR_DEVICE" $DNS_SERVERS 2>/dev/null || true
-            resolvectl domain "$PRRR_DEVICE" "~." 2>/dev/null || true
-            echo "DNS set via resolvectl: $DNS_SERVERS"
-        fi
-    fi
+    # Set up DNS
+    setup_dns
 
     echo "prrr VPN routing is UP"
 }
 
 do_down() {
+    # Source env if available (may not exist on abnormal exit)
+    if [[ -f "$ENV_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$ENV_FILE"
+    fi
+
+    local fwmark="${PRRR_FWMARK:-51820}"
+    local route_table="$fwmark"
+    local device="${PRRR_DEVICE:-prrr0}"
+
     echo "Tearing down prrr VPN routing..."
 
-    # Read saved state
-    local mode="split-tunnel"
-    [[ -f "$STATE_DIR/mode" ]] && mode=$(cat "$STATE_DIR/mode")
-
-    if [[ "$mode" == "full-tunnel" ]]; then
-        # Remove the /1 tunnel routes
-        ip route del 0.0.0.0/1 dev "$PRRR_DEVICE" 2>/dev/null || true
-        ip route del 128.0.0.0/1 dev "$PRRR_DEVICE" 2>/dev/null || true
-
-        # Remove the pinned server route
-        if [[ -f "$STATE_DIR/server_route" ]]; then
-            local server_ip
-            server_ip=$(cat "$STATE_DIR/server_route")
-            ip route del "$server_ip" 2>/dev/null || true
-        fi
-    fi
+    # Remove fwmark rules and routes
+    ip -4 rule del not fwmark "$fwmark" table "$route_table" 2>/dev/null || true
+    ip -4 rule del table main suppress_prefixlength 0 2>/dev/null || true
+    ip -4 route del default dev "$device" table "$route_table" 2>/dev/null || true
 
     # Reset DNS
-    if command -v resolvectl &>/dev/null; then
-        resolvectl revert "$PRRR_DEVICE" 2>/dev/null || true
-    fi
-
-    # Clean up state
-    rm -rf "$STATE_DIR"
+    teardown_dns
 
     echo "prrr VPN routing is DOWN"
+}
+
+setup_dns() {
+    local dns_servers="${PRRR_DNS_SERVERS:-}"
+    if [[ -z "$dns_servers" ]]; then
+        return
+    fi
+
+    if command -v resolvectl &>/dev/null; then
+        # systemd-resolved (Fedora, Ubuntu 18.04+)
+        # shellcheck disable=SC2086
+        resolvectl dns "$PRRR_DEVICE" $dns_servers 2>/dev/null || true
+        resolvectl domain "$PRRR_DEVICE" "~." 2>/dev/null || true
+        echo "DNS set via resolvectl: $dns_servers"
+    elif command -v resolvconf &>/dev/null; then
+        # openresolv (Debian, Arch, Alpine)
+        # shellcheck disable=SC2086
+        printf 'nameserver %s\n' $dns_servers | resolvconf -a "$PRRR_DEVICE" 2>/dev/null || true
+        echo "DNS set via resolvconf: $dns_servers"
+    else
+        # Direct /etc/resolv.conf manipulation (last resort)
+        if [[ ! -f /etc/resolv.conf.prrr-backup ]]; then
+            cp /etc/resolv.conf /etc/resolv.conf.prrr-backup 2>/dev/null || true
+        fi
+        # shellcheck disable=SC2086
+        printf 'nameserver %s\n' $dns_servers > /etc/resolv.conf
+        echo "DNS set via /etc/resolv.conf: $dns_servers"
+    fi
+}
+
+teardown_dns() {
+    local device="${PRRR_DEVICE:-prrr0}"
+
+    if command -v resolvectl &>/dev/null; then
+        resolvectl revert "$device" 2>/dev/null || true
+    elif command -v resolvconf &>/dev/null; then
+        resolvconf -d "$device" 2>/dev/null || true
+    else
+        # Restore backed-up resolv.conf
+        if [[ -f /etc/resolv.conf.prrr-backup ]]; then
+            mv /etc/resolv.conf.prrr-backup /etc/resolv.conf
+        fi
+    fi
 }
 
 case "${1:-}" in
