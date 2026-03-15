@@ -1928,7 +1928,7 @@ mod tests {
     fn tls_cert_expiring_soon_warns() {
         let dir = std::env::temp_dir().join("prrr-diag-test-tls-expiring");
         std::fs::create_dir_all(&dir).expect("create dir");
-        let (cert_path, key_path) = write_custom_expiry_pem(&dir, &["vpn.example.com"], (2026, 3, 1));
+        let (cert_path, key_path) = write_custom_expiry_pem(&dir, &["vpn.example.com"], (2026, 4, 1));
 
         let result = check_tls_cert(Some(&cert_path), Some(&key_path), None);
         assert_eq!(result.status, CheckStatus::Warn);

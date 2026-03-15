@@ -212,6 +212,7 @@ mod tests {
             tunnel_spawner: None,
             cover_page_enabled: true,
             trust_proxy_headers: false,
+            h2_streaming_enabled: true,
         }
     }
 

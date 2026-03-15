@@ -55,7 +55,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/harp/upload/{session_id}", post(harp::h2_upload_handler))
         .route(
             "/harp/download/{session_id}",
-            get(harp::h2_download_handler).post(harp::h2_download_handler),
+            get(harp::h2_download_handler).post(harp::poll_download_handler),
         );
 
     let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
@@ -204,6 +204,7 @@ mod tests {
             tunnel_spawner: None,
             cover_page_enabled: true,
             trust_proxy_headers: false,
+            h2_streaming_enabled: true,
         }
     }
 
