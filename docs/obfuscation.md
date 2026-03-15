@@ -365,6 +365,10 @@ if !is_valid {
 
 ### TLS Fingerprint Mimicry Flow
 
+TLS mimicry is applied to both transport paths:
+
+**QUIC/MASQUE path:**
+
 ```text
 Config (TOML/CLI)
      ↓
@@ -379,6 +383,27 @@ rustls::ClientConfig::builder_with_provider(provider)
 quinn::ClientConfig (with ALPN=h3, datagrams enabled)
      ↓
 QUIC connection with reordered cipher suites in ClientHello
+```
+
+**HARP client path (HTTP/WebSocket):**
+
+```text
+Config (TOML) → [transport] tls_profile = "chrome"
+     ↓  (main.rs parses, defaults to Chrome)
+TlsProfile enum (Chrome | Firefox | Default)
+     ↓  stored in HarpClientTransport
+HarpClientTransport::connect()
+     ↓  passes self.tls_profile
+build_harp_rustls_config(insecure, profile)
+     ↓  calls build_crypto_provider(profile)
+CryptoProvider { cipher_suites: [...], kx_groups: [...] }
+     ↓
+rustls::ClientConfig::builder_with_provider(provider)
+     ↓  + alpn_protocols = [h2, http/1.1]
+MarkedHttpClient + connect_harp_websocket()
+     ↓
+HARP HTTP/WS connection with browser-like ClientHello
+  (reordered cipher suites + ALPN h2, http/1.1)
 ```
 
 ### Full Protocol Stack with Obfuscation
@@ -404,6 +429,67 @@ TLS 1.3 with mimicked fingerprint (F-010)
   └─ ALPN=h3 (appears as HTTP/3)
      ↓
 UDP/IP: standard port 443 traffic
+```
+
+## CDN Domain Fronting (Hardening Phase 3, Feature 3)
+
+When a direct connection to the prrr server is blocked by IP-based filtering,
+the HARP client can automatically fall back to routing through a CDN (e.g.,
+Cloudflare). This makes the traffic appear as normal CDN visits.
+
+### How It Works
+
+1. Client tries direct connection (with `direct_timeout_secs` timeout, default 5s)
+2. If direct times out, falls back to CDN fronting:
+   - DNS resolves `cdn_fronting_domain` → CDN edge IP (e.g., Cloudflare)
+   - TLS SNI = `cdn_fronting_domain` (CDN terminates TLS)
+   - HTTP Host header = `cdn_fronting_domain` (CDN routes to origin)
+   - HARP session/polling/WebSocket goes through CDN transparently
+3. Runtime state (`use_fronting`) remembers the active path across reconnections
+4. Periodically probes direct connection (every `direct_retry_interval_secs`, default 600s)
+5. If direct probe succeeds, switches back to direct
+
+### Configuration
+
+```toml
+[transport]
+cdn_fronting_enabled = true
+cdn_fronting_domain = "prrr.tech"
+direct_timeout_secs = 5
+direct_retry_interval_secs = 600
+```
+
+### Architecture
+
+```text
+HarpClientTransport::connect_with_fallback()
+  ├─ cdn_fronting_enabled = false → direct only (timeout wrapper)
+  └─ cdn_fronting_enabled = true
+       ├─ use_fronting = false → try direct, fallback to CDN on timeout
+       └─ use_fronting = true → CDN (probe direct periodically)
+```
+
+### Server-Side CDN Header Parsing
+
+When the server is behind Cloudflare, it sees the CDN edge IP instead of the
+real client IP. The `resolve_client_ip()` function in `src/web/harp.rs`
+extracts the real client IP from CDN-injected headers:
+
+| Priority | Header | Source |
+|----------|--------|--------|
+| 1 | `CF-Connecting-IP` | Cloudflare-specific, single IP |
+| 2 | `X-Forwarded-For` | Standard proxy chain, first IP used |
+| 3 | Socket peer address | Fallback when no proxy headers present |
+
+Header parsing is gated by `trust_proxy_headers` in `[web_admin]` config
+(default: `false`). When disabled, all proxy headers are ignored and the
+socket peer address is always used. This prevents header spoofing by
+untrusted clients connecting directly.
+
+```toml
+[web_admin]
+enabled = true
+trust_proxy_headers = true  # Enable when behind Cloudflare CDN
 ```
 
 ## Security Notes

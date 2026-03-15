@@ -68,6 +68,7 @@ transport with all-default values.
 | `enabled` | bool | `true` | Whether this transport is active |
 | `websocket_enabled` | bool | `true` | Enable WebSocket streaming binding |
 | `polling_enabled` | bool | `true` | Enable HTTP polling fallback binding |
+| `h2_streaming_enabled` | bool | `true` | Enable HTTP/2 multiplexed streaming binding |
 | `session_idle_timeout` | u64 | `300` | HARP session idle timeout in seconds |
 
 ### `[obfuscation]`
@@ -106,6 +107,8 @@ Web administration panel. Disabled by default.
 | `tls_key` | String | -- | Path to TLS private key (PEM) |
 | `admin_password_hash` | String | -- | Argon2id password hash (required when enabled) |
 | `session_timeout` | u64 | `3600` | JWT session timeout in seconds |
+| `cover_page_enabled` | bool | `true` | Serve cover landing page at `/` for DPI camouflage. When `false`, `/` serves the admin SPA directly. |
+| `trust_proxy_headers` | bool | `false` | Trust CDN proxy headers (`CF-Connecting-IP`, `X-Forwarded-For`) for real client IP extraction. Enable when behind Cloudflare or another trusted reverse proxy. |
 
 ### `[messaging]`
 
@@ -189,10 +192,15 @@ Client transport settings. The client uses a single transport at a time.
 | `protocol` | String | Transport protocol: `"harp"` (default) or `"masque"` |
 | `keep_alive` | u64 | Keep-alive interval in seconds (MASQUE) |
 | `insecure_skip_verify` | bool | Skip TLS certificate verification (dev/test only) |
-| `preferred_binding` | String | HARP binding preference: `"stream"` (WebSocket) or `"poll"` (HTTP polling) |
+| `preferred_binding` | String | HARP binding preference: `"stream"` (WebSocket), `"poll"` (HTTP polling), or `"h2"` (HTTP/2 streams) |
 | `poll_interval_ms` | u64 | HARP polling interval in milliseconds |
 | `reconnect_backoff_ms` | u64 | Initial reconnection backoff delay in ms (default: 1000) |
 | `reconnect_max_backoff_ms` | u64 | Maximum reconnection backoff delay in ms (default: 30000) |
+| `tls_profile` | String | TLS fingerprint profile: `"chrome"`, `"firefox"`, or `"default"`. When absent, defaults to Chrome. |
+| `cdn_fronting_enabled` | bool | Enable CDN domain fronting fallback. When `true`, falls back to CDN if direct connection times out. Default: `false`. |
+| `cdn_fronting_domain` | String | CDN fronting domain (e.g., `"prrr.tech"`). Used for DNS resolution and TLS SNI when routing through CDN. |
+| `direct_timeout_secs` | u64 | Direct connection timeout in seconds before CDN fallback. Default: `5`. |
+| `direct_retry_interval_secs` | u64 | Interval in seconds between probing direct connection when CDN is active. Default: `600`. |
 
 ### `[obfuscation]`
 
@@ -258,6 +266,7 @@ name = "harp"
 enabled = true
 websocket_enabled = true
 polling_enabled = true
+h2_streaming_enabled = true
 session_idle_timeout = 300
 
 [[transports]]
@@ -285,6 +294,7 @@ enabled = true
 listen_addr = "0.0.0.0:8443"
 admin_password_hash = "$argon2id$v=19$m=65536,t=3,p=4$..."
 session_timeout = 3600
+# trust_proxy_headers = true  # Enable when behind Cloudflare CDN
 
 [messaging]
 enabled = true
@@ -324,11 +334,16 @@ allowed_ips = ["0.0.0.0/0", "::/0"]
 
 [transport]
 protocol = "harp"   # or "masque" for QUIC-based transport
-# preferred_binding = "stream"  # HARP only: "stream" (WebSocket) or "poll" (HTTP)
+# preferred_binding = "stream"  # HARP only: "stream" | "poll" | "h2"
 # poll_interval_ms = 500         # HARP polling only
 # keep_alive = 25                # MASQUE only
 # reconnect_backoff_ms = 1000    # Initial reconnection backoff (ms)
 # reconnect_max_backoff_ms = 30000  # Maximum reconnection backoff (ms)
+# tls_profile = "chrome"           # TLS fingerprint: "chrome", "firefox", "default"
+# cdn_fronting_enabled = false      # Enable CDN domain fronting fallback
+# cdn_fronting_domain = "prrr.tech" # CDN fronting domain
+# direct_timeout_secs = 5           # Timeout before CDN fallback (seconds)
+# direct_retry_interval_secs = 600  # Probe direct interval when using CDN (seconds)
 
 [obfuscation]
 enabled = true

@@ -24,6 +24,7 @@ use crate::handshake::hybrid::{HybridInitiator, InitiatorResult};
 use crate::handshake::noise_ik::KeyPair;
 use crate::transport::TransportError;
 use crate::transport::encrypted_channel::{EncryptedChannel, NONCE_COUNTER_LEN};
+use crate::transport::h2_adapter::{H2Receiver, H2Sender};
 use crate::transport::harp::{HarpFrame, HarpFrameReader, HarpFrameType};
 use crate::transport::masque::{MasqueClient, build_masque_client_config};
 use crate::tunnel::TunnelError;
@@ -161,7 +162,7 @@ async fn handshake_as_client(
 const WS_WRITE_CHANNEL_CAPACITY: usize = 256;
 
 /// Client transport capabilities advertised during session establishment.
-const HARP_CLIENT_CAPABILITIES: &[&str] = &["stream", "poll"];
+const HARP_CLIENT_CAPABILITIES: &[&str] = &["stream", "poll", "h2"];
 
 /// Result of a successful HARP session establishment.
 pub struct HarpSessionResult {
@@ -572,6 +573,54 @@ pub fn build_harp_http_client(insecure: bool) -> anyhow::Result<reqwest::Client>
 }
 
 // ---------------------------------------------------------------------------
+// Shared TLS config builder
+// ---------------------------------------------------------------------------
+
+/// Build a `rustls::ClientConfig` using the given TLS profile for cipher suite
+/// ordering, and the given certificate verification mode.
+///
+/// This is the single source of truth for HARP client TLS configuration,
+/// used by both `MarkedHttpClient` and `connect_harp_websocket`.
+/// ALPN protocol identifier for HTTP/2.
+const ALPN_H2: &[u8] = b"h2";
+/// ALPN protocol identifier for HTTP/1.1.
+const ALPN_HTTP11: &[u8] = b"http/1.1";
+
+fn build_harp_rustls_config(insecure: bool, profile: crate::obfuscation::tls_mimicry::TlsProfile) -> anyhow::Result<rustls::ClientConfig> {
+    let provider = Arc::new(crate::obfuscation::tls_mimicry::build_crypto_provider(profile));
+    let mut config = if insecure {
+        rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| anyhow::anyhow!("TLS protocol version error: {e}"))?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(InsecureCertVerifier))
+            .with_no_client_auth()
+    } else {
+        let root_store = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| anyhow::anyhow!("TLS protocol version error: {e}"))?
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
+    };
+    config.alpn_protocols = vec![ALPN_H2.to_vec(), ALPN_HTTP11.to_vec()];
+    Ok(config)
+}
+
+/// Build a `rustls::ClientConfig` with HTTP/2-only ALPN (`["h2"]`).
+///
+/// Forces the TLS handshake to negotiate HTTP/2 exclusively. Used by
+/// `connect_harp_h2()` where we need the server to select HTTP/2.
+fn build_harp_h2_rustls_config(
+    insecure: bool,
+    profile: crate::obfuscation::tls_mimicry::TlsProfile,
+) -> anyhow::Result<rustls::ClientConfig> {
+    let mut config = build_harp_rustls_config(insecure, profile)?;
+    config.alpn_protocols = vec![ALPN_H2.to_vec()];
+    Ok(config)
+}
+
+// ---------------------------------------------------------------------------
 // MarkedHttpClient — HTTP client with SO_MARK support
 // ---------------------------------------------------------------------------
 
@@ -585,33 +634,32 @@ pub fn build_harp_http_client(insecure: bool) -> anyhow::Result<reqwest::Client>
 pub struct MarkedHttpClient {
     /// Firewall mark for SO_MARK. `None` means no marking (tests).
     fwmark: Option<u32>,
-    /// Skip TLS certificate verification.
-    insecure: bool,
     /// Cached TLS connector (shared across requests).
     tls_connector: tokio_rustls::TlsConnector,
+    /// Override TLS SNI server name (used when URL contains an IP instead of hostname).
+    tls_server_name: Option<String>,
 }
 
 impl MarkedHttpClient {
     /// Create a new marked HTTP client.
-    pub fn new(fwmark: Option<u32>, insecure: bool) -> anyhow::Result<Self> {
-        let tls_config = if insecure {
-            rustls::ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(InsecureCertVerifier))
-                .with_no_client_auth()
-        } else {
-            let root_store = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth()
-        };
+    ///
+    /// The `profile` parameter controls TLS cipher suite ordering in the
+    /// ClientHello to mimic a specific browser fingerprint.
+    pub fn new(fwmark: Option<u32>, insecure: bool, profile: crate::obfuscation::tls_mimicry::TlsProfile) -> anyhow::Result<Self> {
+        let tls_config = build_harp_rustls_config(insecure, profile)?;
 
         let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
         Ok(Self {
             fwmark,
-            insecure,
             tls_connector,
+            tls_server_name: None,
         })
+    }
+
+    /// Set an override TLS SNI server name for requests to IP-based URLs.
+    pub fn with_tls_server_name(mut self, name: String) -> Self {
+        self.tls_server_name = Some(name);
+        self
     }
 
     /// POST JSON body and parse JSON response.
@@ -678,16 +726,17 @@ impl MarkedHttpClient {
         }
 
         // TLS handshake (if HTTPS)
+        let sni_host = self.tls_server_name.as_deref().unwrap_or(host);
         let (status, resp_body) = if use_tls {
-            let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
-                .map_err(|e| anyhow::anyhow!("invalid server name '{host}': {e}"))?;
+            let server_name = rustls::pki_types::ServerName::try_from(sni_host.to_string())
+                .map_err(|e| anyhow::anyhow!("invalid server name '{sni_host}': {e}"))?;
             let tls_stream = self
                 .tls_connector
                 .connect(server_name, tcp_stream)
                 .await
-                .map_err(|e| anyhow::anyhow!("TLS handshake with {host} failed: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("TLS handshake with {sni_host} failed: {e}"))?;
 
-            self.send_http1_request(tls_stream, host, path, body, content_type).await?
+            self.send_http1_request(tls_stream, sni_host, path, body, content_type).await?
         } else {
             self.send_http1_request(tcp_stream, host, path, body, content_type).await?
         };
@@ -773,6 +822,7 @@ async fn connect_harp_websocket(
     session_id: &str,
     insecure: bool,
     fwmark: Option<u32>,
+    profile: crate::obfuscation::tls_mimicry::TlsProfile,
 ) -> anyhow::Result<(BoxedWsSink, BoxedWsStream)> {
     // Decode session_id from standard base64 to raw bytes, then re-encode as URL-safe
     let session_id_bytes = BASE64
@@ -827,18 +877,8 @@ async fn connect_harp_websocket(
     }
 
     if use_tls {
-        // TLS handshake on marked stream
-        let tls_config = if insecure {
-            rustls::ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(InsecureCertVerifier))
-                .with_no_client_auth()
-        } else {
-            let root_store = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth()
-        };
+        // TLS handshake on marked stream with profiled cipher suite ordering
+        let tls_config = build_harp_rustls_config(insecure, profile)?;
         let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
         let server_name =
             rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|e| anyhow::anyhow!("invalid server name '{host}': {e}"))?;
@@ -881,6 +921,8 @@ pub struct HarpClientParams<'a> {
     pub server_kem_pub: &'a [u8],
     /// Skip TLS certificate verification.
     pub insecure: bool,
+    /// TLS fingerprint profile for cipher suite ordering.
+    pub tls_profile: crate::obfuscation::tls_mimicry::TlsProfile,
     /// Cancellation token for graceful shutdown.
     pub cancel: CancellationToken,
 }
@@ -898,13 +940,14 @@ pub async fn run_harp_client<T: TunDevice>(tun: T, params: HarpClientParams<'_>)
         server_noise_pub,
         server_kem_pub,
         insecure,
+        tls_profile,
         cancel,
     } = params;
     if insecure {
         tracing::warn!("TLS certificate verification disabled (--insecure). Do NOT use in production.");
     }
 
-    let http_client = MarkedHttpClient::new(None, insecure)?;
+    let http_client = MarkedHttpClient::new(None, insecure, tls_profile)?;
 
     // Determine base URL: use server_name for TLS SNI, fall back to endpoint
     let scheme = if insecure { "http" } else { "https" };
@@ -920,7 +963,7 @@ pub async fn run_harp_client<T: TunDevice>(tun: T, params: HarpClientParams<'_>)
     // Step 3: Try WebSocket streaming, fall back to polling on failure
     let stats = Arc::new(crate::tunnel::pipeline::TrafficStats::new());
 
-    match connect_harp_websocket(&base_url, &session.session_id, insecure, None).await {
+    match connect_harp_websocket(&base_url, &session.session_id, insecure, None, tls_profile).await {
         Ok((ws_sink, ws_stream)) => {
             tracing::info!("HARP transport: WebSocket streaming");
             let sender = HarpWsSender::new(ws_sink, cancel.child_token());
@@ -1123,11 +1166,174 @@ impl ClientTransport for MasqueClientTransport {
 }
 
 // ---------------------------------------------------------------------------
+// HARP HTTP/2 Connect (Step 4.3)
+// ---------------------------------------------------------------------------
+
+/// HARP H2 upload endpoint path prefix.
+const HARP_H2_UPLOAD_PATH: &str = "/api/v1/harp/upload/";
+
+/// HARP H2 download endpoint path prefix.
+const HARP_H2_DOWNLOAD_PATH: &str = "/api/v1/harp/download/";
+
+/// Log message for H2 binding selection.
+const LOG_HARP_H2_STREAMS: &str = "HARP transport: using HTTP/2 streams";
+
+/// Preferred binding value for HTTP/2 streaming.
+const BINDING_H2: &str = "h2";
+
+/// Preferred binding value for HTTP polling.
+const BINDING_POLL: &str = "poll";
+
+/// Establish an HTTP/2 connection and open upload/download streams.
+///
+/// Creates a marked TCP socket, performs a TLS handshake with H2-only
+/// ALPN (`["h2"]`), runs the h2 client handshake, spawns the connection
+/// driver, and opens two long-lived streams:
+/// - Upload: `POST /api/v1/harp/upload/{session_id}` (sender keeps sending DATA)
+/// - Download: `GET /api/v1/harp/download/{session_id}` (receiver reads response DATA)
+///
+/// Returns `(H2Sender, H2Receiver)` ready for use with the tunnel pipeline.
+async fn connect_harp_h2(
+    host: &str,
+    port: &str,
+    session_id: &str,
+    insecure: bool,
+    fwmark: Option<u32>,
+    profile: crate::obfuscation::tls_mimicry::TlsProfile,
+) -> anyhow::Result<(H2Sender, H2Receiver)> {
+    tracing::debug!(host, port, "H2: connecting");
+
+    // Resolve hostname to IP
+    let addr: std::net::SocketAddr = {
+        use std::net::ToSocketAddrs;
+        format!("{host}:{port}")
+            .to_socket_addrs()
+            .map_err(|e| anyhow::anyhow!("DNS resolution failed for {host}: {e}"))?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no addresses for {host}"))?
+    };
+
+    // Create marked TCP socket
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let socket =
+        crate::routing::create_marked_tcp_socket(domain, fwmark).map_err(|e| anyhow::anyhow!("failed to create marked H2 socket: {e}"))?;
+    socket.set_nonblocking(true).map_err(|e| anyhow::anyhow!("set_nonblocking: {e}"))?;
+    let _ = socket.connect(&addr.into()); // non-blocking: EINPROGRESS
+    let std_stream: std::net::TcpStream = socket.into();
+    let tcp_stream = tokio::net::TcpStream::from_std(std_stream).map_err(|e| anyhow::anyhow!("TcpStream::from_std: {e}"))?;
+    tcp_stream
+        .writable()
+        .await
+        .map_err(|e| anyhow::anyhow!("TCP connect to {addr}: {e}"))?;
+    if let Some(err) = tcp_stream.take_error()? {
+        return Err(anyhow::anyhow!("TCP connect to {addr}: {err}"));
+    }
+
+    // TLS handshake with H2-only ALPN
+    let tls_config = build_harp_h2_rustls_config(insecure, profile)?;
+    let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+    let server_name =
+        rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|e| anyhow::anyhow!("invalid server name '{host}': {e}"))?;
+    let tls_stream = tls_connector
+        .connect(server_name, tcp_stream)
+        .await
+        .map_err(|e| anyhow::anyhow!("TLS handshake for H2 failed: {e}"))?;
+
+    // h2 client handshake over TLS stream
+    let (send_request, connection) = h2::client::handshake(tls_stream)
+        .await
+        .map_err(|e| anyhow::anyhow!("H2 handshake failed: {e}"))?;
+
+    // Spawn connection driver
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            tracing::debug!("H2 connection closed: {e}");
+        }
+    });
+
+    // Encode session_id as URL-safe base64 for URL path
+    let session_id_bytes = BASE64
+        .decode(session_id)
+        .map_err(|e| anyhow::anyhow!("invalid session_id base64: {e}"))?;
+    let session_id_urlsafe = BASE64_URL.encode(&session_id_bytes);
+
+    let upload_path = format!("{HARP_H2_UPLOAD_PATH}{session_id_urlsafe}");
+    let download_path = format!("{HARP_H2_DOWNLOAD_PATH}{session_id_urlsafe}");
+
+    // Open upload stream: POST with end_of_stream=false (we keep sending DATA)
+    let upload_request = hyper::Request::builder()
+        .method(hyper::Method::POST)
+        .uri(&upload_path)
+        .header("host", host)
+        .body(())
+        .map_err(|e| anyhow::anyhow!("failed to build H2 upload request: {e}"))?;
+
+    let mut send_request_clone = send_request.clone();
+    let (_, upload_send_stream) = send_request_clone
+        .send_request(upload_request, false)
+        .map_err(|e| anyhow::anyhow!("H2 upload stream open failed: {e}"))?;
+
+    // Open download stream: GET with end_of_stream=true (we only read response DATA)
+    let download_request = hyper::Request::builder()
+        .method(hyper::Method::GET)
+        .uri(&download_path)
+        .header("host", host)
+        .body(())
+        .map_err(|e| anyhow::anyhow!("failed to build H2 download request: {e}"))?;
+
+    let mut send_request_final = send_request;
+    let (download_response_future, _) = send_request_final
+        .send_request(download_request, true)
+        .map_err(|e| anyhow::anyhow!("H2 download stream open failed: {e}"))?;
+
+    let download_response = download_response_future
+        .await
+        .map_err(|e| anyhow::anyhow!("H2 download response failed: {e}"))?;
+    let download_recv_stream = download_response.into_body();
+
+    tracing::info!(LOG_HARP_H2_STREAMS);
+
+    Ok((H2Sender::new(upload_send_stream), H2Receiver::new(download_recv_stream)))
+}
+
+// ---------------------------------------------------------------------------
 // HARP Client Transport Adapter (Step 12)
 // ---------------------------------------------------------------------------
 
 /// Human-readable name for the HARP client transport.
 const HARP_TRANSPORT_NAME: &str = "harp";
+
+/// Error message prefix for direct connection timeout.
+const ERR_DIRECT_CONNECT_TIMEOUT: &str = "direct connection timed out";
+
+/// Configuration for constructing a [`HarpClientTransport`].
+pub struct HarpClientConfig {
+    /// Server endpoint string (`host:port`).
+    pub server_endpoint: String,
+    /// Server name for TLS SNI.
+    pub server_name: String,
+    /// Skip TLS certificate verification.
+    pub insecure: bool,
+    /// Firewall mark for SO_MARK on transport sockets.
+    pub fwmark: Option<u32>,
+    /// Preferred binding: `"stream"` (WebSocket), `"poll"` (HTTP polling), or `None` (try both).
+    pub preferred_binding: Option<String>,
+    /// TLS fingerprint profile for cipher suite ordering.
+    pub tls_profile: crate::obfuscation::tls_mimicry::TlsProfile,
+    /// Maximum time for a direct connection attempt before giving up.
+    pub direct_timeout: std::time::Duration,
+    /// CDN fronting domain (e.g., `"prrr.tech"`).
+    /// When `Some`, `connect_via_cdn()` routes through CDN instead of direct.
+    pub cdn_fronting_domain: Option<String>,
+    /// Whether CDN domain fronting auto-fallback is enabled.
+    pub cdn_fronting_enabled: bool,
+    /// Interval between probing direct connection when CDN is active.
+    pub direct_retry_interval: std::time::Duration,
+}
 
 /// HARP client transport implementing [`ClientTransport`].
 ///
@@ -1143,16 +1349,56 @@ pub struct HarpClientTransport {
     insecure: bool,
     /// Firewall mark for SO_MARK on transport sockets.
     fwmark: Option<u32>,
+    /// Preferred binding: `"stream"` (WebSocket), `"poll"` (HTTP polling), or `None` (try both).
+    preferred_binding: Option<String>,
+    /// TLS fingerprint profile for cipher suite ordering.
+    tls_profile: crate::obfuscation::tls_mimicry::TlsProfile,
+    /// Maximum time for a direct connection attempt before giving up.
+    direct_timeout: std::time::Duration,
+    /// CDN fronting domain (e.g., `"prrr.tech"`).
+    cdn_fronting_domain: Option<String>,
+    /// Whether CDN domain fronting auto-fallback is enabled.
+    cdn_fronting_enabled: bool,
+    /// Interval between probing direct connection when CDN is active.
+    direct_retry_interval: std::time::Duration,
+    /// Runtime flag: currently preferring CDN over direct.
+    /// Persists across reconnection loop iterations via `Arc`.
+    use_fronting: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Timestamp of last direct connection probe (for retry interval).
+    last_direct_probe: std::sync::Arc<tokio::sync::Mutex<std::time::Instant>>,
 }
 
+/// Error message when CDN fronting domain is not configured.
+const ERR_CDN_DOMAIN_NOT_CONFIGURED: &str = "CDN fronting domain not configured";
+
+/// Log message: falling back to CDN fronting.
+const LOG_FALLING_BACK_TO_CDN: &str = "falling back to CDN fronting";
+
+/// Log message: probing direct connection.
+const LOG_PROBING_DIRECT: &str = "probing direct connection";
+
+/// Log message: direct connection recovered.
+const LOG_DIRECT_RECOVERED: &str = "direct connection recovered";
+
+/// Log message: direct probe failed.
+const LOG_DIRECT_PROBE_FAILED: &str = "direct probe failed, staying on CDN";
+
 impl HarpClientTransport {
-    /// Create a new HARP client transport with the given configuration.
-    pub fn new(server_endpoint: String, server_name: String, insecure: bool, fwmark: Option<u32>) -> Self {
+    /// Create a new HARP client transport from configuration.
+    pub fn new(config: HarpClientConfig) -> Self {
         Self {
-            server_endpoint,
-            server_name,
-            insecure,
-            fwmark,
+            server_endpoint: config.server_endpoint,
+            server_name: config.server_name,
+            insecure: config.insecure,
+            fwmark: config.fwmark,
+            preferred_binding: config.preferred_binding,
+            tls_profile: config.tls_profile,
+            direct_timeout: config.direct_timeout,
+            cdn_fronting_domain: config.cdn_fronting_domain,
+            cdn_fronting_enabled: config.cdn_fronting_enabled,
+            direct_retry_interval: config.direct_retry_interval,
+            use_fronting: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_direct_probe: std::sync::Arc::new(tokio::sync::Mutex::new(std::time::Instant::now())),
         }
     }
 }
@@ -1166,67 +1412,276 @@ impl ClientTransport for HarpClientTransport {
         &'a self,
         params: ClientConnectParams<'a>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<TransportConnection>> + Send + 'a>> {
-        Box::pin(async move {
-            if self.insecure {
-                tracing::warn!("TLS certificate verification disabled (--insecure). Do NOT use in production.");
+        Box::pin(async move { self.connect_with_fallback(params).await })
+    }
+}
+
+impl HarpClientTransport {
+    /// Connect with automatic direct → CDN fallback.
+    ///
+    /// When CDN fronting is disabled, does a simple direct connect with timeout.
+    /// When enabled, orchestrates direct → CDN fallback with periodic direct probing.
+    async fn connect_with_fallback(&self, params: ClientConnectParams<'_>) -> anyhow::Result<TransportConnection> {
+        let timeout = self.direct_timeout;
+
+        if !self.cdn_fronting_enabled {
+            // CDN disabled: direct only
+            return tokio::time::timeout(timeout, self.connect_inner(params))
+                .await
+                .map_err(|_| anyhow::anyhow!("{ERR_DIRECT_CONNECT_TIMEOUT} after {timeout:?}"))?;
+        }
+
+        let currently_fronting = self.use_fronting.load(std::sync::atomic::Ordering::Relaxed);
+
+        if currently_fronting {
+            // Currently using CDN. Check if we should probe direct.
+            let should_probe = {
+                let last_probe = self.last_direct_probe.lock().await;
+                last_probe.elapsed() >= self.direct_retry_interval
+            };
+
+            if should_probe {
+                tracing::info!(LOG_PROBING_DIRECT);
+                *self.last_direct_probe.lock().await = std::time::Instant::now();
+
+                match tokio::time::timeout(timeout, self.connect_inner(params.clone())).await {
+                    Ok(Ok(conn)) => {
+                        self.use_fronting.store(false, std::sync::atomic::Ordering::Relaxed);
+                        tracing::info!(LOG_DIRECT_RECOVERED);
+                        return Ok(conn);
+                    }
+                    _ => {
+                        tracing::info!(LOG_DIRECT_PROBE_FAILED);
+                    }
+                }
             }
 
-            let http_client = MarkedHttpClient::new(self.fwmark, self.insecure)?;
+            // Use CDN
+            tokio::time::timeout(timeout, self.connect_via_cdn(params))
+                .await
+                .map_err(|_| anyhow::anyhow!("{ERR_DIRECT_CONNECT_TIMEOUT} via CDN after {timeout:?}"))?
+        } else {
+            // Try direct first
+            match tokio::time::timeout(timeout, self.connect_inner(params.clone())).await {
+                Ok(Ok(conn)) => Ok(conn),
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, LOG_FALLING_BACK_TO_CDN);
+                    self.use_fronting.store(true, std::sync::atomic::Ordering::Relaxed);
+                    *self.last_direct_probe.lock().await = std::time::Instant::now();
+                    tokio::time::timeout(timeout, self.connect_via_cdn(params))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("{ERR_DIRECT_CONNECT_TIMEOUT} via CDN after {timeout:?}"))?
+                }
+                Err(_) => {
+                    tracing::warn!(ERR_DIRECT_CONNECT_TIMEOUT);
+                    tracing::info!(LOG_FALLING_BACK_TO_CDN);
+                    self.use_fronting.store(true, std::sync::atomic::Ordering::Relaxed);
+                    *self.last_direct_probe.lock().await = std::time::Instant::now();
+                    tokio::time::timeout(timeout, self.connect_via_cdn(params))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("{ERR_DIRECT_CONNECT_TIMEOUT} via CDN after {timeout:?}"))?
+                }
+            }
+        }
+    }
 
-            let scheme = if self.insecure { "http" } else { "https" };
-            let port = extract_port(&self.server_endpoint);
-            // Use server_name (hostname) for TLS URL so the cert matches.
-            // The DNS resolution already happened when resolving server_endpoint.
-            let base_url = format!("{scheme}://{}:{port}", self.server_name);
-            tracing::debug!(endpoint = %self.server_endpoint, server_name = %self.server_name, %base_url, "HARP connecting");
+    /// Inner connection logic, wrapped by [`connect_with_fallback`] with a timeout.
+    async fn connect_inner(&self, params: ClientConnectParams<'_>) -> anyhow::Result<TransportConnection> {
+        if self.insecure {
+            tracing::warn!("TLS certificate verification disabled (--insecure). Do NOT use in production.");
+        }
 
-            let session = establish_harp_session(
-                &http_client,
-                &base_url,
-                params.noise_keypair,
-                params.server_noise_pub,
-                params.server_kem_pub,
+        let http_client = MarkedHttpClient::new(self.fwmark, self.insecure, self.tls_profile)?;
+
+        let scheme = if self.insecure { "http" } else { "https" };
+        let port = extract_port(&self.server_endpoint);
+        // Use server_name (hostname) for the initial handshake URL (DNS works before routing is up).
+        let base_url = format!("{scheme}://{}:{port}", self.server_name);
+        // Use server_endpoint (resolved IP) for polling URLs to avoid DNS deadlock
+        // after routing sets DNS through the tunnel.
+        let ip_host = extract_host(&self.server_endpoint);
+        let poll_base_url = format!("{scheme}://{ip_host}:{port}");
+        tracing::debug!(endpoint = %self.server_endpoint, server_name = %self.server_name, %base_url, %poll_base_url, "HARP connecting");
+
+        let session = establish_harp_session(
+            &http_client,
+            &base_url,
+            params.noise_keypair,
+            params.server_noise_pub,
+            params.server_kem_pub,
+        )
+        .await?;
+        tracing::info!(mode = %session.transport_mode, "HARP handshake complete");
+
+        // HTTP/2 streaming path
+        if self.preferred_binding.as_deref() == Some(BINDING_H2) {
+            let (sender, receiver) = connect_harp_h2(
+                &self.server_name,
+                port,
+                &session.session_id,
+                self.insecure,
+                self.fwmark,
+                self.tls_profile,
             )
             .await?;
-            tracing::info!(mode = %session.transport_mode, "HARP handshake complete");
+            return Ok(TransportConnection {
+                sender: Box::new(sender),
+                receiver: Box::new(receiver),
+                session_keys: session.session_keys,
+            });
+        }
 
-            match connect_harp_websocket(&base_url, &session.session_id, self.insecure, self.fwmark).await {
-                Ok((ws_sink, ws_stream)) => {
-                    tracing::info!("HARP transport: WebSocket streaming");
-                    let sender = HarpWsSender::new(ws_sink, params.cancel.child_token());
-                    let receiver = HarpWsReceiver::new(ws_stream);
-                    Ok(TransportConnection {
-                        sender: Box::new(sender),
-                        receiver: Box::new(receiver),
-                        session_keys: session.session_keys,
-                    })
-                }
+        let use_polling = self.preferred_binding.as_deref() == Some(BINDING_POLL);
+        if use_polling {
+            tracing::info!("HARP transport: forced HTTP polling (preferred_binding=poll)");
+        }
+
+        let ws_result = if use_polling {
+            None
+        } else {
+            match connect_harp_websocket(&base_url, &session.session_id, self.insecure, self.fwmark, self.tls_profile).await {
+                Ok(ws) => Some(ws),
                 Err(ws_err) => {
                     tracing::warn!("WebSocket failed ({ws_err}), falling back to HTTP polling");
-                    let upload_url = format!("{base_url}{}", session.upload_endpoint);
-                    let download_url = format!("{base_url}{}", session.download_endpoint);
-
-                    let (receiver, piggyback_tx) = HarpPollReceiver::new(
-                        http_client.clone(),
-                        download_url,
-                        session.poll_interval_ms,
-                        params.cancel.child_token(),
-                    );
-                    let sender = HarpPollSender::new(
-                        http_client,
-                        upload_url,
-                        session.poll_interval_ms,
-                        piggyback_tx,
-                        params.cancel.child_token(),
-                    );
-                    Ok(TransportConnection {
-                        sender: Box::new(sender),
-                        receiver: Box::new(receiver),
-                        session_keys: session.session_keys,
-                    })
+                    None
                 }
             }
-        })
+        };
+
+        if let Some((ws_sink, ws_stream)) = ws_result {
+            tracing::info!("HARP transport: WebSocket streaming");
+            let sender = HarpWsSender::new(ws_sink, params.cancel.child_token());
+            let receiver = HarpWsReceiver::new(ws_stream);
+            Ok(TransportConnection {
+                sender: Box::new(sender),
+                receiver: Box::new(receiver),
+                session_keys: session.session_keys,
+            })
+        } else {
+            let upload_url = format!("{poll_base_url}{}", session.upload_endpoint);
+            let download_url = format!("{poll_base_url}{}", session.download_endpoint);
+            tracing::debug!(%upload_url, %download_url, "HARP polling URLs (IP-based, avoids DNS deadlock)");
+
+            // Create a new HTTP client with TLS SNI override for IP-based URLs
+            let poll_http_client =
+                MarkedHttpClient::new(self.fwmark, self.insecure, self.tls_profile)?.with_tls_server_name(self.server_name.clone());
+
+            let (receiver, piggyback_tx) = HarpPollReceiver::new(
+                poll_http_client.clone(),
+                download_url,
+                session.poll_interval_ms,
+                params.cancel.child_token(),
+            );
+            let sender = HarpPollSender::new(
+                poll_http_client,
+                upload_url,
+                session.poll_interval_ms,
+                piggyback_tx,
+                params.cancel.child_token(),
+            );
+            Ok(TransportConnection {
+                sender: Box::new(sender),
+                receiver: Box::new(receiver),
+                session_keys: session.session_keys,
+            })
+        }
+    }
+
+    /// Connect through CDN domain fronting.
+    ///
+    /// Instead of connecting directly to the server, routes through a CDN
+    /// (e.g., Cloudflare) by using `cdn_fronting_domain` for DNS resolution,
+    /// TLS SNI, and HTTP Host header. The CDN forwards traffic to the origin
+    /// server transparently.
+    pub async fn connect_via_cdn(&self, params: ClientConnectParams<'_>) -> anyhow::Result<TransportConnection> {
+        let cdn_domain = self
+            .cdn_fronting_domain
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!(ERR_CDN_DOMAIN_NOT_CONFIGURED))?;
+        tracing::info!(domain = %cdn_domain, "connecting via CDN fronting");
+
+        let http_client = MarkedHttpClient::new(self.fwmark, self.insecure, self.tls_profile)?;
+
+        let scheme = if self.insecure { "http" } else { "https" };
+        let port = extract_port(&self.server_endpoint);
+        // CDN path: use cdn_domain for base URL — DNS resolves to CDN IP,
+        // TLS SNI = cdn_domain, HTTP Host = cdn_domain, CDN forwards to origin.
+        let base_url = format!("{scheme}://{cdn_domain}:{port}");
+        tracing::debug!(endpoint = %self.server_endpoint, %cdn_domain, %base_url, "HARP CDN connecting");
+
+        let session = establish_harp_session(
+            &http_client,
+            &base_url,
+            params.noise_keypair,
+            params.server_noise_pub,
+            params.server_kem_pub,
+        )
+        .await?;
+        tracing::info!(mode = %session.transport_mode, "HARP CDN handshake complete");
+
+        // HTTP/2 streaming path through CDN
+        if self.preferred_binding.as_deref() == Some(BINDING_H2) {
+            let (sender, receiver) =
+                connect_harp_h2(cdn_domain, port, &session.session_id, self.insecure, self.fwmark, self.tls_profile).await?;
+            return Ok(TransportConnection {
+                sender: Box::new(sender),
+                receiver: Box::new(receiver),
+                session_keys: session.session_keys,
+            });
+        }
+
+        let use_polling = self.preferred_binding.as_deref() == Some(BINDING_POLL);
+        if use_polling {
+            tracing::info!("HARP CDN transport: forced HTTP polling (preferred_binding=poll)");
+        }
+
+        // Through CDN, both WebSocket and polling use the CDN domain base URL
+        // (CDN routing requires the correct Host header — no IP-based shortcut).
+        let ws_result = if use_polling {
+            None
+        } else {
+            match connect_harp_websocket(&base_url, &session.session_id, self.insecure, self.fwmark, self.tls_profile).await {
+                Ok(ws) => Some(ws),
+                Err(ws_err) => {
+                    tracing::warn!("CDN WebSocket failed ({ws_err}), falling back to CDN HTTP polling");
+                    None
+                }
+            }
+        };
+
+        if let Some((ws_sink, ws_stream)) = ws_result {
+            tracing::info!("HARP CDN transport: WebSocket streaming");
+            let sender = HarpWsSender::new(ws_sink, params.cancel.child_token());
+            let receiver = HarpWsReceiver::new(ws_stream);
+            Ok(TransportConnection {
+                sender: Box::new(sender),
+                receiver: Box::new(receiver),
+                session_keys: session.session_keys,
+            })
+        } else {
+            let upload_url = format!("{base_url}{}", session.upload_endpoint);
+            let download_url = format!("{base_url}{}", session.download_endpoint);
+            tracing::debug!(%upload_url, %download_url, "HARP CDN polling URLs");
+
+            let (receiver, piggyback_tx) = HarpPollReceiver::new(
+                http_client.clone(),
+                download_url,
+                session.poll_interval_ms,
+                params.cancel.child_token(),
+            );
+            let sender = HarpPollSender::new(
+                http_client,
+                upload_url,
+                session.poll_interval_ms,
+                piggyback_tx,
+                params.cancel.child_token(),
+            );
+            Ok(TransportConnection {
+                sender: Box::new(sender),
+                receiver: Box::new(receiver),
+                session_keys: session.session_keys,
+            })
+        }
     }
 }
 
@@ -1451,7 +1906,7 @@ mod tests {
         });
 
         // Build HTTP client and call establish_harp_session
-        let http_client = MarkedHttpClient::new(None, true).expect("http client");
+        let http_client = MarkedHttpClient::new(None, true, crate::obfuscation::tls_mimicry::TlsProfile::Default).expect("http client");
         let base_url = format!("http://{addr}");
 
         let result = establish_harp_session(
@@ -1493,7 +1948,7 @@ mod tests {
 
         // Create an unregistered client
         let client_noise = KeyPair::generate().expect("keypair");
-        let http_client = MarkedHttpClient::new(None, true).expect("http client");
+        let http_client = MarkedHttpClient::new(None, true, crate::obfuscation::tls_mimicry::TlsProfile::Default).expect("http client");
         let base_url = format!("http://{addr}");
 
         let result = establish_harp_session(
@@ -1589,6 +2044,8 @@ mod tests {
             server_noise_public_key,
             server_kem_dk_bytes,
             tunnel_spawner: None,
+            cover_page_enabled: true,
+            trust_proxy_headers: false,
         }
     }
 
@@ -1606,7 +2063,7 @@ mod tests {
         // Use a dummy URL — the background task won't fire during this test
         // because we cancel before the jitter sleep completes
         let sender = HarpPollSender::new(
-            MarkedHttpClient::new(None, true).expect("http client"),
+            MarkedHttpClient::new(None, true, crate::obfuscation::tls_mimicry::TlsProfile::Default).expect("http client"),
             "http://localhost:1/noop".to_string(),
             60_000, // very long interval so background task doesn't fire
             piggyback_tx,
@@ -1631,7 +2088,7 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let sender = HarpPollSender::new(
-            MarkedHttpClient::new(None, true).expect("http client"),
+            MarkedHttpClient::new(None, true, crate::obfuscation::tls_mimicry::TlsProfile::Default).expect("http client"),
             "http://localhost:1/noop".to_string(),
             60_000,
             piggyback_tx,
@@ -1759,7 +2216,7 @@ mod tests {
         let upload_url = format!("{base_url}/upload/{session_id_b64}");
         let download_url = format!("{base_url}/download/{session_id_b64}");
 
-        let http_client = MarkedHttpClient::new(None, true).expect("http client");
+        let http_client = MarkedHttpClient::new(None, true, crate::obfuscation::tls_mimicry::TlsProfile::Default).expect("http client");
         let cancel = CancellationToken::new();
         let poll_interval_ms: u64 = 10; // fast for testing
 
@@ -1908,22 +2365,216 @@ mod tests {
     /// Constant for HARP transport name used in tests.
     const HARP_TRANSPORT_NAME_TEST: &str = "harp";
 
+    /// Create a default `HarpClientConfig` for tests.
+    fn test_harp_config() -> HarpClientConfig {
+        HarpClientConfig {
+            server_endpoint: "127.0.0.1:443".to_string(),
+            server_name: "localhost".to_string(),
+            insecure: false,
+            fwmark: None,
+            preferred_binding: None,
+            tls_profile: crate::obfuscation::tls_mimicry::TlsProfile::Default,
+            direct_timeout: std::time::Duration::from_secs(crate::config::DEFAULT_DIRECT_TIMEOUT_SECS),
+            cdn_fronting_domain: None,
+            cdn_fronting_enabled: false,
+            direct_retry_interval: std::time::Duration::from_secs(crate::config::DEFAULT_DIRECT_RETRY_INTERVAL_SECS),
+        }
+    }
+
     // T-S12-1: HarpClientTransport::name() returns "harp"
     #[test]
     fn harp_client_transport_name() {
-        let transport = HarpClientTransport::new("127.0.0.1:443".to_string(), "localhost".to_string(), false, None);
+        let transport = HarpClientTransport::new(test_harp_config());
         assert_eq!(transport.name(), HARP_TRANSPORT_NAME_TEST);
     }
 
     // T-S12-2: HarpClientTransport can be used as Box<dyn ClientTransport>
     #[test]
     fn harp_client_transport_trait_object() {
-        let transport: Box<dyn ClientTransport> = Box::new(HarpClientTransport::new(
-            "127.0.0.1:443".to_string(),
-            "localhost".to_string(),
-            false,
-            None,
-        ));
+        let transport: Box<dyn ClientTransport> = Box::new(HarpClientTransport::new(test_harp_config()));
         assert_eq!(transport.name(), HARP_TRANSPORT_NAME_TEST);
+    }
+
+    // -----------------------------------------------------------------------
+    // FRD: specs/frds/FRD-20260224-wire-tls-profile.md
+    // Step 1.2: Wire TlsProfile into MarkedHttpClient
+    // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // FRD: specs/frds/FRD-20260224-thread-tls-profile.md
+    // Step 1.3: Thread tls_profile through HarpClientTransport
+    // -----------------------------------------------------------------------
+
+    // AC-1: HarpClientTransport::new() accepts and stores a TlsProfile
+    #[test]
+    fn harp_client_transport_stores_tls_profile() {
+        let mut config = test_harp_config();
+        config.tls_profile = crate::obfuscation::tls_mimicry::TlsProfile::Chrome;
+        let transport = HarpClientTransport::new(config);
+        assert_eq!(transport.name(), HARP_TRANSPORT_NAME_TEST);
+    }
+
+    // -----------------------------------------------------------------------
+    // FRD: specs/frds/FRD-20260224-direct-connect-timeout.md
+    // Step 3.2: Direct-connect timeout
+    // -----------------------------------------------------------------------
+
+    // AC-1: HarpClientTransport::new() accepts and stores direct_timeout
+    #[test]
+    fn harp_client_transport_stores_direct_timeout() {
+        let timeout = std::time::Duration::from_secs(10);
+        let mut config = test_harp_config();
+        config.direct_timeout = timeout;
+        let transport = HarpClientTransport::new(config);
+        assert_eq!(transport.direct_timeout, timeout);
+    }
+
+    // -----------------------------------------------------------------------
+    // FRD: specs/frds/FRD-20260224-cdn-fronting-connect.md
+    // Step 3.3: CDN fronting connect path
+    // -----------------------------------------------------------------------
+
+    // AC-1: HarpClientTransport stores cdn_fronting_domain
+    #[test]
+    fn harp_client_transport_stores_cdn_domain() {
+        let mut config = test_harp_config();
+        config.cdn_fronting_domain = Some("prrr.tech".to_string());
+        let transport = HarpClientTransport::new(config);
+        assert_eq!(transport.cdn_fronting_domain.as_deref(), Some("prrr.tech"));
+    }
+
+    // AC-2: connect_via_cdn() fails without configured domain
+    #[tokio::test]
+    async fn harp_cdn_connect_fails_without_domain() {
+        let transport = HarpClientTransport::new(test_harp_config());
+        let noise_kp = crate::handshake::noise_ik::KeyPair::generate().expect("keypair");
+        let server_pub = [0u8; 32];
+        let kem_pub = vec![0u8; crate::crypto::hybrid_kex::KEM_ENCAPSULATION_KEY_LEN];
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let params = ClientConnectParams {
+            noise_keypair: &noise_kp,
+            server_noise_pub: &server_pub,
+            server_kem_pub: &kem_pub,
+            cancel: cancel.clone(),
+        };
+        let result = transport.connect_via_cdn(params).await;
+        assert!(result.is_err());
+        let err = result.err().expect("expected error");
+        assert!(
+            err.to_string().contains(ERR_CDN_DOMAIN_NOT_CONFIGURED),
+            "expected CDN domain error, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // FRD: specs/frds/FRD-20260224-auto-fallback-strategy.md
+    // Step 3.4: Auto-fallback strategy
+    // -----------------------------------------------------------------------
+
+    // AC-1: CDN disabled → use_fronting stays false
+    #[test]
+    fn auto_fallback_cdn_disabled_use_fronting_stays_false() {
+        let config = test_harp_config(); // cdn_fronting_enabled = false
+        let transport = HarpClientTransport::new(config);
+        assert!(!transport.cdn_fronting_enabled);
+        assert!(!transport.use_fronting.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    // AC-3: CDN enabled → use_fronting defaults to false (direct first)
+    #[test]
+    fn auto_fallback_cdn_enabled_defaults_direct() {
+        let mut config = test_harp_config();
+        config.cdn_fronting_enabled = true;
+        config.cdn_fronting_domain = Some("prrr.tech".to_string());
+        let transport = HarpClientTransport::new(config);
+        assert!(transport.cdn_fronting_enabled);
+        assert!(!transport.use_fronting.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    // AC-1: MarkedHttpClient::new with Chrome profile, insecure
+    #[test]
+    fn marked_http_client_chrome_insecure() {
+        use crate::obfuscation::tls_mimicry::TlsProfile;
+        let client = MarkedHttpClient::new(None, true, TlsProfile::Chrome);
+        assert!(client.is_ok(), "MarkedHttpClient with Chrome profile should succeed");
+    }
+
+    // AC-2: MarkedHttpClient::new with Chrome profile, secure
+    #[test]
+    fn marked_http_client_chrome_secure() {
+        use crate::obfuscation::tls_mimicry::TlsProfile;
+        let client = MarkedHttpClient::new(None, false, TlsProfile::Chrome);
+        assert!(client.is_ok(), "MarkedHttpClient with Chrome secure should succeed");
+    }
+
+    // AC-3: MarkedHttpClient::new with Default profile, insecure
+    #[test]
+    fn marked_http_client_default_insecure() {
+        use crate::obfuscation::tls_mimicry::TlsProfile;
+        let client = MarkedHttpClient::new(None, true, TlsProfile::Default);
+        assert!(client.is_ok(), "MarkedHttpClient with Default profile should succeed");
+    }
+
+    // AC-3b: MarkedHttpClient::new with Firefox profile
+    #[test]
+    fn marked_http_client_firefox_insecure() {
+        use crate::obfuscation::tls_mimicry::TlsProfile;
+        let client = MarkedHttpClient::new(None, true, TlsProfile::Firefox);
+        assert!(client.is_ok(), "MarkedHttpClient with Firefox profile should succeed");
+    }
+
+    // -----------------------------------------------------------------------
+    // FRD: specs/frds/FRD-20260224-alpn-h2-http11.md
+    // Step 1.4: ALPN h2 + http/1.1
+    // -----------------------------------------------------------------------
+
+    // AC-1: build_harp_rustls_config sets ALPN protocols h2 and http/1.1
+    #[test]
+    fn harp_rustls_config_alpn_protocols() {
+        use crate::obfuscation::tls_mimicry::TlsProfile;
+        let config = build_harp_rustls_config(true, TlsProfile::Chrome).unwrap();
+        let expected_alpn: Vec<Vec<u8>> = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        assert_eq!(config.alpn_protocols, expected_alpn, "ALPN should be [h2, http/1.1]");
+    }
+
+    // AC-1b: ALPN is set regardless of insecure mode
+    #[test]
+    fn harp_rustls_config_alpn_secure() {
+        use crate::obfuscation::tls_mimicry::TlsProfile;
+        let config = build_harp_rustls_config(false, TlsProfile::Default).unwrap();
+        let expected_alpn: Vec<Vec<u8>> = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        assert_eq!(config.alpn_protocols, expected_alpn, "ALPN should be set in secure mode too");
+    }
+
+    // -----------------------------------------------------------------------
+    // FRD: specs/frds/FRD-20260225-h2-client-connect.md
+    // Step 4.3: H2 client connect path
+    // -----------------------------------------------------------------------
+
+    // AC-6: HARP_CLIENT_CAPABILITIES includes "h2"
+    #[test]
+    fn client_capabilities_include_h2() {
+        assert!(
+            HARP_CLIENT_CAPABILITIES.contains(&"h2"),
+            "HARP_CLIENT_CAPABILITIES must include 'h2'"
+        );
+    }
+
+    // AC-7: H2-only rustls config has ALPN ["h2"]
+    #[test]
+    fn h2_rustls_config_alpn_h2_only() {
+        use crate::obfuscation::tls_mimicry::TlsProfile;
+        let config = build_harp_h2_rustls_config(true, TlsProfile::Chrome).unwrap();
+        let expected_alpn: Vec<Vec<u8>> = vec![b"h2".to_vec()];
+        assert_eq!(config.alpn_protocols, expected_alpn, "H2 config ALPN should be [h2] only");
+    }
+
+    // AC-7b: H2-only rustls config works in secure mode
+    #[test]
+    fn h2_rustls_config_alpn_h2_only_secure() {
+        use crate::obfuscation::tls_mimicry::TlsProfile;
+        let config = build_harp_h2_rustls_config(false, TlsProfile::Default).unwrap();
+        let expected_alpn: Vec<Vec<u8>> = vec![b"h2".to_vec()];
+        assert_eq!(config.alpn_protocols, expected_alpn, "H2 config ALPN should be [h2] in secure mode");
     }
 }

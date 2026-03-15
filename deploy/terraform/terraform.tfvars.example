@@ -1,0 +1,18 @@
+# Copy to terraform.tfvars and fill in values
+# Values from .env: SERVER_IP and SERVER_PASSWORD
+
+server_ip       = "88.218.250.40"
+server_password = "S0pL7VsKUa"
+
+# VPN transport: "masque" (QUIC/UDP, default), "harp" (HTTPS/TCP), or "both"
+transport = "masque"
+
+# Admin panel password (change this!)
+admin_password = "change-me-please"
+
+# Optional: domain for Let's Encrypt TLS (recommended for DPI resistance)
+# domain        = "vpn.example.com"
+# certbot_email = "you@example.com"
+
+# Optional: path to prebuilt prrr binary
+# prrr_binary_path = "../../target/x86_64-unknown-linux-musl/release/prrr"

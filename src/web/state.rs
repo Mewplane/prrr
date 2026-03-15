@@ -3,6 +3,7 @@
 // FRD: specs/frds/FRD-P009B.md
 // FRD: specs/frds/FRD-20260223-harp-tunnel-orchestration.md
 // FRD: specs/frds/FRD-20260223-transport-visibility-ui.md
+// FRD: specs/frds/FRD-20260224-cdn-header-parsing.md
 
 //! Shared application state for web API handlers.
 
@@ -57,4 +58,9 @@ pub struct AppState {
     ///
     /// `None` when the web admin runs without VPN server (e.g., standalone mode).
     pub tunnel_spawner: Option<Arc<dyn HarpTunnelSpawner>>,
+    /// Whether the cover landing page is served at `/` (default: `true`).
+    pub cover_page_enabled: bool,
+    /// Whether to trust proxy headers for real client IP extraction (default: `false`).
+    /// Enable when behind a trusted CDN (e.g., Cloudflare).
+    pub trust_proxy_headers: bool,
 }

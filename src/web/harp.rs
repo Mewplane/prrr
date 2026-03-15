@@ -3,6 +3,7 @@
 // FRD: specs/frds/FRD-20260223-harp-websocket-streaming.md
 // FRD: specs/frds/FRD-20260223-harp-tunnel-orchestration.md
 // FRD: specs/frds/FRD-20260223-harp-polling-transport.md
+// FRD: specs/frds/FRD-20260224-cdn-header-parsing.md
 
 //! HARP session management, establishment, WebSocket/polling transport, and
 //! tunnel orchestration for the HTTPS API Relay Protocol.
@@ -25,8 +26,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Json;
-use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{FromRequest, Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use base64::Engine;
@@ -204,6 +204,24 @@ impl HarpSessionStore {
     /// Return the number of currently active sessions.
     pub fn active_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// Remove all sessions belonging to the given client.
+    ///
+    /// Returns the number of sessions removed. Dropping the sessions
+    /// closes their mpsc channels, causing associated pipeline tasks
+    /// to exit and TUN devices to be cleaned up via RAII.
+    pub fn remove_by_client_id(&self, client_id: Uuid) -> usize {
+        let mut removed = 0;
+        self.sessions.retain(|_, session| {
+            if session.client_id == client_id {
+                removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+        removed
     }
 
     /// Iterate over all active sessions.
@@ -461,7 +479,23 @@ pub struct HarpConfigInfo {
 /// 3. Authenticates the client against the registry
 /// 4. Creates a session in the store on success
 /// 5. Returns a fake response on any failure (indistinguishable from success)
-pub async fn create_session(State(state): State<AppState>, Json(request): Json<HarpSessionRequest>) -> impl IntoResponse {
+pub async fn create_session(State(state): State<AppState>, req: axum::http::Request<axum::body::Body>) -> impl IntoResponse {
+    // Step 0: Extract peer address from ConnectInfo extension (available when served via axum::serve)
+    let peer_ip = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip())
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    let client_ip = resolve_client_ip(req.headers(), peer_ip, state.trust_proxy_headers);
+
+    // Parse JSON body
+    let request: HarpSessionRequest = match axum::Json::from_request(req, &state).await {
+        Ok(Json(r)) => r,
+        Err(_) => {
+            return (StatusCode::OK, Json(build_fake_response())).into_response();
+        }
+    };
+
     // Step 1: Validate timestamp
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs();
     let time_diff = now.abs_diff(request.timestamp);
@@ -524,12 +558,21 @@ pub async fn create_session(State(state): State<AppState>, Json(request): Json<H
         }
     };
 
+    // Step 5b: Evict any existing sessions for this client (handles reconnect).
+    // Dropping old sessions closes their channels, causing old pipeline tasks
+    // to exit and old TUN devices to be cleaned up.
+    let evicted = state.harp_sessions.remove_by_client_id(client_record.id);
+    if evicted > 0 {
+        tracing::info!(client_id = %client_record.id, evicted, "evicted stale sessions on reconnect");
+    }
+
     // Step 6: Create session in the store
     let (session_id, session) = state.harp_sessions.create(client_record.id);
 
     tracing::info!(
         client_id = %client_record.id,
         client_name = %client_record.name,
+        %client_ip,
         "HARP session established"
     );
 
@@ -725,7 +768,7 @@ async fn run_stream_bridge(
 }
 
 // ---------------------------------------------------------------------------
-// Polling Transport (Fallback)
+// Streaming Transport (HTTP/2 + HTTP/1.1 compatible)
 // ---------------------------------------------------------------------------
 
 /// Look up a HARP session by URL-safe base64-encoded session ID.
@@ -741,6 +784,19 @@ fn lookup_session(store: &HarpSessionStore, session_id_b64: &str) -> Option<Arc<
     store.get(&session_id)
 }
 
+/// Decode a URL-safe base64 session ID string into a `SessionId` array.
+///
+/// Returns `None` if the string is not valid base64 or not the right length.
+fn decode_session_id(session_id_b64: &str) -> Option<SessionId> {
+    let bytes = BASE64_URL.decode(session_id_b64).ok()?;
+    if bytes.len() != SESSION_ID_LEN {
+        return None;
+    }
+    let mut id = [0u8; SESSION_ID_LEN];
+    id.copy_from_slice(&bytes);
+    Some(id)
+}
+
 /// Drain all currently available frames from a session's `to_client_rx`
 /// channel without blocking, and encode them as concatenated HARP wire bytes.
 async fn drain_to_client_frames(session: &HarpSession) -> Vec<u8> {
@@ -752,83 +808,114 @@ async fn drain_to_client_frames(session: &HarpSession) -> Vec<u8> {
     buf
 }
 
+/// Log message for H2 upload stream open.
+const LOG_H2_UPLOAD_STREAM_OPEN: &str = "H2 upload stream opened";
+
+/// Log message for H2 download stream open.
+const LOG_H2_DOWNLOAD_STREAM_OPEN: &str = "H2 download stream opened";
+
 /// Handler for `POST /api/v1/harp/upload/{session_id}`.
 ///
-/// The client sends one or more concatenated HARP frames in the request body.
-/// The server decodes each frame and forwards DATA payloads to the session's
+/// Streaming version: reads HARP frames incrementally from the request
+/// body stream. Supports both HTTP/2 DATA frames and HTTP/1.1 chunked
+/// transfer encoding.
+///
+/// Decodes each frame and forwards DATA payloads to the session's
 /// `from_client_tx` channel. KEEPALIVE frames are silently skipped. A CLOSE
 /// frame removes the session.
 ///
-/// The response body contains any frames queued for download (piggyback
-/// optimization), reducing the number of round-trips for bidirectional traffic.
-///
 /// Unknown or malformed session IDs always return `200 OK` with an empty body
 /// to prevent DPI from fingerprinting error responses.
-pub async fn upload_handler(State(state): State<AppState>, Path(session_id_b64): Path<String>, body: Bytes) -> impl IntoResponse {
+pub async fn h2_upload_handler(
+    State(state): State<AppState>,
+    Path(session_id_b64): Path<String>,
+    body: axum::body::Body,
+) -> impl IntoResponse {
     let session = match lookup_session(&state.harp_sessions, &session_id_b64) {
         Some(s) => s,
-        None => return (StatusCode::OK, Vec::new()).into_response(),
+        None => return StatusCode::OK.into_response(),
     };
 
     session.touch();
+    tracing::debug!(LOG_H2_UPLOAD_STREAM_OPEN);
 
-    // Decode frames from request body
     let mut reader = HarpFrameReader::new();
-    reader.push(&body);
+    let mut body_stream = body.into_data_stream();
 
-    while let Some(result) = reader.next_frame() {
-        let frame = match result {
-            Ok(f) => f,
-            Err(_) => break, // malformed frame data — stop processing
+    while let Some(chunk_result) = futures_util::StreamExt::next(&mut body_stream).await {
+        let chunk = match chunk_result {
+            Ok(c) => c,
+            Err(_) => break,
         };
-        match frame.frame_type {
-            HarpFrameType::Data => {
-                // Re-encode as wire bytes: HarpReceiver expects full HARP frames
-                let wire = match frame.encode() {
-                    Ok(bytes) => bytes,
-                    Err(_) => break,
-                };
-                if session.from_client_tx.send(wire).await.is_err() {
-                    break; // channel closed
-                }
-            }
-            HarpFrameType::Keepalive => {} // skip
-            HarpFrameType::Close => {
-                state.harp_sessions.remove(&{
-                    let mut id = [0u8; SESSION_ID_LEN];
-                    let bytes = BASE64_URL.decode(&session_id_b64).unwrap_or_default();
-                    if bytes.len() == SESSION_ID_LEN {
-                        id.copy_from_slice(&bytes);
+
+        reader.push(&chunk);
+
+        while let Some(result) = reader.next_frame() {
+            let frame = match result {
+                Ok(f) => f,
+                Err(_) => return StatusCode::OK.into_response(),
+            };
+            match frame.frame_type {
+                HarpFrameType::Data => {
+                    session.touch();
+                    let wire = match frame.encode() {
+                        Ok(bytes) => bytes,
+                        Err(_) => return StatusCode::OK.into_response(),
+                    };
+                    if session.from_client_tx.send(wire).await.is_err() {
+                        return StatusCode::OK.into_response();
                     }
-                    id
-                });
-                break;
+                }
+                HarpFrameType::Keepalive => {
+                    session.touch();
+                }
+                HarpFrameType::Close => {
+                    if let Some(id) = decode_session_id(&session_id_b64) {
+                        state.harp_sessions.remove(&id);
+                    }
+                    return StatusCode::OK.into_response();
+                }
             }
         }
     }
 
-    // Piggyback: return any queued download frames in response
+    // Piggyback: return any queued download frames in response.
+    // This preserves backward compatibility with HTTP/1.1 polling clients
+    // that read piggybacked data from the upload response body.
     let piggyback = drain_to_client_frames(&session).await;
     (StatusCode::OK, piggyback).into_response()
 }
 
-/// Handler for `POST /api/v1/harp/download/{session_id}`.
+/// Handler for `GET /api/v1/harp/download/{session_id}`.
 ///
-/// Returns all currently queued frames for the client as concatenated HARP
-/// wire bytes in the response body. If no frames are available, the response
-/// body is empty.
+/// Returns a streaming response body. Reads frames from the session's
+/// `to_client_rx` channel and sends each as a chunk in the response.
+/// Updates `last_activity` on each frame sent.
+///
+/// The stream ends when the session's channel closes.
 ///
 /// Unknown or malformed session IDs always return `200 OK` with an empty body.
-pub async fn download_handler(State(state): State<AppState>, Path(session_id_b64): Path<String>) -> impl IntoResponse {
+pub async fn h2_download_handler(
+    State(state): State<AppState>,
+    Path(session_id_b64): Path<String>,
+) -> impl IntoResponse {
     let session = match lookup_session(&state.harp_sessions, &session_id_b64) {
         Some(s) => s,
-        None => return (StatusCode::OK, Vec::new()).into_response(),
+        None => return StatusCode::OK.into_response(),
     };
 
     session.touch();
+    tracing::debug!(LOG_H2_DOWNLOAD_STREAM_OPEN);
 
-    let frames = drain_to_client_frames(&session).await;
-    (StatusCode::OK, frames).into_response()
+    let body_stream = futures_util::stream::unfold(session, |session| async move {
+        let mut rx = session.to_client_rx.lock().await;
+        let frame_bytes = rx.recv().await?;
+        session.touch();
+        drop(rx);
+        Some((Ok::<_, std::convert::Infallible>(frame_bytes), session))
+    });
+
+    axum::body::Body::from_stream(body_stream).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -853,6 +940,58 @@ fn epoch_millis_now() -> u64 {
 
 use crate::transport::traits::{ServerTransport, SharedServerState};
 
+// ---------------------------------------------------------------------------
+// CDN Header Parsing (Step 3.5)
+// ---------------------------------------------------------------------------
+
+/// HTTP header name for Cloudflare's real client IP.
+const CF_CONNECTING_IP_HEADER: &str = "cf-connecting-ip";
+
+/// HTTP header name for standard proxy forwarding chain.
+const X_FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
+
+/// Extract the real client IP from request headers or socket peer address.
+///
+/// When `trust_proxy_headers` is `true`, checks CDN headers in priority order:
+/// 1. `CF-Connecting-IP` — Cloudflare-specific, single IP value
+/// 2. `X-Forwarded-For` — first IP in comma-separated list
+/// 3. Fallback to `peer_addr`
+///
+/// When `trust_proxy_headers` is `false`, always returns `peer_addr` to
+/// prevent header spoofing by untrusted clients.
+pub fn resolve_client_ip(headers: &axum::http::HeaderMap, peer_addr: std::net::IpAddr, trust_proxy_headers: bool) -> std::net::IpAddr {
+    if !trust_proxy_headers {
+        return peer_addr;
+    }
+
+    // Priority 1: CF-Connecting-IP (Cloudflare-specific, single IP)
+    if let Some(value) = headers.get(CF_CONNECTING_IP_HEADER) {
+        if let Ok(s) = value.to_str() {
+            if let Ok(ip) = s.trim().parse::<std::net::IpAddr>() {
+                return ip;
+            }
+        }
+    }
+
+    // Priority 2: X-Forwarded-For (first IP in comma-separated list)
+    if let Some(value) = headers.get(X_FORWARDED_FOR_HEADER) {
+        if let Ok(s) = value.to_str() {
+            if let Some(first) = s.split(',').next() {
+                if let Ok(ip) = first.trim().parse::<std::net::IpAddr>() {
+                    return ip;
+                }
+            }
+        }
+    }
+
+    // Fallback: socket peer address
+    peer_addr
+}
+
+// ---------------------------------------------------------------------------
+// HARP Server Transport Adapter (Step 12)
+// ---------------------------------------------------------------------------
+
 /// Human-readable name for the HARP server transport.
 const HARP_SERVER_TRANSPORT_NAME: &str = "harp";
 
@@ -871,18 +1010,27 @@ pub struct HarpServerTransport<F: TunFactory> {
     tls_cert: Option<String>,
     /// Optional TLS key path (PEM).
     tls_key: Option<String>,
+    /// Session idle timeout in seconds for the reaper task.
+    session_idle_timeout: u64,
 }
 
 impl<F: TunFactory> HarpServerTransport<F> {
     /// Create a new HARP server transport with the given listen address
     /// and TUN factory. When `tls_cert` and `tls_key` are both `Some`,
     /// the transport serves HTTPS; otherwise plain HTTP.
-    pub fn new(listen_addr: std::net::SocketAddr, tun_factory: Arc<F>, tls_cert: Option<String>, tls_key: Option<String>) -> Self {
+    pub fn new(
+        listen_addr: std::net::SocketAddr,
+        tun_factory: Arc<F>,
+        tls_cert: Option<String>,
+        tls_key: Option<String>,
+        session_idle_timeout: u64,
+    ) -> Self {
         Self {
             listen_addr,
             tun_factory,
             tls_cert,
             tls_key,
+            session_idle_timeout,
         }
     }
 }
@@ -941,7 +1089,26 @@ where
                 server_noise_public_key: *shared.noise_keypair.public_key(),
                 server_kem_dk_bytes: Arc::from(shared.kem_keypair.dk_bytes().as_slice()),
                 tunnel_spawner: Some(Arc::new(spawner)),
+                cover_page_enabled: true,
+                trust_proxy_headers: false,
             };
+
+            // Spawn periodic idle session reaper
+            let sessions_for_reaper = Arc::clone(&state.harp_sessions);
+            let reaper_cancel = cancel.clone();
+            let idle_timeout = Duration::from_secs(self.session_idle_timeout);
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        () = tokio::time::sleep(Duration::from_secs(30)) => {}
+                        () = reaper_cancel.cancelled() => break,
+                    }
+                    let removed = sessions_for_reaper.cleanup_expired(idle_timeout);
+                    if removed > 0 {
+                        tracing::info!(removed, "reaped idle HARP sessions");
+                    }
+                }
+            });
 
             match (&self.tls_cert, &self.tls_key) {
                 (Some(cert), Some(key)) => super::run_web_server_tls(self.listen_addr, state, cert, key).await,
@@ -1030,6 +1197,8 @@ mod tests {
             server_noise_public_key,
             server_kem_dk_bytes,
             tunnel_spawner: None,
+            cover_page_enabled: true,
+            trust_proxy_headers: false,
         }
     }
 
@@ -1537,7 +1706,8 @@ mod tests {
         let parsed2 = parse_session_response(resp2).await;
 
         assert_ne!(parsed1.session_id, parsed2.session_id);
-        assert_eq!(state.harp_sessions.active_count(), 2);
+        // Second handshake evicts the first session (same client_id)
+        assert_eq!(state.harp_sessions.active_count(), 1);
     }
 
     // -- AC-9 (establishment): stream_endpoint contains session_id --
@@ -2528,6 +2698,7 @@ mod tests {
             Arc::new(MockTunFactory::new(DEFAULT_TUNNEL_MTU)),
             None,
             None,
+            300,
         );
 
         assert_eq!(transport.name(), HARP_SERVER_TRANSPORT_NAME);
@@ -2545,6 +2716,7 @@ mod tests {
             Arc::new(MockTunFactory::new(DEFAULT_TUNNEL_MTU)),
             None,
             None,
+            300,
         ));
 
         assert_eq!(transport.name(), HARP_SERVER_TRANSPORT_NAME);
@@ -2581,6 +2753,7 @@ mod tests {
             Arc::new(MockTunFactory::new(DEFAULT_TUNNEL_MTU)),
             None,
             None,
+            300,
         );
 
         let cancel_clone = cancel.clone();
@@ -2598,5 +2771,91 @@ mod tests {
             .expect("task join");
 
         assert!(result.is_ok(), "transport should shut down cleanly: {result:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // FRD: specs/frds/FRD-20260224-cdn-header-parsing.md
+    // Step 3.5: resolve_client_ip tests
+    // -----------------------------------------------------------------------
+
+    // AC-4: CF-Connecting-IP returns header IP when trusted
+    #[test]
+    fn resolve_ip_cf_header_trusted() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(CF_CONNECTING_IP_HEADER, "1.2.3.4".parse().unwrap());
+        let peer: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let result = resolve_client_ip(&headers, peer, true);
+        assert_eq!(result, "1.2.3.4".parse::<std::net::IpAddr>().unwrap());
+    }
+
+    // AC-5: X-Forwarded-For returns first IP when trusted
+    #[test]
+    fn resolve_ip_xff_header_trusted() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(X_FORWARDED_FOR_HEADER, "5.6.7.8, 10.0.0.2".parse().unwrap());
+        let peer: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let result = resolve_client_ip(&headers, peer, true);
+        assert_eq!(result, "5.6.7.8".parse::<std::net::IpAddr>().unwrap());
+    }
+
+    // AC-6: No headers returns peer address
+    #[test]
+    fn resolve_ip_no_headers_returns_peer() {
+        let headers = axum::http::HeaderMap::new();
+        let peer: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let result = resolve_client_ip(&headers, peer, true);
+        assert_eq!(result, peer);
+    }
+
+    // AC-7: CF-Connecting-IP ignored when not trusted
+    #[test]
+    fn resolve_ip_cf_header_untrusted() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(CF_CONNECTING_IP_HEADER, "1.2.3.4".parse().unwrap());
+        let peer: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let result = resolve_client_ip(&headers, peer, false);
+        assert_eq!(result, peer);
+    }
+
+    // AC-8: X-Forwarded-For ignored when not trusted
+    #[test]
+    fn resolve_ip_xff_header_untrusted() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(X_FORWARDED_FOR_HEADER, "5.6.7.8".parse().unwrap());
+        let peer: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let result = resolve_client_ip(&headers, peer, false);
+        assert_eq!(result, peer);
+    }
+
+    // AC-9: CF-Connecting-IP takes priority over X-Forwarded-For
+    #[test]
+    fn resolve_ip_cf_priority_over_xff() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(CF_CONNECTING_IP_HEADER, "1.1.1.1".parse().unwrap());
+        headers.insert(X_FORWARDED_FOR_HEADER, "2.2.2.2".parse().unwrap());
+        let peer: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let result = resolve_client_ip(&headers, peer, true);
+        assert_eq!(result, "1.1.1.1".parse::<std::net::IpAddr>().unwrap());
+    }
+
+    // AC-10: Malformed CF-Connecting-IP falls back to X-Forwarded-For
+    #[test]
+    fn resolve_ip_malformed_cf_falls_back() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(CF_CONNECTING_IP_HEADER, "not-an-ip".parse().unwrap());
+        headers.insert(X_FORWARDED_FOR_HEADER, "3.3.3.3".parse().unwrap());
+        let peer: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let result = resolve_client_ip(&headers, peer, true);
+        assert_eq!(result, "3.3.3.3".parse::<std::net::IpAddr>().unwrap());
+    }
+
+    // AC-11: Malformed X-Forwarded-For falls back to peer address
+    #[test]
+    fn resolve_ip_malformed_xff_falls_back() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(X_FORWARDED_FOR_HEADER, "garbage, more-garbage".parse().unwrap());
+        let peer: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let result = resolve_client_ip(&headers, peer, true);
+        assert_eq!(result, peer);
     }
 }

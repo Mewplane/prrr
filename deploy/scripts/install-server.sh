@@ -26,6 +26,8 @@ DATA_DIR="/var/lib/prrr"
 CONFIG_DIR="/etc/prrr"
 LOG_LEVEL="info"
 MAX_CLIENTS="100"
+TRANSPORT="masque"
+DNS_SERVERS="1.1.1.1,8.8.8.8"
 
 # Print functions
 info() {
@@ -76,6 +78,18 @@ while [[ $# -gt 0 ]]; do
             MAX_CLIENTS="$2"
             shift 2
             ;;
+        --transport)
+            TRANSPORT="$2"
+            shift 2
+            ;;
+        --dns)
+            DNS_SERVERS="$2"
+            shift 2
+            ;;
+        --certbot-email)
+            CERTBOT_EMAIL="$2"
+            shift 2
+            ;;
         --help)
             echo "prrr Server Installation Script"
             echo ""
@@ -89,6 +103,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --no-certbot             Skip Let's Encrypt certificate installation"
             echo "  --data-dir PATH          Data directory (default: /var/lib/prrr)"
             echo "  --max-clients N          Max concurrent clients (default: 100)"
+            echo "  --transport TYPE         Transport: masque, harp, or both (default: masque)"
+            echo "  --dns SERVERS            Comma-separated DNS servers (default: 1.1.1.1,8.8.8.8)"
+            echo "  --certbot-email EMAIL    Email for Let's Encrypt notifications"
             echo "  --help                   Show this help message"
             exit 0
             ;;
@@ -112,8 +129,15 @@ if [[ "$INSTALL_CERTBOT" == true && -z "$DOMAIN" ]]; then
     fatal "Domain is required for Let's Encrypt. Use --domain your-domain.com or --no-certbot"
 fi
 
+# Validate transport
+case "$TRANSPORT" in
+    masque|harp|both) ;;
+    *) fatal "Invalid transport: $TRANSPORT. Must be masque, harp, or both." ;;
+esac
+
 info "Starting prrr server installation..."
 info "Domain: ${DOMAIN:-none}"
+info "Transport: $TRANSPORT"
 info "VPN Port: $VPN_PORT"
 info "Admin Port: $ADMIN_PORT"
 info "Let's Encrypt: $INSTALL_CERTBOT"
@@ -228,6 +252,42 @@ PSK=$(head -c 32 /dev/urandom | base64)
 echo "$PSK" > "$CONFIG_DIR/keys/psk.key"
 chmod 600 "$CONFIG_DIR/keys/psk.key"
 
+# Build DNS array for TOML
+IFS=',' read -ra DNS_ARRAY <<< "$DNS_SERVERS"
+DNS_TOML=""
+for dns in "${DNS_ARRAY[@]}"; do
+    DNS_TOML="${DNS_TOML}\"${dns}\", "
+done
+DNS_TOML="[${DNS_TOML%, }]"
+
+# Build transport sections
+TRANSPORTS=""
+if [[ "$TRANSPORT" == "masque" || "$TRANSPORT" == "both" ]]; then
+    TRANSPORTS+="
+[[transports]]
+name = \"masque\"
+enabled = true
+tls_cert = \"$CERT_PATH\"
+tls_key = \"$KEY_PATH\"
+max_idle_timeout = 300
+keep_alive = 25
+"
+fi
+
+if [[ "$TRANSPORT" == "harp" || "$TRANSPORT" == "both" ]]; then
+    TRANSPORTS+="
+[[transports]]
+name = \"harp\"
+enabled = true
+tls_cert = \"$CERT_PATH\"
+tls_key = \"$KEY_PATH\"
+websocket_enabled = true
+polling_enabled = true
+h2_streaming_enabled = true
+session_idle_timeout = 300
+"
+fi
+
 # Create server configuration
 info "Creating server configuration..."
 cat > "$CONFIG_DIR/server.toml" << EOF
@@ -237,16 +297,13 @@ server_name = "$DOMAIN"
 max_clients = $MAX_CLIENTS
 
 [network]
-subnet = "10.0.0.0/24"
-gateway = "10.0.0.1"
-
-[transport]
-tls_cert = "$CERT_PATH"
-tls_key = "$KEY_PATH"
-
+subnet = "10.66.66.0/24"
+dns_servers = $DNS_TOML
+mtu = 1280
+$TRANSPORTS
 [keys]
-server_key_path = "$CONFIG_DIR/keys/server.key"
-kem_key_path = "$CONFIG_DIR/keys/server_kem.key"
+identity_key_path = "$CONFIG_DIR/keys/server_identity.key"
+pq_key_path = "$CONFIG_DIR/keys/server_pq.key"
 psk_path = "$CONFIG_DIR/keys/psk.key"
 
 [database]
@@ -254,14 +311,20 @@ path = "$DATA_DIR/clients.db"
 
 [web_admin]
 enabled = true
-listen = "0.0.0.0:8443"
+listen_addr = "0.0.0.0:8443"
 admin_password_hash = "$PASSWORD_HASH"
 
 [obfuscation]
+enabled = true
 tls_profile = "chrome"
 padding_strategy = "http-sizes"
-max_jitter_ms = 50
-enable_probe_resistance = true
+timing_jitter_ms = 50
+
+[obfuscation.probe_resist]
+enabled = true
+psk = "$PSK"
+tokens_per_second = 20
+burst_capacity = 5
 
 [logging]
 level = "$LOG_LEVEL"
@@ -294,6 +357,25 @@ EOF
 ln -sf /etc/nginx/sites-available/prrr-admin /etc/nginx/sites-enabled/
 rm -f /etc/nginx/sites-enabled/default
 
+# Enable IP forwarding and NAT for VPN traffic
+info "Configuring IP forwarding and NAT..."
+echo 1 > /proc/sys/net/ipv4/ip_forward
+cat > /etc/sysctl.d/99-prrr.conf << SYSCTL
+net.ipv4.ip_forward = 1
+SYSCTL
+sysctl -p /etc/sysctl.d/99-prrr.conf
+
+MAIN_IFACE=$(ip route show default | awk '{print $5}' | head -1)
+if command -v nft &> /dev/null; then
+    nft add table nat 2>/dev/null || true
+    nft add chain nat postrouting '{ type nat hook postrouting priority 100 ; }' 2>/dev/null || true
+    nft add rule nat postrouting oifname "$MAIN_IFACE" masquerade 2>/dev/null || true
+    nft list ruleset > /etc/nftables.conf
+    systemctl enable nftables 2>/dev/null || true
+elif command -v iptables &> /dev/null; then
+    iptables -t nat -A POSTROUTING -o "$MAIN_IFACE" -j MASQUERADE
+fi
+
 # Test nginx configuration
 nginx -t || fatal "nginx configuration test failed"
 
@@ -323,17 +405,27 @@ systemctl daemon-reload
 systemctl enable prrr
 systemctl start prrr
 systemctl enable nginx
-systemctl start nginx
+systemctl restart nginx
 
 # Configure firewall
 info "Configuring firewall..."
 if command -v ufw &> /dev/null; then
-    ufw allow "$VPN_PORT/udp" comment "prrr VPN"
-    ufw allow "$ADMIN_PORT/tcp" comment "prrr Admin Panel"
-    ufw allow 80/tcp comment "Let's Encrypt"
     ufw allow 22/tcp comment "SSH"
+    ufw allow 80/tcp comment "Let's Encrypt"
+    ufw allow "$ADMIN_PORT/tcp" comment "prrr Admin Panel"
+    if [[ "$TRANSPORT" == "masque" || "$TRANSPORT" == "both" ]]; then
+        ufw allow "$VPN_PORT/udp" comment "prrr MASQUE"
+    fi
+    if [[ "$TRANSPORT" == "harp" || "$TRANSPORT" == "both" ]]; then
+        ufw allow "$VPN_PORT/tcp" comment "prrr HARP"
+    fi
 elif command -v firewall-cmd &> /dev/null; then
-    firewall-cmd --permanent --add-port="$VPN_PORT/udp"
+    if [[ "$TRANSPORT" == "masque" || "$TRANSPORT" == "both" ]]; then
+        firewall-cmd --permanent --add-port="$VPN_PORT/udp"
+    fi
+    if [[ "$TRANSPORT" == "harp" || "$TRANSPORT" == "both" ]]; then
+        firewall-cmd --permanent --add-port="$VPN_PORT/tcp"
+    fi
     firewall-cmd --permanent --add-port="$ADMIN_PORT/tcp"
     firewall-cmd --permanent --add-port=80/tcp
     firewall-cmd --reload
@@ -366,7 +458,13 @@ echo -e "${GREEN}  prrr Server Installation Complete!${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo ""
 echo "Server Details:"
-echo "  VPN Endpoint:    $DOMAIN:$VPN_PORT (UDP)"
+echo "  VPN Transport:   $TRANSPORT"
+if [[ "$TRANSPORT" == "masque" || "$TRANSPORT" == "both" ]]; then
+    echo "  MASQUE Endpoint: ${DOMAIN:-$SERVER_IP}:$VPN_PORT (UDP/QUIC)"
+fi
+if [[ "$TRANSPORT" == "harp" || "$TRANSPORT" == "both" ]]; then
+    echo "  HARP Endpoint:   ${DOMAIN:-$SERVER_IP}:$VPN_PORT (TCP/HTTPS)"
+fi
 echo "  Admin Panel:     https://admin.$DOMAIN:$ADMIN_PORT"
 echo "  Admin Username:  admin"
 echo "  Admin Password:  $ADMIN_PASSWORD"

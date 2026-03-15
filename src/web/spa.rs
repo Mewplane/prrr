@@ -12,6 +12,9 @@ use axum::response::{Html, IntoResponse};
 /// Embedded SPA HTML (Preact + HTM from CDN, single file).
 const SPA_HTML: &str = include_str!("../../assets/index.html");
 
+/// Embedded cover landing page HTML ("PRRR Vision" surveillance company).
+const COVER_HTML: &str = include_str!("../../assets/cover.html");
+
 /// Embedded cat logo image (white, no text).
 const LOGO_PNG: &[u8] = include_bytes!("../../assets/logo_w.png");
 
@@ -20,6 +23,12 @@ const LOGO_TEXT_PNG: &[u8] = include_bytes!("../../assets/logo_w_text.png");
 
 /// Content-Type header value for PNG images.
 const PNG_CONTENT_TYPE: &str = "image/png";
+
+/// Server header value mimicking nginx (DPI evasion).
+const NGINX_SERVER_HEADER: &str = "nginx/1.24.0";
+
+/// Cache-Control for the cover page.
+const COVER_CACHE_CONTROL: &str = "public, max-age=3600";
 
 /// Expected CDN host in the SPA HTML (used in tests).
 #[cfg(test)]
@@ -33,11 +42,26 @@ const EXPECTED_MOUNT_ID: &str = "app";
 #[cfg(test)]
 const EXPECTED_TITLE: &str = "prrr";
 
+/// Serve the cover landing page with nginx-like response headers.
+///
+/// Returns `cover.html` with headers that make the server appear as a
+/// standard nginx web server serving a legitimate business website.
+pub async fn cover_handler() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::SERVER, NGINX_SERVER_HEADER),
+            (header::HeaderName::from_static("x-content-type-options"), "nosniff"),
+            (header::CACHE_CONTROL, COVER_CACHE_CONTROL),
+        ],
+        COVER_HTML,
+    )
+}
+
 /// Serve the embedded SPA HTML.
 ///
 /// Returns the full `index.html` with `Content-Type: text/html`.
-/// Used for both `GET /` (root) and the router fallback (all
-/// unmatched paths) to support client-side routing.
+/// Used for `GET /admin` and admin sub-routes.
 pub async fn spa_handler() -> Html<&'static str> {
     Html(SPA_HTML)
 }
@@ -147,13 +171,86 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // FRD: specs/frds/FRD-20260224-cover-page-handler.md
+    // Step 2.2: Cover page handler
+    // -----------------------------------------------------------------------
+
+    /// Expected branding text in the cover HTML.
+    const EXPECTED_COVER_BRANDING: &str = "PRRR Vision";
+
+    // AC-1: cover_handler returns 200 with text/html containing "PRRR Vision"
+    #[tokio::test]
+    async fn cover_handler_returns_html() {
+        let response = cover_handler().await.into_response();
+        assert_eq!(response.status(), 200);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .expect("content-type header")
+            .to_str()
+            .expect("valid header value");
+        assert!(content_type.contains("text/html"), "expected text/html, got {content_type}");
+    }
+
+    // AC-1b: cover handler body contains "PRRR Vision"
+    #[tokio::test]
+    async fn cover_handler_contains_branding() {
+        let response = cover_handler().await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), 1_048_576).await.expect("read body");
+        let html_str = std::str::from_utf8(&body).expect("valid utf-8");
+        assert!(
+            html_str.contains(EXPECTED_COVER_BRANDING),
+            "cover HTML must contain {EXPECTED_COVER_BRANDING}"
+        );
+    }
+
+    // AC-2: cover handler response has Server: nginx/1.24.0 header
+    #[tokio::test]
+    async fn cover_handler_has_nginx_server_header() {
+        let response = cover_handler().await.into_response();
+        let server = response
+            .headers()
+            .get("server")
+            .expect("server header")
+            .to_str()
+            .expect("valid header value");
+        assert_eq!(server, NGINX_SERVER_HEADER, "Server header must be nginx/1.24.0");
+    }
+
+    // AC-2b: cover handler has X-Content-Type-Options: nosniff
+    #[tokio::test]
+    async fn cover_handler_has_nosniff_header() {
+        let response = cover_handler().await.into_response();
+        let xcto = response
+            .headers()
+            .get("x-content-type-options")
+            .expect("x-content-type-options header")
+            .to_str()
+            .expect("valid header value");
+        assert_eq!(xcto, "nosniff");
+    }
+
+    // AC-2c: cover handler has Cache-Control: public, max-age=3600
+    #[tokio::test]
+    async fn cover_handler_has_cache_control() {
+        let response = cover_handler().await.into_response();
+        let cc = response
+            .headers()
+            .get("cache-control")
+            .expect("cache-control header")
+            .to_str()
+            .expect("valid header value");
+        assert_eq!(cc, COVER_CACHE_CONTROL);
+    }
+
     // --- Logo handler tests (FRD-20260223-web-ui-logo-integration) ---
 
     /// Expected size of logo_w.png in bytes.
-    const EXPECTED_LOGO_SIZE: usize = 64360;
+    const EXPECTED_LOGO_SIZE: usize = 43_863;
 
     /// Expected size of logo_w_text.png in bytes.
-    const EXPECTED_LOGO_TEXT_SIZE: usize = 231_113;
+    const EXPECTED_LOGO_TEXT_SIZE: usize = 84_620;
 
     // AC-1: logo_handler returns 200 with image/png
     #[tokio::test]
