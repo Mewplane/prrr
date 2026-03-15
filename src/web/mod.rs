@@ -52,20 +52,33 @@ pub fn build_router(state: AppState) -> Router {
     let harp_routes = Router::new()
         .route("/harp/session", post(harp::create_session))
         .route("/harp/stream/{session_id}", get(harp::stream_handler))
-        .route("/harp/upload/{session_id}", post(harp::upload_handler))
-        .route("/harp/download/{session_id}", post(harp::download_handler));
+        .route("/harp/upload/{session_id}", post(harp::h2_upload_handler))
+        .route(
+            "/harp/download/{session_id}",
+            get(harp::h2_download_handler).post(harp::h2_download_handler),
+        );
 
     let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
 
-    Router::new()
-        .route("/", get(spa::spa_handler))
+    let base = Router::new()
+        .route("/favicon.ico", get(spa::logo_handler))
+        .route("/admin", get(spa::spa_handler))
         .route("/assets/logo_w.png", get(spa::logo_handler))
         .route("/assets/logo_w_text.png", get(spa::logo_text_handler))
         .route("/c/{token}", get(handlers::get_config_by_token))
-        .nest(API_V1_PREFIX, auth_routes.merge(protected_routes).merge(harp_routes))
-        .fallback(get(spa::spa_handler))
-        .layer(cors)
-        .with_state(state)
+        .nest(API_V1_PREFIX, auth_routes.merge(protected_routes).merge(harp_routes));
+
+    if state.cover_page_enabled {
+        base.route("/", get(spa::cover_handler))
+            .fallback(get(spa::cover_handler))
+            .layer(cors)
+            .with_state(state)
+    } else {
+        base.route("/", get(spa::spa_handler))
+            .fallback(get(spa::spa_handler))
+            .layer(cors)
+            .with_state(state)
+    }
 }
 
 /// Start the web admin HTTP server.
@@ -189,6 +202,8 @@ mod tests {
             server_noise_public_key: [0u8; 32],
             server_kem_dk_bytes: Arc::from([0u8; 0].as_slice()),
             tunnel_spawner: None,
+            cover_page_enabled: true,
+            trust_proxy_headers: false,
         }
     }
 
@@ -511,10 +526,11 @@ mod tests {
         assert!(!body.is_empty(), "logo text body must not be empty");
     }
 
-    // --- SPA routing integration tests (P-007) ---
+    // --- Cover page + SPA routing integration tests (FRD-20260224-cover-page-handler) ---
 
+    // AC-1: GET / returns cover HTML with "PRRR Vision"
     #[tokio::test]
-    async fn spa_root_serves_html() {
+    async fn cover_root_serves_cover_html() {
         let state = test_app_state();
         let app = build_router(state);
 
@@ -529,14 +545,51 @@ mod tests {
             .to_str()
             .expect("valid header value");
         assert!(content_type.contains("text/html"), "expected text/html, got {content_type}");
+        let body = axum::body::to_bytes(resp.into_body(), 1_048_576).await.unwrap();
+        let html = std::str::from_utf8(&body).expect("valid utf-8");
+        assert!(html.contains("PRRR Vision"), "root must serve cover page with PRRR Vision branding");
     }
 
+    // AC-2: GET / has Server: nginx/1.24.0
     #[tokio::test]
-    async fn spa_fallback_serves_html() {
+    async fn cover_root_has_nginx_server_header() {
         let state = test_app_state();
         let app = build_router(state);
 
-        let req = Request::builder().method("GET").uri("/clients").body(Body::empty()).unwrap();
+        let req = Request::builder().method("GET").uri("/").body(Body::empty()).unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        let server = resp
+            .headers()
+            .get("server")
+            .expect("server header")
+            .to_str()
+            .expect("valid header value");
+        assert_eq!(server, "nginx/1.24.0");
+    }
+
+    // AC-3: GET /admin returns SPA HTML
+    #[tokio::test]
+    async fn admin_serves_spa() {
+        let state = test_app_state();
+        let app = build_router(state);
+
+        let req = Request::builder().method("GET").uri("/admin").body(Body::empty()).unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1_048_576).await.unwrap();
+        let html = std::str::from_utf8(&body).expect("valid utf-8");
+        assert!(html.contains("prrr - Admin"), "/admin must serve SPA with prrr - Admin title");
+    }
+
+    // AC-5: GET /favicon.ico returns PNG
+    #[tokio::test]
+    async fn favicon_serves_logo() {
+        let state = test_app_state();
+        let app = build_router(state);
+
+        let req = Request::builder().method("GET").uri("/favicon.ico").body(Body::empty()).unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -546,7 +599,42 @@ mod tests {
             .expect("content-type header")
             .to_str()
             .expect("valid header value");
-        assert!(content_type.contains("text/html"), "expected text/html, got {content_type}");
+        assert_eq!(content_type, "image/png");
+    }
+
+    // AC-6: Fallback serves cover HTML (not SPA)
+    #[tokio::test]
+    async fn fallback_serves_cover() {
+        let state = test_app_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/some-random-path")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1_048_576).await.unwrap();
+        let html = std::str::from_utf8(&body).expect("valid utf-8");
+        assert!(html.contains("PRRR Vision"), "fallback must serve cover page, not SPA");
+    }
+
+    // AC-3: Router with cover_page_enabled=false serves SPA at /
+    #[tokio::test]
+    async fn cover_disabled_root_serves_spa() {
+        let mut state = test_app_state();
+        state.cover_page_enabled = false;
+        let app = build_router(state);
+
+        let req = Request::builder().method("GET").uri("/").body(Body::empty()).unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1_048_576).await.unwrap();
+        let html = std::str::from_utf8(&body).expect("valid utf-8");
+        assert!(html.contains("prrr - Admin"), "with cover disabled, / must serve SPA");
     }
 
     #[tokio::test]

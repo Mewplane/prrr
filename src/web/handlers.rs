@@ -614,6 +614,8 @@ mod tests {
             server_noise_public_key: [0u8; 32],
             server_kem_dk_bytes: Arc::from([0u8; 0].as_slice()),
             tunnel_spawner: None,
+            cover_page_enabled: true,
+            trust_proxy_headers: false,
         }
     }
 

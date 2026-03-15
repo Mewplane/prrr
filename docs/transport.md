@@ -317,6 +317,7 @@ match result {
     Err(TransportError::MasqueHandshake(msg)) => { /* MASQUE CONNECT-UDP handshake error */ }
     Err(TransportError::MasqueDatagram(msg)) => { /* MASQUE datagram framing error */ }
     Err(TransportError::VarintDecode(msg)) => { /* QUIC varint decode error */ }
+    Err(TransportError::H2Stream(msg)) => { /* HTTP/2 stream error */ }
     Ok(data) => { /* success */ }
 }
 ```
@@ -394,3 +395,97 @@ TLS 1.3 (ALPN=h3): indistinguishable from HTTP/3
      ↓
 UDP/IP: standard port 443 traffic
 ```
+
+### HARP HTTP/2 Transport (Hardening Phase 3, Feature 4)
+
+The HARP transport supports HTTP/2 multiplexed streams as a binding mode alongside
+WebSocket (`"stream"`) and HTTP/1.1 polling (`"poll"`). HTTP/2 streams look like
+normal browser traffic and have lower latency than polling.
+
+**Server configuration:**
+
+```toml
+[[transports]]
+name = "harp"
+h2_streaming_enabled = true  # Enable HTTP/2 binding (default: true)
+```
+
+**Client configuration:**
+
+```toml
+[transport]
+preferred_binding = "h2"  # "stream" | "poll" | "h2"
+```
+
+**Dependencies:** `h2 = "0.4"`, `hyper` with `http2` feature, `bytes = "1"`.
+
+### `transport::h2_adapter` — HTTP/2 Stream Adapters
+
+Bridges `h2::SendStream<Bytes>` and `h2::RecvStream` to prrr's `DatagramSender` /
+`DatagramReceiver` traits. Enables HARP frame exchange over HTTP/2 multiplexed
+streams with proper flow control management.
+
+**Types:**
+- `H2Sender` — Sends HARP DATA frames over an HTTP/2 send stream. Wraps `h2::SendStream<Bytes>` behind `std::sync::Mutex` to satisfy the sync `&self` signature of `DatagramSender`.
+- `H2Receiver` — Receives HARP frames from an HTTP/2 receive stream. Wraps `h2::RecvStream` + `HarpFrameReader` behind `tokio::sync::Mutex`. Automatically releases HTTP/2 flow control capacity after consuming each DATA chunk.
+
+**Functions:**
+- `H2Sender::new(stream) -> H2Sender` — Create a new sender wrapping an H2 send stream.
+- `H2Receiver::new(stream) -> H2Receiver` — Create a new receiver wrapping an H2 receive stream.
+- `H2Sender::send_datagram(payload) -> Result<(), TransportError>` — Encode as HARP DATA frame, send via H2.
+- `H2Receiver::recv_datagram() -> Result<Vec<u8>, TransportError>` — Receive H2 DATA, decode HARP frame, return payload.
+
+**Frame handling:**
+- DATA frames: payload returned to caller
+- KEEPALIVE frames: silently skipped
+- CLOSE frames: returns `TransportError::HarpSessionClosed`
+- H2 stream end: returns `TransportError::HarpChannelClosed`
+- H2 errors: returns `TransportError::H2Stream(message)`
+
+### H2 Client Connect Path
+
+The `connect_harp_h2()` function establishes an HTTP/2 connection and opens
+upload/download streams, returning `(H2Sender, H2Receiver)` for use with the
+tunnel pipeline. This is the client-side counterpart to the server-side H2
+streaming handlers (Step 4.4).
+
+**Connection flow:**
+
+```text
+Client                                Server
+------                                ------
+1. DNS resolve host:port
+2. Create marked TCP socket (fwmark)
+3. TLS handshake (ALPN=["h2"] only)
+4. h2::client::handshake(tls_stream)
+5. Spawn H2 connection driver
+6. POST /api/v1/harp/upload/{sid}    → Upload handler
+   (end_of_stream=false)
+7. GET /api/v1/harp/download/{sid}   → Download handler
+   (end_of_stream=true)
+8. Return (H2Sender, H2Receiver)
+```
+
+**Binding selection:** When `preferred_binding = "h2"` is configured, the H2
+path is selected in both `connect_inner()` (direct) and `connect_via_cdn()`
+(CDN fronting) before the WebSocket/polling fallback logic.
+
+**TLS configuration:** `build_harp_h2_rustls_config()` creates a rustls config
+with ALPN `["h2"]` only (not `["h2", "http/1.1"]`) to force HTTP/2 negotiation.
+Uses the same TLS mimicry profile and certificate verification as other HARP
+connections.
+
+**Client capabilities:** `HARP_CLIENT_CAPABILITIES` includes `"h2"` alongside
+`"stream"` and `"poll"`, informing the server that the client supports HTTP/2
+streaming.
+
+**Functions:**
+- `connect_harp_h2(host, port, session_id, insecure, fwmark, profile) -> Result<(H2Sender, H2Receiver)>` — Full H2 connection establishment.
+- `build_harp_h2_rustls_config(insecure, profile) -> Result<ClientConfig>` — H2-only TLS config.
+
+**Constants:**
+- `HARP_H2_UPLOAD_PATH = "/api/v1/harp/upload/"` — Upload stream endpoint prefix.
+- `HARP_H2_DOWNLOAD_PATH = "/api/v1/harp/download/"` — Download stream endpoint prefix.
+- `LOG_HARP_H2_STREAMS = "HARP transport: using HTTP/2 streams"` — Log message for H2 binding selection.
+- `BINDING_H2 = "h2"` — Preferred binding value for HTTP/2.
+- `BINDING_POLL = "poll"` — Preferred binding value for HTTP polling.

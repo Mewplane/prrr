@@ -1,138 +1,118 @@
-# FRD: specs/frds/FRD-P012.md
-# SPEC.md §5 — prrr VPN DigitalOcean Terraform Module
+# prrr VPN — Generic server provisioning (any Linux server via SSH)
 #
-# Resources:
-#   - digitalocean_droplet.prrr_vpn     — Ubuntu 22.04 server
-#   - digitalocean_firewall.prrr_vpn    — SSH + VPN + web admin rules
-#   - digitalocean_domain.prrr_vpn      — DNS zone (conditional)
-#   - digitalocean_record.prrr_vpn_a    — A record (conditional)
+# Unlike the DigitalOcean module, this provisions an existing server
+# using SSH with password authentication. No cloud provider required.
 
 terraform {
   required_version = ">= 1.0"
+}
 
-  required_providers {
-    digitalocean = {
-      source  = "digitalocean/digitalocean"
-      version = "~> 2.0"
-    }
+locals {
+  install_args = join(" ", compact([
+    "--admin-pass '${var.admin_password}'",
+    "--vpn-port ${var.vpn_port}",
+    "--admin-port ${var.admin_https_port}",
+    "--max-clients ${var.max_clients}",
+    "--transport ${var.transport}",
+    "--dns ${join(",", var.dns_servers)}",
+    var.domain != "" ? "--domain ${var.domain}" : "--no-certbot",
+    var.certbot_email != "" ? "--certbot-email ${var.certbot_email}" : "",
+  ]))
+}
+
+# ---------------------------------------------------------------------------
+# Upload prrr binary (if provided)
+# ---------------------------------------------------------------------------
+
+resource "null_resource" "upload_binary" {
+  count = var.prrr_binary_path != "" ? 1 : 0
+
+  connection {
+    type     = "ssh"
+    host     = var.server_ip
+    user     = var.ssh_user
+    password = var.server_password
+    port     = var.ssh_port
+    timeout  = "2m"
+  }
+
+  provisioner "file" {
+    source      = var.prrr_binary_path
+    destination = "/usr/local/bin/prrr"
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "chmod +x /usr/local/bin/prrr",
+    ]
   }
 }
 
-provider "digitalocean" {
-  token = var.do_token
-}
-
 # ---------------------------------------------------------------------------
-# Droplet
+# Upload and run install script
 # ---------------------------------------------------------------------------
 
-resource "digitalocean_droplet" "prrr_vpn" {
-  name     = var.server_name
-  image    = "ubuntu-22-04-x64"
-  region   = var.region
-  size     = var.droplet_size
-  ssh_keys = var.ssh_key_ids
+resource "null_resource" "install_prrr" {
+  depends_on = [null_resource.upload_binary]
 
-  user_data = templatefile("${path.module}/templates/cloud-init.yml", {
+  connection {
+    type     = "ssh"
+    host     = var.server_ip
+    user     = var.ssh_user
+    password = var.server_password
+    port     = var.ssh_port
+    timeout  = "10m"
+  }
+
+  provisioner "file" {
+    source      = "${path.module}/../scripts/install-server.sh"
+    destination = "/tmp/install_prrr.sh"
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "chmod +x /tmp/install_prrr.sh",
+      "bash /tmp/install_prrr.sh ${local.install_args}",
+      "rm -f /tmp/install_prrr.sh",
+    ]
+  }
+
+  triggers = {
+    # Re-provision when config changes
+    transport      = var.transport
     admin_password = var.admin_password
-    domain         = var.domain
-    admin_domain   = var.admin_subdomain != "" ? "${var.admin_subdomain}.${var.domain}" : "admin.${var.domain}"
     vpn_port       = var.vpn_port
-    admin_port     = var.admin_https_port
     max_clients    = var.max_clients
-    dns_servers    = join(",", var.dns_servers)
-    certbot_email  = var.certbot_email
-  })
-
-  tags = ["prrr-vpn", var.environment]
-}
-
-# ---------------------------------------------------------------------------
-# Firewall
-# ---------------------------------------------------------------------------
-
-resource "digitalocean_firewall" "prrr_vpn" {
-  name        = "${var.server_name}-fw"
-  droplet_ids = [digitalocean_droplet.prrr_vpn.id]
-
-  # SSH — restricted to admin IPs
-  inbound_rule {
-    protocol         = "tcp"
-    port_range       = "22"
-    source_addresses = var.admin_ip_addresses
-  }
-
-  # VPN — open to all (HARP over TCP 443, MASQUE/QUIC over UDP 443)
-  inbound_rule {
-    protocol         = "tcp"
-    port_range       = "443"
-    source_addresses = ["0.0.0.0/0", "::/0"]
-  }
-
-  inbound_rule {
-    protocol         = "udp"
-    port_range       = "443"
-    source_addresses = ["0.0.0.0/0", "::/0"]
-  }
-
-  # Let's Encrypt HTTP-01 validation
-  inbound_rule {
-    protocol         = "tcp"
-    port_range       = "80"
-    source_addresses = ["0.0.0.0/0", "::/0"]
-  }
-
-  # Web Admin HTTPS — restricted to admin IPs
-  inbound_rule {
-    protocol         = "tcp"
-    port_range       = var.admin_https_port
-    source_addresses = var.admin_ip_addresses
-  }
-
-  # Outbound — allow all TCP
-  outbound_rule {
-    protocol              = "tcp"
-    port_range            = "1-65535"
-    destination_addresses = ["0.0.0.0/0", "::/0"]
-  }
-
-  # Outbound — allow all UDP
-  outbound_rule {
-    protocol              = "udp"
-    port_range            = "1-65535"
-    destination_addresses = ["0.0.0.0/0", "::/0"]
-  }
-
-  # Outbound — allow ICMP
-  outbound_rule {
-    protocol              = "icmp"
-    destination_addresses = ["0.0.0.0/0", "::/0"]
+    domain         = var.domain
   }
 }
 
 # ---------------------------------------------------------------------------
-# DNS (conditional — only when domain is provided)
+# Configure firewall
 # ---------------------------------------------------------------------------
 
-resource "digitalocean_domain" "prrr_vpn" {
-  count = var.domain != "" ? 1 : 0
-  name  = var.domain
-}
+resource "null_resource" "firewall" {
+  depends_on = [null_resource.install_prrr]
 
-resource "digitalocean_record" "prrr_vpn_a" {
-  count  = var.domain != "" ? 1 : 0
-  domain = digitalocean_domain.prrr_vpn[0].id
-  type   = "A"
-  name   = "@"
-  value  = digitalocean_droplet.prrr_vpn.ipv4_address
-  ttl    = 300
-}
+  connection {
+    type     = "ssh"
+    host     = var.server_ip
+    user     = var.ssh_user
+    password = var.server_password
+    port     = var.ssh_port
+    timeout  = "2m"
+  }
 
-resource "digitalocean_record" "prrr_admin_a" {
-  count  = var.domain != "" ? 1 : 0
-  domain = digitalocean_domain.prrr_vpn[0].id
-  type   = "A"
-  name   = var.admin_subdomain != "" ? var.admin_subdomain : "admin"
-  value  = digitalocean_droplet.prrr_vpn.ipv4_address
-  ttl    = 300
+  provisioner "remote-exec" {
+    inline = [
+      "if command -v ufw &>/dev/null; then",
+      "  ufw --force enable",
+      "  ufw allow ${var.ssh_port}/tcp comment 'SSH'",
+      "  ufw allow 80/tcp comment 'Let\\'s Encrypt'",
+      "  ufw allow ${var.admin_https_port}/tcp comment 'prrr Admin'",
+      var.transport == "masque" || var.transport == "both" ? "  ufw allow ${var.vpn_port}/udp comment 'prrr MASQUE'" : "  true",
+      var.transport == "harp" || var.transport == "both" ? "  ufw allow ${var.vpn_port}/tcp comment 'prrr HARP'" : "  true",
+      "fi",
+    ]
+  }
 }

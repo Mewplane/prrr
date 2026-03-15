@@ -1,39 +1,38 @@
-# FRD: specs/frds/FRD-P012.md
-# SPEC.md §5.2 — Terraform variables for prrr VPN DigitalOcean deployment
+# prrr VPN — Generic server provisioning variables
+# Works with any Linux server accessible via SSH (Ubuntu 22.04+, Debian 11+, Fedora 38+)
 
-variable "do_token" {
-  description = "DigitalOcean API token"
+variable "server_ip" {
+  description = "IP address of the target server"
+  type        = string
+}
+
+variable "server_password" {
+  description = "Root password for SSH authentication"
   type        = string
   sensitive   = true
 }
 
-variable "server_name" {
-  description = "Server name used for droplet hostname and resource naming"
+variable "ssh_user" {
+  description = "SSH user for provisioning"
   type        = string
-  default     = "prrr-vpn"
+  default     = "root"
 }
 
-variable "region" {
-  description = "DigitalOcean region slug (e.g. fra1, nyc1, sfo3)"
+variable "ssh_port" {
+  description = "SSH port"
+  type        = number
+  default     = 22
+}
+
+variable "transport" {
+  description = "VPN transport protocol: masque (QUIC/UDP, default) or harp (HTTPS/TCP)"
   type        = string
-  default     = "fra1"
-}
+  default     = "masque"
 
-variable "droplet_size" {
-  description = "Droplet size slug (e.g. s-1vcpu-1gb for $6/month)"
-  type        = string
-  default     = "s-1vcpu-1gb"
-}
-
-variable "ssh_key_ids" {
-  description = "List of DigitalOcean SSH key IDs to add to the droplet"
-  type        = list(number)
-}
-
-variable "admin_ip_addresses" {
-  description = "IP addresses allowed to access SSH and web admin (CIDR notation)"
-  type        = list(string)
-  default     = ["0.0.0.0/0"]
+  validation {
+    condition     = contains(["masque", "harp", "both"], var.transport)
+    error_message = "Transport must be 'masque', 'harp', or 'both'."
+  }
 }
 
 variable "admin_password" {
@@ -43,7 +42,7 @@ variable "admin_password" {
 }
 
 variable "domain" {
-  description = "Domain name for DNS A record and Let's Encrypt certificates. Required for DPI-resistant deployments — bare IP addresses and self-signed certs are detectable. Leave empty to skip DNS setup (development only)."
+  description = "Domain name for TLS certificates (optional, self-signed if empty)"
   type        = string
   default     = ""
 }
@@ -55,13 +54,13 @@ variable "admin_subdomain" {
 }
 
 variable "vpn_port" {
-  description = "VPN listen port (TCP for HARP, UDP for MASQUE)"
+  description = "VPN listen port (UDP for MASQUE, TCP for HARP)"
   type        = number
   default     = 443
 }
 
 variable "admin_https_port" {
-  description = "HTTPS admin panel port (TCP, served by nginx)"
+  description = "HTTPS admin panel port"
   type        = number
   default     = 9443
 }
@@ -84,8 +83,8 @@ variable "dns_servers" {
   default     = ["1.1.1.1", "8.8.8.8"]
 }
 
-variable "environment" {
-  description = "Environment tag for resource identification"
+variable "prrr_binary_path" {
+  description = "Path to prebuilt prrr binary. If empty, will attempt to build on server."
   type        = string
-  default     = "production"
+  default     = ""
 }

@@ -85,6 +85,12 @@ pub const DEFAULT_PROBE_RESIST_TOKENS_PER_SEC: u64 = 20;
 /// Default probe resistance burst capacity.
 pub const DEFAULT_PROBE_RESIST_BURST: u64 = 5;
 
+/// Default direct connection timeout before CDN fallback (seconds).
+pub const DEFAULT_DIRECT_TIMEOUT_SECS: u64 = 5;
+
+/// Default interval for probing direct connection when using CDN (seconds).
+pub const DEFAULT_DIRECT_RETRY_INTERVAL_SECS: u64 = 600;
+
 /// Default web admin listen address.
 pub const DEFAULT_WEB_ADMIN_ADDR: &str = "0.0.0.0:8443";
 
@@ -361,6 +367,8 @@ pub struct HarpTransportConfig {
     pub websocket_enabled: Option<bool>,
     /// Enable HTTP polling fallback mode.
     pub polling_enabled: Option<bool>,
+    /// Enable HTTP/2 multiplexed streaming mode (default: `true` when resolved).
+    pub h2_streaming_enabled: Option<bool>,
     /// Seconds before idle HARP sessions are cleaned up.
     pub session_idle_timeout: Option<u64>,
     /// Path to TLS certificate file (PEM) for HTTPS.
@@ -412,6 +420,13 @@ pub struct WebAdminSection {
     pub admin_password_hash: Option<String>,
     /// Session timeout in seconds.
     pub session_timeout: Option<u64>,
+    /// Whether to serve the cover landing page at `/` (default: `true`).
+    /// When `false`, `/` serves the admin SPA directly.
+    pub cover_page_enabled: Option<bool>,
+    /// Whether to trust proxy headers (`CF-Connecting-IP`, `X-Forwarded-For`)
+    /// for extracting the real client IP (default: `false`).
+    /// Enable when behind a trusted CDN (e.g., Cloudflare).
+    pub trust_proxy_headers: Option<bool>,
 }
 
 /// `[messaging]` section — Whisper messaging service.
@@ -538,6 +553,20 @@ pub struct ClientTransportSection {
     pub reconnect_backoff_ms: Option<u64>,
     /// Maximum reconnection backoff delay in milliseconds.
     pub reconnect_max_backoff_ms: Option<u64>,
+    /// TLS fingerprint profile: `"chrome"`, `"firefox"`, or `"default"`.
+    /// When `None`, the caller defaults to `TlsProfile::Chrome`.
+    pub tls_profile: Option<String>,
+    /// Enable CDN domain fronting fallback (default: disabled).
+    /// When `true`, the client falls back to CDN routing if direct
+    /// connection fails within `direct_timeout_secs`.
+    pub cdn_fronting_enabled: Option<bool>,
+    /// CDN fronting domain (e.g., `"prrr.tech"`).
+    /// Used for DNS resolution and TLS SNI when fronting through CDN.
+    pub cdn_fronting_domain: Option<String>,
+    /// Direct connection timeout in seconds before falling back to CDN (default: 5).
+    pub direct_timeout_secs: Option<u64>,
+    /// Interval in seconds between probing direct connection when CDN is active (default: 600).
+    pub direct_retry_interval_secs: Option<u64>,
 }
 
 /// `[obfuscation]` section in client config.
@@ -675,6 +704,8 @@ pub enum ResolvedTransport {
         websocket_enabled: bool,
         /// Whether HTTP polling fallback is enabled.
         polling_enabled: bool,
+        /// Whether HTTP/2 multiplexed streaming is enabled.
+        h2_streaming_enabled: bool,
         /// Session idle timeout in seconds.
         session_idle_timeout: u64,
         /// Optional TLS certificate path.
@@ -695,6 +726,7 @@ pub fn resolve_server_transports(config: &ServerConfig) -> Vec<ResolvedTransport
             return vec![ResolvedTransport::Harp {
                 websocket_enabled: true,
                 polling_enabled: true,
+                h2_streaming_enabled: true,
                 session_idle_timeout: DEFAULT_HARP_SESSION_IDLE_TIMEOUT,
                 tls_cert: None,
                 tls_key: None,
@@ -723,6 +755,7 @@ pub fn resolve_server_transports(config: &ServerConfig) -> Vec<ResolvedTransport
                 Some(ResolvedTransport::Harp {
                     websocket_enabled: h.websocket_enabled.unwrap_or(true),
                     polling_enabled: h.polling_enabled.unwrap_or(true),
+                    h2_streaming_enabled: h.h2_streaming_enabled.unwrap_or(true),
                     session_idle_timeout: h.session_idle_timeout.unwrap_or(DEFAULT_HARP_SESSION_IDLE_TIMEOUT),
                     tls_cert: h.tls_cert.clone(),
                     tls_key: h.tls_key.clone(),
@@ -1943,5 +1976,345 @@ name = "harp"
             }
             _ => panic!("expected Client command"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // FRD: specs/frds/FRD-20260224-tls-profile-config.md
+    // Step 1.1: tls_profile config field
+    // -----------------------------------------------------------------------
+
+    // AC-1: TOML with tls_profile = "chrome" parses to Some("chrome")
+    #[test]
+    fn client_transport_tls_profile_chrome() {
+        let toml_str = r#"
+[transport]
+protocol = "harp"
+tls_profile = "chrome"
+"#;
+        let config: ClientConfigFile = toml::from_str(toml_str).expect("parse client transport");
+        let transport = config.transport.expect("transport section present");
+        assert_eq!(
+            transport.tls_profile.as_deref(),
+            Some("chrome"),
+            "tls_profile should parse as Some(\"chrome\")"
+        );
+    }
+
+    // AC-2: TOML with tls_profile = "firefox" parses to Some("firefox")
+    #[test]
+    fn client_transport_tls_profile_firefox() {
+        let toml_str = r#"
+[transport]
+protocol = "harp"
+tls_profile = "firefox"
+"#;
+        let config: ClientConfigFile = toml::from_str(toml_str).expect("parse client transport");
+        let transport = config.transport.expect("transport section present");
+        assert_eq!(
+            transport.tls_profile.as_deref(),
+            Some("firefox"),
+            "tls_profile should parse as Some(\"firefox\")"
+        );
+    }
+
+    // AC-3: TOML with tls_profile = "default" parses to Some("default")
+    #[test]
+    fn client_transport_tls_profile_default_value() {
+        let toml_str = r#"
+[transport]
+protocol = "harp"
+tls_profile = "default"
+"#;
+        let config: ClientConfigFile = toml::from_str(toml_str).expect("parse client transport");
+        let transport = config.transport.expect("transport section present");
+        assert_eq!(
+            transport.tls_profile.as_deref(),
+            Some("default"),
+            "tls_profile should parse as Some(\"default\")"
+        );
+    }
+
+    // AC-4: TOML without tls_profile defaults to None
+    #[test]
+    fn client_transport_tls_profile_absent() {
+        let toml_str = r#"
+[transport]
+protocol = "harp"
+"#;
+        let config: ClientConfigFile = toml::from_str(toml_str).expect("parse client transport");
+        let transport = config.transport.expect("transport section present");
+        assert!(transport.tls_profile.is_none(), "tls_profile should be None when absent");
+    }
+
+    // AC-5: TOML with unknown tls_profile = "safari" preserves the raw string
+    #[test]
+    fn client_transport_tls_profile_unknown_preserved() {
+        let toml_str = r#"
+[transport]
+protocol = "harp"
+tls_profile = "safari"
+"#;
+        let config: ClientConfigFile = toml::from_str(toml_str).expect("parse client transport");
+        let transport = config.transport.expect("transport section present");
+        assert_eq!(
+            transport.tls_profile.as_deref(),
+            Some("safari"),
+            "unknown tls_profile should be preserved as raw string"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // FRD: specs/frds/FRD-20260224-cover-page-config.md
+    // Step 2.3: cover_page_enabled config field
+    // -----------------------------------------------------------------------
+
+    // AC-1: web_admin with cover_page_enabled = false parses correctly
+    #[test]
+    fn web_admin_cover_page_disabled() {
+        let toml_str = r#"
+[server]
+name = "test"
+
+[web_admin]
+enabled = true
+cover_page_enabled = false
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).expect("parse server config");
+        let web = config.web_admin.expect("web_admin section present");
+        assert_eq!(web.cover_page_enabled, Some(false));
+    }
+
+    // -----------------------------------------------------------------------
+    // FRD: specs/frds/FRD-20260224-cdn-fronting-config.md
+    // Step 3.1: CDN fronting config fields
+    // -----------------------------------------------------------------------
+
+    // AC-1: TOML with all CDN fronting fields parses correctly
+    #[test]
+    fn client_transport_cdn_fronting_full() {
+        let toml_str = r#"
+[transport]
+protocol = "harp"
+cdn_fronting_enabled = true
+cdn_fronting_domain = "prrr.tech"
+direct_timeout_secs = 10
+direct_retry_interval_secs = 300
+"#;
+        let config: ClientConfigFile = toml::from_str(toml_str).expect("parse client transport");
+        let transport = config.transport.expect("transport section present");
+        assert_eq!(transport.cdn_fronting_enabled, Some(true));
+        assert_eq!(transport.cdn_fronting_domain.as_deref(), Some("prrr.tech"));
+        assert_eq!(transport.direct_timeout_secs, Some(10));
+        assert_eq!(transport.direct_retry_interval_secs, Some(300));
+    }
+
+    // AC-2: TOML without CDN fields defaults all to None
+    #[test]
+    fn client_transport_cdn_fronting_absent() {
+        let toml_str = r#"
+[transport]
+protocol = "harp"
+"#;
+        let config: ClientConfigFile = toml::from_str(toml_str).expect("parse client transport");
+        let transport = config.transport.expect("transport section present");
+        assert!(transport.cdn_fronting_enabled.is_none());
+        assert!(transport.cdn_fronting_domain.is_none());
+        assert!(transport.direct_timeout_secs.is_none());
+        assert!(transport.direct_retry_interval_secs.is_none());
+    }
+
+    // AC-3: Partial CDN config (enabled=true, no domain) is representable
+    #[test]
+    fn client_transport_cdn_fronting_partial() {
+        let toml_str = r#"
+[transport]
+protocol = "harp"
+cdn_fronting_enabled = true
+direct_timeout_secs = 5
+"#;
+        let config: ClientConfigFile = toml::from_str(toml_str).expect("parse client transport");
+        let transport = config.transport.expect("transport section present");
+        assert_eq!(transport.cdn_fronting_enabled, Some(true));
+        assert!(transport.cdn_fronting_domain.is_none(), "domain should be None when absent");
+        assert_eq!(transport.direct_timeout_secs, Some(DEFAULT_DIRECT_TIMEOUT_SECS));
+        assert!(transport.direct_retry_interval_secs.is_none());
+    }
+
+    // AC-2: web_admin without cover_page_enabled defaults to None (caller defaults true)
+    #[test]
+    fn web_admin_cover_page_default() {
+        let toml_str = r#"
+[server]
+name = "test"
+
+[web_admin]
+enabled = true
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).expect("parse server config");
+        let web = config.web_admin.expect("web_admin section present");
+        assert!(web.cover_page_enabled.is_none(), "cover_page_enabled should be None when absent");
+    }
+
+    // -----------------------------------------------------------------------
+    // FRD: specs/frds/FRD-20260224-cdn-header-parsing.md
+    // Step 3.5: trust_proxy_headers config field
+    // -----------------------------------------------------------------------
+
+    // AC-1: web_admin with trust_proxy_headers = true parses correctly
+    #[test]
+    fn server_config_trust_proxy_headers_enabled() {
+        let toml_str = r#"
+[web_admin]
+enabled = true
+trust_proxy_headers = true
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).expect("parse server config");
+        let web = config.web_admin.expect("web_admin section present");
+        assert_eq!(web.trust_proxy_headers, Some(true));
+    }
+
+    // AC-2: web_admin with trust_proxy_headers = false parses correctly
+    #[test]
+    fn server_config_trust_proxy_headers_disabled() {
+        let toml_str = r#"
+[web_admin]
+enabled = true
+trust_proxy_headers = false
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).expect("parse server config");
+        let web = config.web_admin.expect("web_admin section present");
+        assert_eq!(web.trust_proxy_headers, Some(false));
+    }
+
+    // AC-3: web_admin without trust_proxy_headers defaults to None
+    #[test]
+    fn server_config_trust_proxy_headers_absent() {
+        let toml_str = r#"
+[web_admin]
+enabled = true
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).expect("parse server config");
+        let web = config.web_admin.expect("web_admin section present");
+        assert!(web.trust_proxy_headers.is_none(), "trust_proxy_headers should be None when absent");
+    }
+
+    // -----------------------------------------------------------------------
+    // FRD: specs/frds/FRD-20260224-h2-dependency-config.md
+    // Step 4.1: h2 dependency and config fields
+    // -----------------------------------------------------------------------
+
+    // AC-1: h2 crate is accessible (compile-time check)
+    #[test]
+    fn h2_crate_accessible() {
+        // Verify h2 types are usable — confirms the dependency compiles
+        let _reason = h2::Reason::NO_ERROR;
+    }
+
+    // AC-2: hyper http2 feature is active (compile-time check)
+    #[test]
+    fn hyper_http2_feature_active() {
+        // http2::Builder is only available when hyper's "http2" feature is enabled
+        let _builder = hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
+    }
+
+    // AC-3: Server HARP config with h2_streaming_enabled = true parses
+    #[test]
+    fn harp_config_h2_enabled() {
+        let toml_str = r#"
+[[transports]]
+name = "harp"
+h2_streaming_enabled = true
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).expect("parse harp h2 enabled");
+        let transports = config.transports.expect("transports present");
+        match &transports[0] {
+            TransportEntry::Harp(h) => {
+                assert_eq!(h.h2_streaming_enabled, Some(true));
+            }
+            _ => panic!("expected Harp entry"),
+        }
+    }
+
+    // AC-4: Server HARP config with h2_streaming_enabled = false parses
+    #[test]
+    fn harp_config_h2_disabled() {
+        let toml_str = r#"
+[[transports]]
+name = "harp"
+h2_streaming_enabled = false
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).expect("parse harp h2 disabled");
+        let transports = config.transports.expect("transports present");
+        match &transports[0] {
+            TransportEntry::Harp(h) => {
+                assert_eq!(h.h2_streaming_enabled, Some(false));
+            }
+            _ => panic!("expected Harp entry"),
+        }
+    }
+
+    // AC-5: Server HARP config without h2_streaming_enabled defaults to None
+    #[test]
+    fn harp_config_h2_absent() {
+        let toml_str = r#"
+[[transports]]
+name = "harp"
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).expect("parse harp without h2");
+        let transports = config.transports.expect("transports present");
+        match &transports[0] {
+            TransportEntry::Harp(h) => {
+                assert!(h.h2_streaming_enabled.is_none(), "h2_streaming_enabled should be None when absent");
+            }
+            _ => panic!("expected Harp entry"),
+        }
+    }
+
+    // AC-6: resolve_server_transports resolves h2_streaming_enabled default to true
+    #[test]
+    fn resolve_harp_h2_default_true() {
+        let toml_str = r#"
+[[transports]]
+name = "harp"
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).expect("parse");
+        let resolved = resolve_server_transports(&config);
+        match &resolved[0] {
+            ResolvedTransport::Harp { h2_streaming_enabled, .. } => {
+                assert!(*h2_streaming_enabled, "h2_streaming_enabled should default to true");
+            }
+            _ => panic!("expected Harp"),
+        }
+    }
+
+    // AC-7: resolve_server_transports preserves explicit h2_streaming_enabled = false
+    #[test]
+    fn resolve_harp_h2_explicit_false() {
+        let toml_str = r#"
+[[transports]]
+name = "harp"
+h2_streaming_enabled = false
+"#;
+        let config: ServerConfig = toml::from_str(toml_str).expect("parse");
+        let resolved = resolve_server_transports(&config);
+        match &resolved[0] {
+            ResolvedTransport::Harp { h2_streaming_enabled, .. } => {
+                assert!(!*h2_streaming_enabled, "h2_streaming_enabled should be false when explicitly set");
+            }
+            _ => panic!("expected Harp"),
+        }
+    }
+
+    // AC-8: Client config preferred_binding = "h2" parses correctly
+    #[test]
+    fn client_preferred_binding_h2() {
+        let toml_str = r#"
+[transport]
+protocol = "harp"
+preferred_binding = "h2"
+"#;
+        let config: ClientConfigFile = toml::from_str(toml_str).expect("parse client h2 binding");
+        let transport = config.transport.expect("transport section present");
+        assert_eq!(transport.preferred_binding.as_deref(), Some("h2"));
     }
 }

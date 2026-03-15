@@ -93,6 +93,16 @@ pub struct ReconnectConfig {
     pub backoff_max_ms: u64,
 }
 
+/// Cryptographic material needed for each reconnection handshake.
+pub struct ReconnectCryptoParams<'a> {
+    /// Client's Noise IK keypair.
+    pub noise_keypair: &'a KeyPair,
+    /// Server's Noise IK public key.
+    pub server_noise_pub: &'a [u8; 32],
+    /// Server's ML-KEM-768 encapsulation key.
+    pub server_kem_pub: &'a [u8],
+}
+
 /// Run the VPN client with automatic reconnection on transport failure.
 ///
 /// Creates a new session (new handshake, new keys) on each reconnection
@@ -106,9 +116,7 @@ pub struct ReconnectConfig {
 /// Only retries on transport/pipeline errors, not on cancellation.
 pub async fn run_with_reconnect<T: TunDevice + Clone>(
     transport: &dyn ClientTransport,
-    noise_keypair: &KeyPair,
-    server_noise_pub: &[u8; 32],
-    server_kem_pub: &[u8],
+    crypto: &ReconnectCryptoParams<'_>,
     tun: T,
     config: &ReconnectConfig,
     mut route_manager: Option<&mut crate::routing::RouteManager>,
@@ -118,9 +126,9 @@ pub async fn run_with_reconnect<T: TunDevice + Clone>(
 
     loop {
         let params = ClientConnectParams {
-            noise_keypair,
-            server_noise_pub,
-            server_kem_pub,
+            noise_keypair: crypto.noise_keypair,
+            server_noise_pub: crypto.server_noise_pub,
+            server_kem_pub: crypto.server_kem_pub,
             cancel: cancel.clone(),
         };
 
@@ -443,11 +451,28 @@ mod tests {
         }
     }
 
-    fn test_keypair_and_keys() -> (KeyPair, [u8; 32], Vec<u8>) {
-        let noise_keypair = KeyPair::generate().expect("keygen");
-        let server_noise_pub = [0xAA; 32];
-        let server_kem_pub = vec![0xBB; 64];
-        (noise_keypair, server_noise_pub, server_kem_pub)
+    struct TestCryptoMaterial {
+        noise_keypair: KeyPair,
+        server_noise_pub: [u8; 32],
+        server_kem_pub: Vec<u8>,
+    }
+
+    impl TestCryptoMaterial {
+        fn new() -> Self {
+            Self {
+                noise_keypair: KeyPair::generate().expect("keygen"),
+                server_noise_pub: [0xAA; 32],
+                server_kem_pub: vec![0xBB; 64],
+            }
+        }
+
+        fn as_params(&self) -> ReconnectCryptoParams<'_> {
+            ReconnectCryptoParams {
+                noise_keypair: &self.noise_keypair,
+                server_noise_pub: &self.server_noise_pub,
+                server_kem_pub: &self.server_kem_pub,
+            }
+        }
     }
 
     #[tokio::test]
@@ -458,7 +483,7 @@ mod tests {
         let connect_count = Arc::new(AtomicU32::new(0));
         let transport = FailNTransport::new(2, Arc::clone(&connect_count));
 
-        let (noise_keypair, server_noise_pub, server_kem_pub) = test_keypair_and_keys();
+        let crypto = TestCryptoMaterial::new();
         let (tun, _handle) = MockTun::new(DEFAULT_TUNNEL_MTU);
         let tun = Arc::new(tun);
         let cancel = CancellationToken::new();
@@ -481,17 +506,7 @@ mod tests {
             cancel_clone.cancel();
         });
 
-        let result = run_with_reconnect(
-            &transport,
-            &noise_keypair,
-            &server_noise_pub,
-            &server_kem_pub,
-            tun,
-            &config,
-            None,
-            cancel,
-        )
-        .await;
+        let result = run_with_reconnect(&transport, &crypto.as_params(), tun, &config, None, cancel).await;
 
         assert!(result.is_ok());
     }
@@ -504,7 +519,7 @@ mod tests {
         let connect_count = Arc::new(AtomicU32::new(0));
         let transport = FailNTransport::new(0, Arc::clone(&connect_count));
 
-        let (noise_keypair, server_noise_pub, server_kem_pub) = test_keypair_and_keys();
+        let crypto = TestCryptoMaterial::new();
         let (tun, _handle) = MockTun::new(DEFAULT_TUNNEL_MTU);
         let tun = Arc::new(tun);
         let cancel = CancellationToken::new();
@@ -526,17 +541,7 @@ mod tests {
             cancel_clone.cancel();
         });
 
-        let result = run_with_reconnect(
-            &transport,
-            &noise_keypair,
-            &server_noise_pub,
-            &server_kem_pub,
-            tun,
-            &config,
-            None,
-            cancel,
-        )
-        .await;
+        let result = run_with_reconnect(&transport, &crypto.as_params(), tun, &config, None, cancel).await;
 
         assert!(result.is_ok());
     }
@@ -551,7 +556,7 @@ mod tests {
             connect_count: Arc::clone(&connect_count),
         };
 
-        let (noise_keypair, server_noise_pub, server_kem_pub) = test_keypair_and_keys();
+        let crypto = TestCryptoMaterial::new();
         let (tun, _handle) = MockTun::new(DEFAULT_TUNNEL_MTU);
         let tun = Arc::new(tun);
         let cancel = CancellationToken::new();
@@ -575,17 +580,7 @@ mod tests {
             cancel_clone.cancel();
         });
 
-        let result = run_with_reconnect(
-            &transport,
-            &noise_keypair,
-            &server_noise_pub,
-            &server_kem_pub,
-            tun,
-            &config,
-            None,
-            cancel,
-        )
-        .await;
+        let result = run_with_reconnect(&transport, &crypto.as_params(), tun, &config, None, cancel).await;
 
         assert!(result.is_ok());
         assert!(connect_count.load(Ordering::Relaxed) >= min_connect_attempts);

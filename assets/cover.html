@@ -1,0 +1,1269 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>PRRR Vision — Intelligent Video Surveillance</title>
+        <meta name="description" content="PRRR Vision provides AI-powered video surveillance solutions for businesses and homes. Motion detection, cloud recording, and real-time alerts." />
+        <meta property="og:title" content="PRRR Vision — Intelligent Video Surveillance" />
+        <meta property="og:description" content="AI-powered video surveillance for the modern world. Protect what matters most." />
+        <meta property="og:image" content="/assets/logo_w_text.png" />
+        <meta property="og:type" content="website" />
+        <link rel="icon" type="image/png" href="/assets/logo_w.png" />
+        <style>
+            :root {
+                --bg: #000000;
+                --surface: #111111;
+                --surface-alt: #1a1a1a;
+                --border: #333333;
+                --text: #ffffff;
+                --text-dim: #a0a0a0;
+                --text-muted: #666666;
+                --primary: #ffffff;
+                --primary-text: #000000;
+                --accent: #3b82f6;
+                --accent-hover: #2563eb;
+                --success: #22c55e;
+                --radius: 8px;
+                --radius-lg: 16px;
+                --transition: 150ms ease;
+                --max-width: 1200px;
+            }
+
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+
+            html {
+                scroll-behavior: smooth;
+            }
+
+            body {
+                font-family:
+                    -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+                    sans-serif;
+                background: var(--bg);
+                color: var(--text);
+                line-height: 1.6;
+                min-height: 100vh;
+            }
+
+            /* Navigation */
+            .nav {
+                position: fixed;
+                top: 0;
+                left: 0;
+                right: 0;
+                z-index: 100;
+                background: rgba(0, 0, 0, 0.9);
+                backdrop-filter: blur(12px);
+                border-bottom: 1px solid var(--border);
+                padding: 0 24px;
+            }
+
+            .nav-inner {
+                max-width: var(--max-width);
+                margin: 0 auto;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                height: 72px;
+            }
+
+            .nav-logo {
+                height: 40px;
+            }
+
+            .nav-links {
+                display: flex;
+                gap: 32px;
+                list-style: none;
+            }
+
+            .nav-links a {
+                color: var(--text-dim);
+                text-decoration: none;
+                font-size: 14px;
+                font-weight: 500;
+                transition: color var(--transition);
+            }
+
+            .nav-links a:hover {
+                color: var(--text);
+            }
+
+            .nav-cta {
+                display: inline-block;
+                background: var(--primary);
+                color: var(--primary-text);
+                padding: 8px 20px;
+                border-radius: var(--radius);
+                text-decoration: none;
+                font-size: 14px;
+                font-weight: 600;
+                transition: opacity var(--transition);
+            }
+
+            .nav-cta:hover {
+                opacity: 0.9;
+            }
+
+            .nav-mobile-toggle {
+                display: none;
+                background: none;
+                border: none;
+                color: var(--text);
+                font-size: 24px;
+                cursor: pointer;
+            }
+
+            /* Hero */
+            .hero {
+                padding: 160px 24px 100px;
+                text-align: center;
+                background: linear-gradient(180deg, rgba(59, 130, 246, 0.06) 0%, var(--bg) 100%);
+            }
+
+            .hero-inner {
+                max-width: 800px;
+                margin: 0 auto;
+            }
+
+            .hero-badge {
+                display: inline-block;
+                background: var(--surface);
+                border: 1px solid var(--border);
+                border-radius: 20px;
+                padding: 6px 16px;
+                font-size: 13px;
+                color: var(--text-dim);
+                margin-bottom: 24px;
+            }
+
+            .hero h1 {
+                font-size: 56px;
+                font-weight: 700;
+                line-height: 1.1;
+                margin-bottom: 20px;
+                letter-spacing: -0.02em;
+            }
+
+            .hero h1 span {
+                background: linear-gradient(135deg, var(--accent), #8b5cf6);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+                background-clip: text;
+            }
+
+            .hero p {
+                font-size: 20px;
+                color: var(--text-dim);
+                max-width: 600px;
+                margin: 0 auto 40px;
+                line-height: 1.7;
+            }
+
+            .hero-buttons {
+                display: flex;
+                gap: 16px;
+                justify-content: center;
+                flex-wrap: wrap;
+            }
+
+            .btn-primary {
+                display: inline-flex;
+                align-items: center;
+                gap: 8px;
+                background: var(--primary);
+                color: var(--primary-text);
+                padding: 14px 28px;
+                border-radius: var(--radius);
+                text-decoration: none;
+                font-size: 16px;
+                font-weight: 600;
+                transition: opacity var(--transition);
+            }
+
+            .btn-primary:hover {
+                opacity: 0.9;
+            }
+
+            .btn-secondary {
+                display: inline-flex;
+                align-items: center;
+                gap: 8px;
+                background: transparent;
+                color: var(--text);
+                padding: 14px 28px;
+                border-radius: var(--radius);
+                border: 1px solid var(--border);
+                text-decoration: none;
+                font-size: 16px;
+                font-weight: 500;
+                transition: border-color var(--transition), background var(--transition);
+            }
+
+            .btn-secondary:hover {
+                border-color: var(--text-dim);
+                background: var(--surface);
+            }
+
+            /* Stats */
+            .stats {
+                padding: 60px 24px;
+                border-top: 1px solid var(--border);
+                border-bottom: 1px solid var(--border);
+            }
+
+            .stats-inner {
+                max-width: var(--max-width);
+                margin: 0 auto;
+                display: grid;
+                grid-template-columns: repeat(4, 1fr);
+                gap: 32px;
+                text-align: center;
+            }
+
+            .stat-value {
+                font-size: 40px;
+                font-weight: 700;
+                letter-spacing: -0.02em;
+                margin-bottom: 4px;
+            }
+
+            .stat-label {
+                font-size: 14px;
+                color: var(--text-dim);
+            }
+
+            /* Section */
+            .section {
+                padding: 100px 24px;
+            }
+
+            .section-header {
+                text-align: center;
+                margin-bottom: 64px;
+            }
+
+            .section-tag {
+                font-size: 13px;
+                font-weight: 600;
+                color: var(--accent);
+                text-transform: uppercase;
+                letter-spacing: 0.1em;
+                margin-bottom: 12px;
+            }
+
+            .section-header h2 {
+                font-size: 40px;
+                font-weight: 700;
+                line-height: 1.2;
+                margin-bottom: 16px;
+                letter-spacing: -0.01em;
+            }
+
+            .section-header p {
+                font-size: 18px;
+                color: var(--text-dim);
+                max-width: 600px;
+                margin: 0 auto;
+            }
+
+            /* Features */
+            .features-grid {
+                max-width: var(--max-width);
+                margin: 0 auto;
+                display: grid;
+                grid-template-columns: repeat(3, 1fr);
+                gap: 24px;
+            }
+
+            .feature-card {
+                background: var(--surface);
+                border: 1px solid var(--border);
+                border-radius: var(--radius-lg);
+                padding: 32px;
+                transition: border-color var(--transition), transform var(--transition);
+            }
+
+            .feature-card:hover {
+                border-color: var(--text-dim);
+                transform: translateY(-2px);
+            }
+
+            .feature-icon {
+                width: 48px;
+                height: 48px;
+                background: var(--surface-alt);
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 24px;
+                margin-bottom: 20px;
+            }
+
+            .feature-card h3 {
+                font-size: 18px;
+                font-weight: 600;
+                margin-bottom: 8px;
+            }
+
+            .feature-card p {
+                font-size: 14px;
+                color: var(--text-dim);
+                line-height: 1.7;
+            }
+
+            /* How it works */
+            .steps-grid {
+                max-width: var(--max-width);
+                margin: 0 auto;
+                display: grid;
+                grid-template-columns: repeat(3, 1fr);
+                gap: 32px;
+            }
+
+            .step-card {
+                text-align: center;
+                padding: 32px 24px;
+            }
+
+            .step-number {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                width: 56px;
+                height: 56px;
+                border-radius: 50%;
+                background: var(--surface);
+                border: 1px solid var(--border);
+                font-size: 24px;
+                font-weight: 700;
+                margin-bottom: 20px;
+            }
+
+            .step-card h3 {
+                font-size: 18px;
+                font-weight: 600;
+                margin-bottom: 8px;
+            }
+
+            .step-card p {
+                font-size: 14px;
+                color: var(--text-dim);
+                line-height: 1.7;
+            }
+
+            /* Pricing */
+            .pricing-grid {
+                max-width: var(--max-width);
+                margin: 0 auto;
+                display: grid;
+                grid-template-columns: repeat(3, 1fr);
+                gap: 24px;
+                align-items: start;
+            }
+
+            .pricing-card {
+                background: var(--surface);
+                border: 1px solid var(--border);
+                border-radius: var(--radius-lg);
+                padding: 40px 32px;
+                text-align: center;
+                transition: border-color var(--transition);
+            }
+
+            .pricing-card.featured {
+                border-color: var(--accent);
+                position: relative;
+            }
+
+            .pricing-card.featured::before {
+                content: "Most Popular";
+                position: absolute;
+                top: -12px;
+                left: 50%;
+                transform: translateX(-50%);
+                background: var(--accent);
+                color: var(--text);
+                font-size: 12px;
+                font-weight: 600;
+                padding: 4px 16px;
+                border-radius: 12px;
+            }
+
+            .pricing-card:hover {
+                border-color: var(--text-dim);
+            }
+
+            .pricing-name {
+                font-size: 18px;
+                font-weight: 600;
+                margin-bottom: 8px;
+            }
+
+            .pricing-desc {
+                font-size: 14px;
+                color: var(--text-dim);
+                margin-bottom: 24px;
+            }
+
+            .pricing-price {
+                font-size: 48px;
+                font-weight: 700;
+                letter-spacing: -0.02em;
+                margin-bottom: 4px;
+            }
+
+            .pricing-price span {
+                font-size: 16px;
+                font-weight: 400;
+                color: var(--text-dim);
+            }
+
+            .pricing-period {
+                font-size: 14px;
+                color: var(--text-dim);
+                margin-bottom: 32px;
+            }
+
+            .pricing-features {
+                list-style: none;
+                text-align: left;
+                margin-bottom: 32px;
+            }
+
+            .pricing-features li {
+                font-size: 14px;
+                color: var(--text-dim);
+                padding: 8px 0;
+                border-bottom: 1px solid var(--border);
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+
+            .pricing-features li::before {
+                content: "\2713";
+                color: var(--success);
+                font-weight: 700;
+            }
+
+            .pricing-btn {
+                display: block;
+                width: 100%;
+                padding: 12px;
+                border-radius: var(--radius);
+                text-decoration: none;
+                font-size: 14px;
+                font-weight: 600;
+                text-align: center;
+                transition: opacity var(--transition);
+            }
+
+            .pricing-btn-primary {
+                background: var(--primary);
+                color: var(--primary-text);
+            }
+
+            .pricing-btn-secondary {
+                background: transparent;
+                color: var(--text);
+                border: 1px solid var(--border);
+            }
+
+            .pricing-btn:hover {
+                opacity: 0.9;
+            }
+
+            /* About */
+            .about-grid {
+                max-width: var(--max-width);
+                margin: 0 auto;
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 64px;
+                align-items: center;
+            }
+
+            .about-content h2 {
+                font-size: 36px;
+                font-weight: 700;
+                margin-bottom: 16px;
+                letter-spacing: -0.01em;
+            }
+
+            .about-content p {
+                font-size: 16px;
+                color: var(--text-dim);
+                line-height: 1.8;
+                margin-bottom: 16px;
+            }
+
+            .about-stats {
+                display: grid;
+                grid-template-columns: repeat(2, 1fr);
+                gap: 24px;
+                margin-top: 32px;
+            }
+
+            .about-stat {
+                padding: 24px;
+                background: var(--surface);
+                border: 1px solid var(--border);
+                border-radius: var(--radius);
+            }
+
+            .about-stat-value {
+                font-size: 28px;
+                font-weight: 700;
+                margin-bottom: 4px;
+            }
+
+            .about-stat-label {
+                font-size: 13px;
+                color: var(--text-dim);
+            }
+
+            /* CTA */
+            .cta {
+                padding: 100px 24px;
+                text-align: center;
+                background: linear-gradient(180deg, var(--bg) 0%, rgba(59, 130, 246, 0.04) 100%);
+            }
+
+            .cta h2 {
+                font-size: 40px;
+                font-weight: 700;
+                margin-bottom: 16px;
+                letter-spacing: -0.01em;
+            }
+
+            .cta p {
+                font-size: 18px;
+                color: var(--text-dim);
+                margin-bottom: 32px;
+                max-width: 500px;
+                margin-left: auto;
+                margin-right: auto;
+            }
+
+            /* Footer */
+            .footer {
+                border-top: 1px solid var(--border);
+                padding: 60px 24px 40px;
+            }
+
+            .footer-inner {
+                max-width: var(--max-width);
+                margin: 0 auto;
+                display: grid;
+                grid-template-columns: 2fr 1fr 1fr 1fr;
+                gap: 48px;
+            }
+
+            .footer-brand p {
+                font-size: 14px;
+                color: var(--text-dim);
+                margin-top: 16px;
+                line-height: 1.7;
+                max-width: 280px;
+            }
+
+            .footer-col h4 {
+                font-size: 14px;
+                font-weight: 600;
+                margin-bottom: 16px;
+            }
+
+            .footer-col ul {
+                list-style: none;
+            }
+
+            .footer-col li {
+                margin-bottom: 8px;
+            }
+
+            .footer-col a {
+                font-size: 14px;
+                color: var(--text-dim);
+                text-decoration: none;
+                transition: color var(--transition);
+            }
+
+            .footer-col a:hover {
+                color: var(--text);
+            }
+
+            .footer-bottom {
+                max-width: var(--max-width);
+                margin: 40px auto 0;
+                padding-top: 24px;
+                border-top: 1px solid var(--border);
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                font-size: 13px;
+                color: var(--text-muted);
+            }
+
+            .footer-bottom-links {
+                display: flex;
+                gap: 24px;
+            }
+
+            .footer-bottom-links a {
+                color: var(--text-muted);
+                text-decoration: none;
+                transition: color var(--transition);
+            }
+
+            .footer-bottom-links a:hover {
+                color: var(--text-dim);
+            }
+
+            /* Responsive */
+            @media (max-width: 768px) {
+                .nav-links {
+                    display: none;
+                }
+
+                .nav-cta {
+                    display: none;
+                }
+
+                .nav-mobile-toggle {
+                    display: block;
+                }
+
+                .hero {
+                    padding: 120px 24px 60px;
+                }
+
+                .hero h1 {
+                    font-size: 36px;
+                }
+
+                .hero p {
+                    font-size: 16px;
+                }
+
+                .stats-inner {
+                    grid-template-columns: repeat(2, 1fr);
+                    gap: 24px;
+                }
+
+                .stat-value {
+                    font-size: 28px;
+                }
+
+                .features-grid,
+                .steps-grid,
+                .pricing-grid {
+                    grid-template-columns: 1fr;
+                    gap: 16px;
+                }
+
+                .about-grid {
+                    grid-template-columns: 1fr;
+                    gap: 32px;
+                }
+
+                .section-header h2 {
+                    font-size: 28px;
+                }
+
+                .cta h2 {
+                    font-size: 28px;
+                }
+
+                .footer-inner {
+                    grid-template-columns: 1fr 1fr;
+                    gap: 32px;
+                }
+
+                .footer-bottom {
+                    flex-direction: column;
+                    gap: 16px;
+                    text-align: center;
+                }
+            }
+
+            @media (max-width: 480px) {
+                .hero h1 {
+                    font-size: 28px;
+                }
+
+                .hero-buttons {
+                    flex-direction: column;
+                    align-items: center;
+                }
+
+                .stats-inner {
+                    grid-template-columns: 1fr;
+                }
+
+                .about-stats {
+                    grid-template-columns: 1fr;
+                }
+
+                .footer-inner {
+                    grid-template-columns: 1fr;
+                }
+
+                .pricing-price {
+                    font-size: 36px;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <!-- Navigation -->
+        <nav class="nav">
+            <div class="nav-inner">
+                <img src="/assets/logo_w_text.png" alt="PRRR Vision" class="nav-logo" />
+                <ul class="nav-links">
+                    <li><a href="#features">Features</a></li>
+                    <li><a href="#how-it-works">How It Works</a></li>
+                    <li><a href="#pricing">Pricing</a></li>
+                    <li><a href="#about">About</a></li>
+                </ul>
+                <a href="#pricing" class="nav-cta">Get Started</a>
+                <button class="nav-mobile-toggle" aria-label="Toggle menu">&#9776;</button>
+            </div>
+        </nav>
+
+        <!-- Hero -->
+        <section class="hero">
+            <div class="hero-inner">
+                <div class="hero-badge">Trusted by 10,000+ businesses worldwide</div>
+                <h1>Intelligent Video<br /><span>Surveillance</span> Solutions</h1>
+                <p>
+                    AI-powered cameras that detect, record, and alert in real time.
+                    Protect your premises with enterprise-grade monitoring built for
+                    the modern world.
+                </p>
+                <div class="hero-buttons">
+                    <a href="#pricing" class="btn-primary">Start Free Trial &#8594;</a>
+                    <a href="#features" class="btn-secondary">Explore Features</a>
+                </div>
+            </div>
+        </section>
+
+        <!-- Stats -->
+        <section class="stats">
+            <div class="stats-inner">
+                <div>
+                    <div class="stat-value">10K+</div>
+                    <div class="stat-label">Active installations</div>
+                </div>
+                <div>
+                    <div class="stat-value">99.97%</div>
+                    <div class="stat-label">Uptime guarantee</div>
+                </div>
+                <div>
+                    <div class="stat-value">50ms</div>
+                    <div class="stat-label">Alert latency</div>
+                </div>
+                <div>
+                    <div class="stat-value">4K</div>
+                    <div class="stat-label">Resolution support</div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Features -->
+        <section class="section" id="features">
+            <div class="section-header">
+                <div class="section-tag">Features</div>
+                <h2>Everything you need for<br />complete surveillance</h2>
+                <p>
+                    From AI-driven analytics to seamless cloud integration,
+                    PRRR Vision covers every aspect of modern security monitoring.
+                </p>
+            </div>
+            <div class="features-grid">
+                <div class="feature-card">
+                    <div class="feature-icon">&#128065;</div>
+                    <h3>AI Motion Detection</h3>
+                    <p>
+                        Advanced neural networks distinguish between humans, vehicles,
+                        and animals. Reduce false alarms by up to 95% with intelligent
+                        object classification and zone-based triggering.
+                    </p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">&#9729;</div>
+                    <h3>Cloud Recording</h3>
+                    <p>
+                        Encrypted cloud storage with configurable retention policies.
+                        Access recordings from anywhere, anytime. Automatic backup
+                        ensures footage is never lost due to hardware failure.
+                    </p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">&#127909;</div>
+                    <h3>Multi-Camera Management</h3>
+                    <p>
+                        Manage hundreds of cameras from a single dashboard. Grid view,
+                        PTZ control, and camera grouping make large deployments simple
+                        and efficient to operate.
+                    </p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">&#128241;</div>
+                    <h3>Mobile Application</h3>
+                    <p>
+                        Native iOS and Android apps with live streaming, push notifications,
+                        and two-way audio. Monitor your premises on the go with real-time
+                        feeds optimized for mobile networks.
+                    </p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">&#127769;</div>
+                    <h3>Night Vision</h3>
+                    <p>
+                        IR illumination provides clear footage in complete darkness up to
+                        30 meters. Smart IR adjusts intensity automatically to prevent
+                        overexposure in close-range scenarios.
+                    </p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">&#128274;</div>
+                    <h3>Access Control</h3>
+                    <p>
+                        Integrate with door locks, gates, and barriers. Facial recognition
+                        and license plate reading enable automated access decisions for
+                        authorized personnel and vehicles.
+                    </p>
+                </div>
+            </div>
+        </section>
+
+        <!-- How It Works -->
+        <section class="section" id="how-it-works" style="background: var(--surface)">
+            <div class="section-header">
+                <div class="section-tag">How It Works</div>
+                <h2>Up and running in minutes</h2>
+                <p>
+                    Our streamlined setup process gets your surveillance system
+                    operational with minimal configuration.
+                </p>
+            </div>
+            <div class="steps-grid">
+                <div class="step-card">
+                    <div class="step-number">1</div>
+                    <h3>Connect Cameras</h3>
+                    <p>
+                        Plug in your cameras and connect to your local network. PRRR Vision
+                        automatically discovers compatible devices via ONVIF and RTSP.
+                    </p>
+                </div>
+                <div class="step-card">
+                    <div class="step-number">2</div>
+                    <h3>Configure Zones</h3>
+                    <p>
+                        Draw detection zones, set sensitivity levels, and choose alert types
+                        through our intuitive web interface. Templates make common setups instant.
+                    </p>
+                </div>
+                <div class="step-card">
+                    <div class="step-number">3</div>
+                    <h3>Monitor &amp; Respond</h3>
+                    <p>
+                        Receive real-time alerts on your phone, review AI-tagged events, and
+                        access recordings from any device. Your surveillance runs 24/7 autonomously.
+                    </p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Pricing -->
+        <section class="section" id="pricing">
+            <div class="section-header">
+                <div class="section-tag">Pricing</div>
+                <h2>Plans for every scale</h2>
+                <p>
+                    Start with a free trial. Upgrade as your monitoring needs grow.
+                    All plans include automatic updates and technical support.
+                </p>
+            </div>
+            <div class="pricing-grid">
+                <div class="pricing-card">
+                    <div class="pricing-name">Starter</div>
+                    <div class="pricing-desc">For homes and small offices</div>
+                    <div class="pricing-price">$29 <span>/ mo</span></div>
+                    <div class="pricing-period">per location, billed annually</div>
+                    <ul class="pricing-features">
+                        <li>Up to 8 cameras</li>
+                        <li>7-day cloud recording</li>
+                        <li>AI motion detection</li>
+                        <li>Mobile app access</li>
+                        <li>Email alerts</li>
+                    </ul>
+                    <a href="#" class="pricing-btn pricing-btn-secondary">Start Free Trial</a>
+                </div>
+                <div class="pricing-card featured">
+                    <div class="pricing-name">Professional</div>
+                    <div class="pricing-desc">For growing businesses</div>
+                    <div class="pricing-price">$79 <span>/ mo</span></div>
+                    <div class="pricing-period">per location, billed annually</div>
+                    <ul class="pricing-features">
+                        <li>Up to 32 cameras</li>
+                        <li>30-day cloud recording</li>
+                        <li>AI analytics dashboard</li>
+                        <li>Multi-site management</li>
+                        <li>Priority support</li>
+                        <li>Access control integration</li>
+                    </ul>
+                    <a href="#" class="pricing-btn pricing-btn-primary">Start Free Trial</a>
+                </div>
+                <div class="pricing-card">
+                    <div class="pricing-name">Enterprise</div>
+                    <div class="pricing-desc">For large organizations</div>
+                    <div class="pricing-price">Custom</div>
+                    <div class="pricing-period">tailored to your requirements</div>
+                    <ul class="pricing-features">
+                        <li>Unlimited cameras</li>
+                        <li>90-day cloud recording</li>
+                        <li>On-premises option</li>
+                        <li>Dedicated account manager</li>
+                        <li>Custom integrations</li>
+                        <li>SLA guarantee</li>
+                    </ul>
+                    <a href="#" class="pricing-btn pricing-btn-secondary">Contact Sales</a>
+                </div>
+            </div>
+        </section>
+
+        <!-- About -->
+        <section class="section" id="about" style="background: var(--surface)">
+            <div class="about-grid">
+                <div class="about-content">
+                    <div class="section-tag">About Us</div>
+                    <h2>Built by security professionals</h2>
+                    <p>
+                        PRRR Vision was founded by a team of engineers and security consultants
+                        who saw an opportunity to bring enterprise-grade surveillance to businesses
+                        of every size. Our platform combines years of field experience with
+                        cutting-edge AI research.
+                    </p>
+                    <p>
+                        Headquartered in Tallinn, Estonia, with engineering offices in Berlin and
+                        Singapore, we serve customers across 40 countries. Our systems process
+                        millions of video frames daily, delivering reliable protection around
+                        the clock.
+                    </p>
+                </div>
+                <div>
+                    <div class="about-stats">
+                        <div class="about-stat">
+                            <div class="about-stat-value">2019</div>
+                            <div class="about-stat-label">Founded</div>
+                        </div>
+                        <div class="about-stat">
+                            <div class="about-stat-value">120+</div>
+                            <div class="about-stat-label">Team members</div>
+                        </div>
+                        <div class="about-stat">
+                            <div class="about-stat-value">40</div>
+                            <div class="about-stat-label">Countries served</div>
+                        </div>
+                        <div class="about-stat">
+                            <div class="about-stat-value">$18M</div>
+                            <div class="about-stat-label">Series A funding</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Testimonials -->
+        <section class="section" id="testimonials">
+            <div class="section-header">
+                <div class="section-tag">Testimonials</div>
+                <h2>Trusted by security professionals</h2>
+                <p>
+                    See what our customers say about their experience with
+                    PRRR Vision surveillance solutions.
+                </p>
+            </div>
+            <div class="features-grid">
+                <div class="feature-card">
+                    <p style="font-style: italic; margin-bottom: 16px; font-size: 15px; line-height: 1.8">
+                        "We deployed PRRR Vision across all 12 of our retail locations in under a week.
+                        The AI motion detection reduced our false alarm rate from over 200 per day to
+                        fewer than 5. The installation team was professional and the support has been
+                        outstanding throughout the entire process."
+                    </p>
+                    <div style="display: flex; align-items: center; gap: 12px">
+                        <div style="width: 40px; height: 40px; border-radius: 50%; background: var(--surface-alt); border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; font-weight: 600">MK</div>
+                        <div>
+                            <div style="font-weight: 600; font-size: 14px">Marcus Keller</div>
+                            <div style="font-size: 13px; color: var(--text-dim)">Director of Security, NordMart Retail Group</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="feature-card">
+                    <p style="font-style: italic; margin-bottom: 16px; font-size: 15px; line-height: 1.8">
+                        "The cloud recording with automatic failover gives us peace of mind that we never
+                        had with our previous on-premises NVR system. Even when our office internet went
+                        down during a storm, the cameras continued recording locally and synced everything
+                        once connectivity was restored."
+                    </p>
+                    <div style="display: flex; align-items: center; gap: 12px">
+                        <div style="width: 40px; height: 40px; border-radius: 50%; background: var(--surface-alt); border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; font-weight: 600">SV</div>
+                        <div>
+                            <div style="font-weight: 600; font-size: 14px">Sandra Vogt</div>
+                            <div style="font-size: 13px; color: var(--text-dim)">Facility Manager, TechPark Innovation Center</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="feature-card">
+                    <p style="font-style: italic; margin-bottom: 16px; font-size: 15px; line-height: 1.8">
+                        "As a property management company overseeing 50+ residential buildings, we needed
+                        a solution that could scale without overwhelming our small security team. PRRR
+                        Vision's multi-site dashboard and automated alerts have been a game changer for
+                        our operations and response times."
+                    </p>
+                    <div style="display: flex; align-items: center; gap: 12px">
+                        <div style="width: 40px; height: 40px; border-radius: 50%; background: var(--surface-alt); border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; font-weight: 600">JL</div>
+                        <div>
+                            <div style="font-weight: 600; font-size: 14px">Johan Lindqvist</div>
+                            <div style="font-size: 13px; color: var(--text-dim)">CEO, BalticProperties Management</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Technical Specs -->
+        <section class="section" style="background: var(--surface)">
+            <div class="section-header">
+                <div class="section-tag">Technical Specifications</div>
+                <h2>Enterprise-grade infrastructure</h2>
+                <p>
+                    Built on reliable, modern infrastructure designed for
+                    24/7 operation with minimal maintenance overhead.
+                </p>
+            </div>
+            <div class="features-grid">
+                <div class="feature-card" style="background: var(--bg)">
+                    <h3 style="margin-bottom: 16px">Video Processing</h3>
+                    <ul style="list-style: none; font-size: 14px; color: var(--text-dim)">
+                        <li style="padding: 8px 0; border-bottom: 1px solid var(--border)">Resolution: up to 4K (3840 x 2160) at 30 fps</li>
+                        <li style="padding: 8px 0; border-bottom: 1px solid var(--border)">Compression: H.265 / H.264 with smart codec selection</li>
+                        <li style="padding: 8px 0; border-bottom: 1px solid var(--border)">Bitrate: adaptive 256 kbps to 16 Mbps per stream</li>
+                        <li style="padding: 8px 0; border-bottom: 1px solid var(--border)">Latency: under 200ms glass-to-glass live view</li>
+                        <li style="padding: 8px 0">Protocols: ONVIF Profile S/T, RTSP, RTMP</li>
+                    </ul>
+                </div>
+                <div class="feature-card" style="background: var(--bg)">
+                    <h3 style="margin-bottom: 16px">AI Analytics Engine</h3>
+                    <ul style="list-style: none; font-size: 14px; color: var(--text-dim)">
+                        <li style="padding: 8px 0; border-bottom: 1px solid var(--border)">Object detection: person, vehicle, animal, package</li>
+                        <li style="padding: 8px 0; border-bottom: 1px solid var(--border)">Classification accuracy: 98.5% in standard conditions</li>
+                        <li style="padding: 8px 0; border-bottom: 1px solid var(--border)">Processing: edge inference with cloud model updates</li>
+                        <li style="padding: 8px 0; border-bottom: 1px solid var(--border)">Facial recognition: optional module, GDPR compliant</li>
+                        <li style="padding: 8px 0">License plate reading: 50+ countries supported</li>
+                    </ul>
+                </div>
+                <div class="feature-card" style="background: var(--bg)">
+                    <h3 style="margin-bottom: 16px">Cloud Platform</h3>
+                    <ul style="list-style: none; font-size: 14px; color: var(--text-dim)">
+                        <li style="padding: 8px 0; border-bottom: 1px solid var(--border)">Availability: 99.97% SLA with multi-region failover</li>
+                        <li style="padding: 8px 0; border-bottom: 1px solid var(--border)">Encryption: AES-256 at rest, TLS 1.3 in transit</li>
+                        <li style="padding: 8px 0; border-bottom: 1px solid var(--border)">Storage: automatic tiering (hot / warm / archive)</li>
+                        <li style="padding: 8px 0; border-bottom: 1px solid var(--border)">Regions: EU (Frankfurt), US (Virginia), APAC (Singapore)</li>
+                        <li style="padding: 8px 0">Compliance: GDPR, SOC 2 Type II, ISO 27001</li>
+                    </ul>
+                </div>
+            </div>
+        </section>
+
+        <!-- FAQ -->
+        <section class="section" id="faq">
+            <div class="section-header">
+                <div class="section-tag">FAQ</div>
+                <h2>Frequently asked questions</h2>
+                <p>
+                    Everything you need to know about PRRR Vision. Can't find
+                    what you're looking for? Contact our support team.
+                </p>
+            </div>
+            <div style="max-width: 800px; margin: 0 auto">
+                <div style="border-bottom: 1px solid var(--border); padding: 24px 0">
+                    <h3 style="font-size: 16px; font-weight: 600; margin-bottom: 8px">What cameras are compatible with PRRR Vision?</h3>
+                    <p style="font-size: 14px; color: var(--text-dim); line-height: 1.8">
+                        PRRR Vision supports any camera that uses ONVIF Profile S or T protocols, as well as
+                        cameras with RTSP streaming capabilities. This includes models from major manufacturers
+                        such as Hikvision, Dahua, Axis, Hanwha, Vivotek, and Reolink. Our compatibility database
+                        covers over 3,000 camera models. If your camera supports RTSP streaming, it will likely
+                        work with our platform.
+                    </p>
+                </div>
+                <div style="border-bottom: 1px solid var(--border); padding: 24px 0">
+                    <h3 style="font-size: 16px; font-weight: 600; margin-bottom: 8px">How does the AI motion detection reduce false alarms?</h3>
+                    <p style="font-size: 14px; color: var(--text-dim); line-height: 1.8">
+                        Traditional motion detection triggers on any pixel change, including shadows, leaves,
+                        rain, and lighting variations. Our AI model analyzes the video feed to identify and
+                        classify objects before generating alerts. You can configure rules like "alert only on
+                        person detected in zone A after business hours" or "ignore vehicles in parking area
+                        during daytime." This dramatically reduces the noise from conventional motion detection
+                        and ensures your security team focuses on genuine events.
+                    </p>
+                </div>
+                <div style="border-bottom: 1px solid var(--border); padding: 24px 0">
+                    <h3 style="font-size: 16px; font-weight: 600; margin-bottom: 8px">Can I keep recordings on my own servers instead of the cloud?</h3>
+                    <p style="font-size: 14px; color: var(--text-dim); line-height: 1.8">
+                        Yes. Our Enterprise plan supports hybrid and fully on-premises deployments. You can run
+                        the PRRR Vision management server on your own hardware while optionally syncing metadata
+                        and alerts to the cloud. This is popular with organizations that have strict data
+                        residency requirements or existing storage infrastructure. Contact our sales team
+                        for architecture guidance on on-premises deployments.
+                    </p>
+                </div>
+                <div style="border-bottom: 1px solid var(--border); padding: 24px 0">
+                    <h3 style="font-size: 16px; font-weight: 600; margin-bottom: 8px">What bandwidth does the system require?</h3>
+                    <p style="font-size: 14px; color: var(--text-dim); line-height: 1.8">
+                        Bandwidth requirements depend on the number of cameras and resolution settings. A typical
+                        1080p camera at 15 fps uses approximately 2-4 Mbps of upload bandwidth for cloud recording.
+                        Our smart codec selection can reduce this by up to 60% using H.265 compression and
+                        event-based recording (only full-quality during motion events). For a 16-camera deployment
+                        at 1080p, we recommend at least 25 Mbps upload bandwidth with cloud recording enabled.
+                    </p>
+                </div>
+                <div style="border-bottom: 1px solid var(--border); padding: 24px 0">
+                    <h3 style="font-size: 16px; font-weight: 600; margin-bottom: 8px">Is my video footage encrypted?</h3>
+                    <p style="font-size: 14px; color: var(--text-dim); line-height: 1.8">
+                        Absolutely. All video data is encrypted with AES-256 both in transit and at rest. Camera
+                        streams are secured with TLS 1.3 from the camera to our cloud platform. Cloud storage
+                        uses server-side encryption with customer-managed keys available on Enterprise plans.
+                        We never access your footage unless explicitly authorized for technical support purposes.
+                        Our infrastructure is SOC 2 Type II certified and undergoes annual third-party security audits.
+                    </p>
+                </div>
+                <div style="padding: 24px 0">
+                    <h3 style="font-size: 16px; font-weight: 600; margin-bottom: 8px">Do you offer a free trial?</h3>
+                    <p style="font-size: 14px; color: var(--text-dim); line-height: 1.8">
+                        Yes, we offer a 14-day free trial of our Professional plan with full access to all features
+                        including AI analytics, cloud recording, and multi-site management. No credit card is required
+                        to start. At the end of the trial, you can choose a plan that fits your needs or simply let
+                        the trial expire. We will never charge you without explicit consent. If you need more time to
+                        evaluate, our sales team can extend your trial period upon request.
+                    </p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Integrations -->
+        <section class="section" style="background: var(--surface)">
+            <div class="section-header">
+                <div class="section-tag">Integrations</div>
+                <h2>Works with your existing systems</h2>
+                <p>
+                    PRRR Vision integrates with leading access control, alarm, and building
+                    management systems out of the box.
+                </p>
+            </div>
+            <div class="features-grid">
+                <div class="feature-card" style="background: var(--bg)">
+                    <div class="feature-icon">&#128279;</div>
+                    <h3>Access Control Systems</h3>
+                    <p>
+                        Native integration with HID Global, ASSA ABLOY, and Salto electronic
+                        lock systems. Trigger camera recording on door access events. Match
+                        cardholder identity with video footage automatically for streamlined
+                        incident investigation and audit trail generation.
+                    </p>
+                </div>
+                <div class="feature-card" style="background: var(--bg)">
+                    <div class="feature-icon">&#128680;</div>
+                    <h3>Alarm Systems</h3>
+                    <p>
+                        Connect with Honeywell, Bosch, and DSC alarm panels via open protocols.
+                        Video verification of alarm events reduces false dispatch rates by up to
+                        90%. Security operators can visually confirm threats before dispatching
+                        response teams, saving time and operational costs.
+                    </p>
+                </div>
+                <div class="feature-card" style="background: var(--bg)">
+                    <div class="feature-icon">&#127970;</div>
+                    <h3>Building Management</h3>
+                    <p>
+                        BACnet and Modbus integration enables camera feeds linked to HVAC,
+                        lighting, and elevator systems. Correlate occupancy data from cameras
+                        with building automation to optimize energy usage and improve facility
+                        operations across your entire portfolio.
+                    </p>
+                </div>
+            </div>
+        </section>
+
+        <!-- CTA -->
+        <section class="cta">
+            <h2>Ready to secure your premises?</h2>
+            <p>
+                Start your 14-day free trial today. No credit card required.
+                Full access to all Professional features.
+            </p>
+            <div class="hero-buttons">
+                <a href="#pricing" class="btn-primary">Get Started Free &#8594;</a>
+                <a href="#" class="btn-secondary">Schedule a Demo</a>
+            </div>
+        </section>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <div class="footer-inner">
+                <div class="footer-brand">
+                    <img src="/assets/logo_w_text.png" alt="PRRR Vision" class="nav-logo" />
+                    <p>
+                        AI-powered video surveillance solutions for businesses and homes.
+                        Intelligent monitoring that keeps you safe, 24/7.
+                    </p>
+                </div>
+                <div class="footer-col">
+                    <h4>Product</h4>
+                    <ul>
+                        <li><a href="#features">Features</a></li>
+                        <li><a href="#pricing">Pricing</a></li>
+                        <li><a href="#">Integrations</a></li>
+                        <li><a href="#">Changelog</a></li>
+                    </ul>
+                </div>
+                <div class="footer-col">
+                    <h4>Company</h4>
+                    <ul>
+                        <li><a href="#about">About</a></li>
+                        <li><a href="#">Careers</a></li>
+                        <li><a href="#">Blog</a></li>
+                        <li><a href="#">Press</a></li>
+                    </ul>
+                </div>
+                <div class="footer-col">
+                    <h4>Support</h4>
+                    <ul>
+                        <li><a href="#">Documentation</a></li>
+                        <li><a href="#">Contact Us</a></li>
+                        <li><a href="#">System Status</a></li>
+                        <li><a href="#">API Reference</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="footer-bottom">
+                <span>&copy; 2025 PRRR Vision Ltd. All rights reserved.</span>
+                <div class="footer-bottom-links">
+                    <a href="#">Privacy Policy</a>
+                    <a href="#">Terms of Service</a>
+                    <a href="#">Cookie Policy</a>
+                </div>
+            </div>
+        </footer>
+    </body>
+</html>

@@ -2,6 +2,8 @@
 
 /// Encrypted bidirectional channel with nonce management and replay protection.
 pub mod encrypted_channel;
+/// HTTP/2 stream adapters for DatagramSender / DatagramReceiver.
+pub mod h2_adapter;
 /// HARP frame codec for HTTPS API Relay Protocol.
 pub mod harp;
 /// MASQUE CONNECT-UDP framing over QUIC DATAGRAMs (RFC 9297/9298).
@@ -111,4 +113,8 @@ pub enum TransportError {
     /// HARP CLOSE frame received (peer requested session teardown).
     #[error("HARP session closed by peer")]
     HarpSessionClosed,
+
+    /// HTTP/2 stream-level error (send or receive).
+    #[error("H2 stream error: {0}")]
+    H2Stream(String),
 }

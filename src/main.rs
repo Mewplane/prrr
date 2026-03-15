@@ -128,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
                 .network
                 .as_ref()
                 .and_then(|n| n.dns_servers.as_ref())
-                .map(|d| d.clone())
+                .cloned()
                 .unwrap_or_else(|| prrr::config::DEFAULT_DNS_SERVERS.iter().map(|s| (*s).to_string()).collect());
             let dist_mtu = config.network.as_ref().and_then(|n| n.mtu).unwrap_or(prrr::config::DEFAULT_MTU);
             let dist_transport_protocol = {
@@ -257,6 +257,8 @@ async fn main() -> anyhow::Result<()> {
                     server_noise_public_key: server_noise_pub,
                     server_kem_dk_bytes: std::sync::Arc::clone(&server_kem_dk_bytes),
                     tunnel_spawner: None,
+                    cover_page_enabled: web_config.cover_page_enabled.unwrap_or(true),
+                    trust_proxy_headers: web_config.trust_proxy_headers.unwrap_or(false),
                 };
                 tracing::info!(%listen_addr, "starting web admin server");
                 Some(tokio::spawn(prrr::web::run_web_server(listen_addr, app_state)))
@@ -324,12 +326,18 @@ async fn main() -> anyhow::Result<()> {
                         tracing::info!("starting MASQUE transport on {}", args.listen);
                         transport_tasks.spawn(async move { transport.run(shared, cancel).await });
                     }
-                    prrr::config::ResolvedTransport::Harp { tls_cert, tls_key, .. } => {
+                    prrr::config::ResolvedTransport::Harp {
+                        tls_cert,
+                        tls_key,
+                        session_idle_timeout,
+                        ..
+                    } => {
                         let transport = prrr::web::harp::HarpServerTransport::new(
                             args.listen,
                             std::sync::Arc::clone(&tun_factory),
                             tls_cert.clone(),
                             tls_key.clone(),
+                            *session_idle_timeout,
                         );
                         let shared = std::sync::Arc::clone(&shared);
                         let cancel = cancel.clone();
@@ -489,12 +497,37 @@ async fn main() -> anyhow::Result<()> {
             let transport: Box<dyn prrr::transport::ClientTransport> = match transport_protocol {
                 "harp" => {
                     tracing::info!("using HARP transport");
-                    Box::new(prrr::client::HarpClientTransport::new(
-                        server_addr.to_string(),
-                        server_name.to_string(),
+                    let preferred_binding = config.transport.as_ref().and_then(|t| t.preferred_binding.clone());
+                    let tls_profile = config
+                        .transport
+                        .as_ref()
+                        .and_then(|t| t.tls_profile.as_deref())
+                        .and_then(|s| s.parse::<prrr::obfuscation::tls_mimicry::TlsProfile>().ok())
+                        .unwrap_or(prrr::obfuscation::tls_mimicry::TlsProfile::Chrome);
+                    let direct_timeout_secs = config
+                        .transport
+                        .as_ref()
+                        .and_then(|t| t.direct_timeout_secs)
+                        .unwrap_or(prrr::config::DEFAULT_DIRECT_TIMEOUT_SECS);
+                    let cdn_fronting_domain = config.transport.as_ref().and_then(|t| t.cdn_fronting_domain.clone());
+                    let cdn_fronting_enabled = config.transport.as_ref().and_then(|t| t.cdn_fronting_enabled).unwrap_or(false);
+                    let direct_retry_interval_secs = config
+                        .transport
+                        .as_ref()
+                        .and_then(|t| t.direct_retry_interval_secs)
+                        .unwrap_or(prrr::config::DEFAULT_DIRECT_RETRY_INTERVAL_SECS);
+                    Box::new(prrr::client::HarpClientTransport::new(prrr::client::HarpClientConfig {
+                        server_endpoint: server_addr.to_string(),
+                        server_name: server_name.to_string(),
                         insecure,
-                        fwmark_opt,
-                    ))
+                        fwmark: fwmark_opt,
+                        preferred_binding,
+                        tls_profile,
+                        direct_timeout: std::time::Duration::from_secs(direct_timeout_secs),
+                        cdn_fronting_domain,
+                        cdn_fronting_enabled,
+                        direct_retry_interval: std::time::Duration::from_secs(direct_retry_interval_secs),
+                    }))
                 }
                 _ => {
                     tracing::info!("using MASQUE transport");
@@ -533,13 +566,13 @@ async fn main() -> anyhow::Result<()> {
                 .routing
                 .as_ref()
                 .and_then(|r| r.allowed_ips.as_ref())
-                .map(|v| v.clone())
+                .cloned()
                 .unwrap_or_default();
             let excluded_ips = config
                 .routing
                 .as_ref()
                 .and_then(|r| r.excluded_ips.as_ref())
-                .map(|v| v.clone())
+                .cloned()
                 .unwrap_or_default();
             let hook_script = config
                 .routing
@@ -552,7 +585,7 @@ async fn main() -> anyhow::Result<()> {
                 tun_device: tun_config.name.clone(),
                 client_ip: tun_address,
                 gateway_ip: gateway,
-                server_ip: std::net::IpAddr::from(server_addr.ip()),
+                server_ip: server_addr.ip(),
                 server_endpoint: server_name.to_string(),
                 all_traffic,
                 dns_servers,
@@ -565,11 +598,14 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(fwmark, "route manager ready");
 
             // Run with automatic reconnection on transport failure
+            let crypto_params = prrr::reconnect::ReconnectCryptoParams {
+                noise_keypair: &noise_keypair,
+                server_noise_pub: &server_noise_pub,
+                server_kem_pub: &server_kem_pub,
+            };
             prrr::reconnect::run_with_reconnect(
                 transport.as_ref(),
-                &noise_keypair,
-                &server_noise_pub,
-                &server_kem_pub,
+                &crypto_params,
                 tun,
                 &reconnect_config,
                 Some(&mut route_manager),

@@ -30,6 +30,7 @@ const NOISE_PUBLIC_KEY_LEN: usize = 32;
 ///
 /// Borrows cryptographic material from the caller to avoid cloning
 /// key bytes. The [`CancellationToken`] is cheaply cloneable and owned.
+#[derive(Clone)]
 pub struct ClientConnectParams<'a> {
     /// Client's Noise X25519 static keypair.
     pub noise_keypair: &'a KeyPair,
