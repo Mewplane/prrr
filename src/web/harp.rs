@@ -4,6 +4,8 @@
 // FRD: specs/frds/FRD-20260223-harp-tunnel-orchestration.md
 // FRD: specs/frds/FRD-20260223-harp-polling-transport.md
 // FRD: specs/frds/FRD-20260224-cdn-header-parsing.md
+// FRD: specs/frds/FRD-20260225-h2-server-handlers.md
+// FRD: specs/frds/FRD-20260315-h2-capability-advertisement.md
 
 //! HARP session management, establishment, WebSocket/polling transport, and
 //! tunnel orchestration for the HTTPS API Relay Protocol.
@@ -444,7 +446,7 @@ pub struct HarpSessionResponse {
 /// Transport binding endpoints returned in the session response.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HarpTransportInfo {
-    /// Server-selected transport mode (`"stream"` or `"poll"`).
+    /// Server-selected transport mode (`"stream"`, `"poll"`, or `"h2"`).
     pub mode: String,
     /// WebSocket streaming endpoint path.
     pub stream_endpoint: String,
@@ -452,6 +454,8 @@ pub struct HarpTransportInfo {
     pub upload_endpoint: String,
     /// HTTP polling download endpoint path.
     pub download_endpoint: String,
+    /// Transport bindings the server supports (e.g., `["h2", "stream", "poll"]`).
+    pub capabilities: Vec<String>,
 }
 
 /// Session configuration parameters returned in the session response.
@@ -605,18 +609,24 @@ pub async fn create_session(State(state): State<AppState>, req: axum::http::Requ
     }
 
     // Step 7: Build success response
-    let response = build_real_response(&session_id, &noise_msg2, &request.capabilities);
+    let response = build_real_response(&session_id, &noise_msg2, &request.capabilities, state.h2_streaming_enabled);
 
     (StatusCode::OK, Json(response)).into_response()
 }
 
 /// Build a real session response for a successful handshake.
-fn build_real_response(session_id: &SessionId, noise_msg2: &[u8], capabilities: &[String]) -> HarpSessionResponse {
-    let mode = select_transport_mode(capabilities);
+fn build_real_response(
+    session_id: &SessionId,
+    noise_msg2: &[u8],
+    client_capabilities: &[String],
+    h2_streaming_enabled: bool,
+) -> HarpSessionResponse {
+    let mode = select_transport_mode(client_capabilities, h2_streaming_enabled);
+    let server_capabilities = build_server_capabilities(h2_streaming_enabled);
     HarpSessionResponse {
         session_id: BASE64.encode(session_id),
         noise_msg2: BASE64.encode(noise_msg2),
-        transport: build_transport_info(session_id, &mode),
+        transport: build_transport_info(session_id, &mode, server_capabilities),
         config: HarpConfigInfo {
             rekey_interval: DEFAULT_REKEY_INTERVAL,
             keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
@@ -626,7 +636,20 @@ fn build_real_response(session_id: &SessionId, noise_msg2: &[u8], capabilities: 
     }
 }
 
+/// Build the list of server-supported transport capabilities.
+fn build_server_capabilities(h2_streaming_enabled: bool) -> Vec<String> {
+    let mut caps = Vec::with_capacity(3);
+    if h2_streaming_enabled {
+        caps.push("h2".to_string());
+    }
+    caps.push("stream".to_string());
+    caps.push("poll".to_string());
+    caps
+}
+
 /// Build a fake response that is structurally identical to a real one.
+///
+/// Includes `"stream"` and `"poll"` in capabilities for DPI resistance.
 fn build_fake_response() -> HarpSessionResponse {
     let mut fake_session_id = [0u8; SESSION_ID_LEN];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut fake_session_id);
@@ -634,10 +657,11 @@ fn build_fake_response() -> HarpSessionResponse {
     let mut fake_msg2 = vec![0u8; FAKE_NOISE_MSG2_LEN];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut fake_msg2);
 
+    let fake_capabilities = vec!["stream".to_string(), "poll".to_string()];
     HarpSessionResponse {
         session_id: BASE64.encode(fake_session_id),
         noise_msg2: BASE64.encode(fake_msg2),
-        transport: build_transport_info(&fake_session_id, "stream"),
+        transport: build_transport_info(&fake_session_id, "stream", fake_capabilities),
         config: HarpConfigInfo {
             rekey_interval: DEFAULT_REKEY_INTERVAL,
             keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
@@ -651,19 +675,25 @@ fn build_fake_response() -> HarpSessionResponse {
 ///
 /// Endpoint paths use URL-safe base64 (no padding) to avoid `/`, `+`, `=`
 /// characters that would break URL path matching.
-fn build_transport_info(session_id: &SessionId, mode: &str) -> HarpTransportInfo {
+fn build_transport_info(session_id: &SessionId, mode: &str, capabilities: Vec<String>) -> HarpTransportInfo {
     let url_id = BASE64_URL.encode(session_id);
     HarpTransportInfo {
         mode: mode.to_string(),
         stream_endpoint: format!("{HARP_API_PREFIX}/stream/{url_id}"),
         upload_endpoint: format!("{HARP_API_PREFIX}/upload/{url_id}"),
         download_endpoint: format!("{HARP_API_PREFIX}/download/{url_id}"),
+        capabilities,
     }
 }
 
-/// Select transport mode based on client capabilities.
-fn select_transport_mode(capabilities: &[String]) -> String {
-    if capabilities.iter().any(|c| c == "stream") {
+/// Select transport mode based on client capabilities and server config.
+///
+/// Priority: h2 > stream > poll. H2 is only selected when both the client
+/// advertises it and the server has `h2_streaming_enabled`.
+fn select_transport_mode(client_capabilities: &[String], h2_streaming_enabled: bool) -> String {
+    if h2_streaming_enabled && client_capabilities.iter().any(|c| c == "h2") {
+        "h2".to_string()
+    } else if client_capabilities.iter().any(|c| c == "stream") {
         "stream".to_string()
     } else {
         "poll".to_string()
@@ -895,10 +925,7 @@ pub async fn h2_upload_handler(
 /// The stream ends when the session's channel closes.
 ///
 /// Unknown or malformed session IDs always return `200 OK` with an empty body.
-pub async fn h2_download_handler(
-    State(state): State<AppState>,
-    Path(session_id_b64): Path<String>,
-) -> impl IntoResponse {
+pub async fn h2_download_handler(State(state): State<AppState>, Path(session_id_b64): Path<String>) -> impl IntoResponse {
     let session = match lookup_session(&state.harp_sessions, &session_id_b64) {
         Some(s) => s,
         None => return StatusCode::OK.into_response(),
@@ -916,6 +943,32 @@ pub async fn h2_download_handler(
     });
 
     axum::body::Body::from_stream(body_stream).into_response()
+}
+
+/// Log message for polling download.
+const LOG_POLL_DOWNLOAD: &str = "poll download: draining queued frames";
+
+/// Handler for `POST /api/v1/harp/download/{session_id}`.
+///
+/// Polling-compatible download: drains all currently available frames from the
+/// session's `to_client_rx` channel without blocking, and returns them as
+/// concatenated wire bytes. Returns an empty body when no frames are queued.
+///
+/// Used by HTTP/1.1 polling clients (`HarpPollReceiver`). HTTP/2 streaming
+/// clients use `h2_download_handler` via GET instead.
+///
+/// Unknown or malformed session IDs always return `200 OK` with an empty body.
+pub async fn poll_download_handler(State(state): State<AppState>, Path(session_id_b64): Path<String>) -> impl IntoResponse {
+    let session = match lookup_session(&state.harp_sessions, &session_id_b64) {
+        Some(s) => s,
+        None => return (StatusCode::OK, Vec::new()).into_response(),
+    };
+
+    session.touch();
+    tracing::debug!(LOG_POLL_DOWNLOAD);
+
+    let body = drain_to_client_frames(&session).await;
+    (StatusCode::OK, body).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1091,6 +1144,7 @@ where
                 tunnel_spawner: Some(Arc::new(spawner)),
                 cover_page_enabled: true,
                 trust_proxy_headers: false,
+                h2_streaming_enabled: true,
             };
 
             // Spawn periodic idle session reaper
@@ -1199,6 +1253,7 @@ mod tests {
             tunnel_spawner: None,
             cover_page_enabled: true,
             trust_proxy_headers: false,
+            h2_streaming_enabled: true,
         }
     }
 
@@ -1778,19 +1833,87 @@ mod tests {
     #[test]
     fn select_transport_mode_prefers_stream() {
         let caps = vec!["stream".to_string(), "poll".to_string()];
-        assert_eq!(select_transport_mode(&caps), "stream");
+        assert_eq!(select_transport_mode(&caps, false), "stream");
     }
 
     #[test]
     fn select_transport_mode_falls_back_to_poll() {
         let caps = vec!["poll".to_string()];
-        assert_eq!(select_transport_mode(&caps), "poll");
+        assert_eq!(select_transport_mode(&caps, false), "poll");
     }
 
     #[test]
     fn select_transport_mode_defaults_to_poll_on_empty() {
         let caps: Vec<String> = vec![];
-        assert_eq!(select_transport_mode(&caps), "poll");
+        assert_eq!(select_transport_mode(&caps, false), "poll");
+    }
+
+    // -- AC-1: select_transport_mode returns h2 when both sides support it
+    #[test]
+    fn select_mode_prefers_h2() {
+        let caps = vec!["h2".to_string(), "stream".to_string(), "poll".to_string()];
+        assert_eq!(select_transport_mode(&caps, true), "h2");
+    }
+
+    // -- AC-2: falls back to stream when h2 disabled on server
+    #[test]
+    fn select_mode_h2_disabled_falls_to_stream() {
+        let caps = vec!["h2".to_string(), "stream".to_string(), "poll".to_string()];
+        assert_eq!(select_transport_mode(&caps, false), "stream");
+    }
+
+    // -- AC-3: falls back to poll when only poll in client caps
+    #[test]
+    fn select_mode_poll_fallback() {
+        let caps = vec!["poll".to_string()];
+        assert_eq!(select_transport_mode(&caps, true), "poll");
+    }
+
+    // -- AC-4: server capabilities include h2 when enabled
+    #[test]
+    fn server_capabilities_include_h2_when_enabled() {
+        let caps = build_server_capabilities(true);
+        assert_eq!(caps, vec!["h2", "stream", "poll"]);
+    }
+
+    // -- AC-5: server capabilities exclude h2 when disabled
+    #[test]
+    fn server_capabilities_exclude_h2_when_disabled() {
+        let caps = build_server_capabilities(false);
+        assert_eq!(caps, vec!["stream", "poll"]);
+    }
+
+    // -- AC-6: fake response includes capabilities for DPI resistance
+    #[test]
+    fn fake_response_has_capabilities() {
+        let resp = build_fake_response();
+        assert!(resp.transport.capabilities.contains(&"stream".to_string()));
+        assert!(resp.transport.capabilities.contains(&"poll".to_string()));
+    }
+
+    // -- AC-4 (integration): real response includes h2 capability when enabled
+    #[test]
+    fn session_response_capabilities_include_h2() {
+        let session_id = [0xAAu8; SESSION_ID_LEN];
+        let noise_msg2 = [0xBBu8; 48];
+        let client_caps = vec!["h2".to_string(), "stream".to_string(), "poll".to_string()];
+        let resp = build_real_response(&session_id, &noise_msg2, &client_caps, true);
+        assert_eq!(resp.transport.mode, "h2");
+        assert!(resp.transport.capabilities.contains(&"h2".to_string()));
+        assert!(resp.transport.capabilities.contains(&"stream".to_string()));
+        assert!(resp.transport.capabilities.contains(&"poll".to_string()));
+    }
+
+    // -- AC-5 (integration): real response excludes h2 when disabled
+    #[test]
+    fn session_response_capabilities_exclude_h2_when_disabled() {
+        let session_id = [0xAAu8; SESSION_ID_LEN];
+        let noise_msg2 = [0xBBu8; 48];
+        let client_caps = vec!["h2".to_string(), "stream".to_string(), "poll".to_string()];
+        let resp = build_real_response(&session_id, &noise_msg2, &client_caps, false);
+        assert_eq!(resp.transport.mode, "stream");
+        assert!(!resp.transport.capabilities.contains(&"h2".to_string()));
+        assert!(resp.transport.capabilities.contains(&"stream".to_string()));
     }
 
     // -----------------------------------------------------------------------
@@ -2857,5 +2980,292 @@ mod tests {
         let peer: std::net::IpAddr = "10.0.0.1".parse().unwrap();
         let result = resolve_client_ip(&headers, peer, true);
         assert_eq!(result, peer);
+    }
+
+    // -----------------------------------------------------------------------
+    // FRD: specs/frds/FRD-20260225-h2-server-handlers.md
+    // Step 4.4: Server-side H2 streaming handler tests
+    // -----------------------------------------------------------------------
+
+    /// Encode a session ID as URL-safe base64 (no padding) for route paths.
+    fn encode_session_id_b64(session_id: &SessionId) -> String {
+        BASE64_URL.encode(session_id)
+    }
+
+    /// Build an Axum router with a fresh app state and a pre-created session.
+    /// Returns `(Router, SessionId, Arc<HarpSession>)`.
+    fn h2_test_router_with_session() -> (axum::Router, SessionId, Arc<HarpSession>) {
+        let state = harp_test_app_state();
+        let client_id = Uuid::new_v4();
+        let (session_id, session) = state.harp_sessions.create(client_id);
+        let router = crate::web::build_router(state);
+        (router, session_id, session)
+    }
+
+    // AC-1: H2 upload handler forwards DATA frames to session channel
+    #[tokio::test]
+    async fn h2_upload_forwards_data_to_channel() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (router, session_id, session) = h2_test_router_with_session();
+        let b64_id = encode_session_id_b64(&session_id);
+
+        let test_payload = b"hello-tunnel-data";
+        let data_frame = crate::transport::harp::HarpFrame::data(test_payload.to_vec());
+        let wire = data_frame.encode().expect("encode data frame");
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/harp/upload/{b64_id}"))
+            .body(Body::from(wire))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "upload should return 200");
+
+        // The handler re-encodes the frame before sending to the channel
+        let mut rx = session.from_client_rx.lock().await;
+        let received = rx.try_recv().expect("channel should have data");
+
+        // Decode the received wire bytes to verify payload
+        let (decoded, _) = crate::transport::harp::HarpFrame::decode(&received).expect("decode received frame");
+        assert_eq!(decoded.frame_type, HarpFrameType::Data);
+        assert_eq!(decoded.payload, test_payload, "payload must match");
+    }
+
+    // AC-2: H2 upload handler skips KEEPALIVE frames
+    #[tokio::test]
+    async fn h2_upload_skips_keepalive() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (router, session_id, session) = h2_test_router_with_session();
+        let b64_id = encode_session_id_b64(&session_id);
+
+        // Send a KEEPALIVE followed by a DATA frame
+        let keepalive = crate::transport::harp::HarpFrame::keepalive().encode().expect("encode keepalive");
+        let test_payload = b"after-keepalive";
+        let data_frame = crate::transport::harp::HarpFrame::data(test_payload.to_vec())
+            .encode()
+            .expect("encode data");
+
+        let mut body_bytes = keepalive;
+        body_bytes.extend_from_slice(&data_frame);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/harp/upload/{b64_id}"))
+            .body(Body::from(body_bytes))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Only the DATA frame should appear in the channel (KEEPALIVE skipped)
+        let mut rx = session.from_client_rx.lock().await;
+        let received = rx.try_recv().expect("channel should have one data frame");
+        let (decoded, _) = crate::transport::harp::HarpFrame::decode(&received).expect("decode frame");
+        assert_eq!(decoded.frame_type, HarpFrameType::Data);
+        assert_eq!(decoded.payload, test_payload);
+
+        // No more frames in channel
+        assert!(rx.try_recv().is_err(), "no more frames expected — KEEPALIVE must be skipped");
+    }
+
+    // AC-3: H2 upload handler updates last_activity on each frame
+    #[tokio::test]
+    async fn h2_upload_updates_last_activity() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (router, session_id, session) = h2_test_router_with_session();
+        let b64_id = encode_session_id_b64(&session_id);
+
+        let before = session.last_activity.load(Ordering::Relaxed);
+
+        // Small delay to ensure measurable time difference
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let data_frame = crate::transport::harp::HarpFrame::data(b"ping".to_vec()).encode().expect("encode");
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/harp/upload/{b64_id}"))
+            .body(Body::from(data_frame))
+            .unwrap();
+
+        let _resp = router.oneshot(req).await.unwrap();
+
+        let after = session.last_activity.load(Ordering::Relaxed);
+        assert!(after > before, "last_activity must be updated: before={before}, after={after}");
+    }
+
+    // AC-4: H2 upload returns 200 OK for unknown session
+    #[tokio::test]
+    async fn h2_upload_unknown_session_returns_200() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let state = harp_test_app_state();
+        let router = crate::web::build_router(state);
+
+        let fake_id = [0xDDu8; SESSION_ID_LEN];
+        let b64_id = encode_session_id_b64(&fake_id);
+
+        let data_frame = crate::transport::harp::HarpFrame::data(b"data".to_vec()).encode().expect("encode");
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/harp/upload/{b64_id}"))
+            .body(Body::from(data_frame))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "unknown session must return 200 for DPI resistance");
+    }
+
+    // AC-5: H2 download handler streams frames from session channel
+    #[tokio::test]
+    async fn h2_download_streams_from_channel() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let (router, session_id, session) = h2_test_router_with_session();
+        let b64_id = encode_session_id_b64(&session_id);
+
+        // Enqueue a frame for the client to download
+        let test_payload = b"download-data";
+        let wire = crate::transport::harp::HarpFrame::data(test_payload.to_vec())
+            .encode()
+            .expect("encode");
+
+        session.to_client_tx.send(wire.clone()).await.expect("send to channel");
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/harp/download/{b64_id}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "download should return 200");
+
+        // Read the first chunk with a timeout (stream never ends on its own
+        // because the session Arc keeps to_client_tx alive inside the unfold)
+        let timeout_dur = std::time::Duration::from_secs(2);
+        let mut body = resp.into_body();
+        let chunk = tokio::time::timeout(timeout_dur, body.frame())
+            .await
+            .expect("chunk should arrive within timeout")
+            .expect("frame should be Some")
+            .expect("frame should be Ok");
+
+        let data = chunk.into_data().expect("frame should be data");
+        assert_eq!(data.as_ref(), wire.as_slice(), "streamed frame must match enqueued wire bytes");
+    }
+
+    // AC-6: H2 download handler updates last_activity on each frame
+    #[tokio::test]
+    async fn h2_download_updates_last_activity() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let (router, session_id, session) = h2_test_router_with_session();
+        let b64_id = encode_session_id_b64(&session_id);
+
+        let before = session.last_activity.load(Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let wire = crate::transport::harp::HarpFrame::data(b"ts-check".to_vec())
+            .encode()
+            .expect("encode");
+
+        session.to_client_tx.send(wire).await.expect("send to channel");
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/harp/download/{b64_id}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+
+        // Read the first chunk to trigger the touch() call
+        let timeout_dur = std::time::Duration::from_secs(2);
+        let mut body = resp.into_body();
+        let _chunk = tokio::time::timeout(timeout_dur, body.frame())
+            .await
+            .expect("chunk should arrive within timeout")
+            .expect("frame should be Some")
+            .expect("frame should be Ok");
+
+        let after = session.last_activity.load(Ordering::Relaxed);
+        assert!(after > before, "download must update last_activity: before={before}, after={after}");
+    }
+
+    // AC-7: H2 download returns 200 OK for unknown session
+    #[tokio::test]
+    async fn h2_download_unknown_session_returns_200() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let state = harp_test_app_state();
+        let router = crate::web::build_router(state);
+
+        let fake_id = [0xEEu8; SESSION_ID_LEN];
+        let b64_id = encode_session_id_b64(&fake_id);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/harp/download/{b64_id}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "unknown session must return 200 for DPI resistance");
+    }
+
+    // AC-8: Download route accepts GET method
+    #[tokio::test]
+    async fn h2_download_accepts_get() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let (router, session_id, session) = h2_test_router_with_session();
+        let b64_id = encode_session_id_b64(&session_id);
+
+        let wire = crate::transport::harp::HarpFrame::data(b"get-test".to_vec())
+            .encode()
+            .expect("encode");
+        session.to_client_tx.send(wire).await.expect("send");
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/harp/download/{b64_id}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "download route must accept GET");
+
+        // Verify we can read the chunk (proves GET works for streaming)
+        let timeout_dur = std::time::Duration::from_secs(2);
+        let mut body = resp.into_body();
+        let chunk = tokio::time::timeout(timeout_dur, body.frame())
+            .await
+            .expect("chunk should arrive within timeout");
+        assert!(chunk.is_some(), "GET download should stream data");
     }
 }

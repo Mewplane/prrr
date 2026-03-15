@@ -488,4 +488,72 @@ streaming.
 - `HARP_H2_DOWNLOAD_PATH = "/api/v1/harp/download/"` — Download stream endpoint prefix.
 - `LOG_HARP_H2_STREAMS = "HARP transport: using HTTP/2 streams"` — Log message for H2 binding selection.
 - `BINDING_H2 = "h2"` — Preferred binding value for HTTP/2.
+- `BINDING_STREAM = "stream"` — Preferred binding value for WebSocket streaming.
 - `BINDING_POLL = "poll"` — Preferred binding value for HTTP polling.
+
+### H2 Server-Side Streaming Handlers (Step 4.4)
+
+The server accepts long-lived HTTP/2 streams for upload and download via two
+Axum handlers in `src/web/harp.rs`. These replace the short-lived polling
+handlers when the client uses HTTP/2 binding.
+
+**Handlers:**
+
+- `h2_upload_handler` — `POST /api/v1/harp/upload/{session_id}`: Reads HARP
+  frames incrementally from the streaming request body using `HarpFrameReader`.
+  Forwards DATA payloads to the session's `from_client_tx` channel, skips
+  KEEPALIVE frames, and removes the session on CLOSE. Updates `last_activity`
+  on each frame to prevent idle reaping. Returns piggybacked download frames
+  in the response body for HTTP/1.1 polling backward compatibility.
+
+- `h2_download_handler` — `GET /api/v1/harp/download/{session_id}`: Returns a
+  streaming response body built with `futures_util::stream::unfold`. Reads
+  frames from the session's `to_client_rx` channel and sends each as a chunk.
+  Updates `last_activity` on each frame. The stream ends when the HTTP/2
+  connection is closed by the client.
+
+**Routes (in `src/web/mod.rs`):**
+
+```rust
+.route("/harp/upload/{session_id}", post(harp::h2_upload_handler))
+.route("/harp/download/{session_id}", get(harp::h2_download_handler)
+    .post(harp::poll_download_handler))  // polling backward compat
+```
+
+- `poll_download_handler` — `POST /api/v1/harp/download/{session_id}`: Non-blocking
+  drain of all currently queued frames, returned as concatenated wire bytes. Used
+  by HTTP/1.1 polling clients (`HarpPollReceiver`). Returns empty body when no
+  frames are available.
+
+**DPI resistance:** Both handlers return `200 OK` with empty body for unknown
+or malformed session IDs, preventing fingerprinting of error responses.
+
+**Server TLS ALPN:** `axum-server` with rustls automatically advertises
+`h2` + `http/1.1` ALPN, allowing the server to accept both HTTP/2 and
+HTTP/1.1 clients on the same port.
+
+### H2 Capability Advertisement (Step 4.5)
+
+The session response now includes a `capabilities` field in `HarpTransportInfo`
+listing the transport bindings the server supports. This enables clients to
+auto-select the best available binding.
+
+**Server-side (`src/web/harp.rs`):**
+
+- `HarpTransportInfo.capabilities: Vec<String>` — e.g., `["h2", "stream", "poll"]`
+- `build_server_capabilities(h2_streaming_enabled)` builds the list based on config
+- `select_transport_mode(client_capabilities, h2_streaming_enabled)` uses priority
+  `h2 > stream > poll`, selecting h2 only when both client and server support it
+- Fake responses include `["stream", "poll"]` capabilities for DPI resistance
+
+**Client-side (`src/client.rs`):**
+
+- `HarpSessionResult.server_capabilities: Vec<String>` — capabilities from server
+- `resolve_binding(preferred_binding, server_capabilities)` auto-selects binding:
+  - Explicit `preferred_binding` overrides auto-select
+  - When `None`, picks `h2 > stream > poll` from server capabilities
+- Both `connect_inner()` and `connect_via_cdn()` use `resolve_binding()`
+
+**AppState (`src/web/state.rs`):**
+
+- `h2_streaming_enabled: bool` — derived from resolved transport config in `main.rs`

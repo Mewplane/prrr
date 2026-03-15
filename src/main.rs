@@ -219,6 +219,8 @@ async fn main() -> anyhow::Result<()> {
                     metrics_enabled,
                 });
 
+                let resolved_server_transports = prrr::config::resolve_server_transports(&config);
+
                 let app_state = prrr::web::AppState {
                     registry: std::sync::Arc::clone(&registry),
                     active_connections: std::sync::Arc::clone(&active_connections),
@@ -231,8 +233,8 @@ async fn main() -> anyhow::Result<()> {
                     config_tokens: std::sync::Arc::clone(&config_tokens),
                     server_config,
                     resolved_transports: std::sync::Arc::new(
-                        prrr::config::resolve_server_transports(&config)
-                            .into_iter()
+                        resolved_server_transports
+                            .iter()
                             .map(|rt| match rt {
                                 prrr::config::ResolvedTransport::Harp {
                                     websocket_enabled,
@@ -240,15 +242,15 @@ async fn main() -> anyhow::Result<()> {
                                     session_idle_timeout,
                                     ..
                                 } => prrr::web::handlers::TransportInfoResponse::from_harp(
-                                    websocket_enabled,
-                                    polling_enabled,
-                                    session_idle_timeout,
+                                    *websocket_enabled,
+                                    *polling_enabled,
+                                    *session_idle_timeout,
                                 ),
                                 prrr::config::ResolvedTransport::Masque {
                                     max_idle_timeout,
                                     keep_alive,
                                     ..
-                                } => prrr::web::handlers::TransportInfoResponse::from_masque(max_idle_timeout, keep_alive),
+                                } => prrr::web::handlers::TransportInfoResponse::from_masque(*max_idle_timeout, *keep_alive),
                             })
                             .collect(),
                     ),
@@ -259,6 +261,15 @@ async fn main() -> anyhow::Result<()> {
                     tunnel_spawner: None,
                     cover_page_enabled: web_config.cover_page_enabled.unwrap_or(true),
                     trust_proxy_headers: web_config.trust_proxy_headers.unwrap_or(false),
+                    h2_streaming_enabled: resolved_server_transports.iter().any(|rt| {
+                        matches!(
+                            rt,
+                            prrr::config::ResolvedTransport::Harp {
+                                h2_streaming_enabled: true,
+                                ..
+                            }
+                        )
+                    }),
                 };
                 tracing::info!(%listen_addr, "starting web admin server");
                 Some(tokio::spawn(prrr::web::run_web_server(listen_addr, app_state)))

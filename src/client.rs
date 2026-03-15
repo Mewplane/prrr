@@ -1,5 +1,6 @@
 // FRD: specs/frds/FRD-009.md
 // FRD: specs/frds/FRD-20260223-harp-client-transport.md
+// FRD: specs/frds/FRD-20260315-h2-capability-advertisement.md
 
 //! VPN client orchestrator.
 //!
@@ -178,6 +179,8 @@ pub struct HarpSessionResult {
     pub download_endpoint: String,
     /// Suggested polling interval in milliseconds.
     pub poll_interval_ms: u64,
+    /// Transport capabilities advertised by the server.
+    pub server_capabilities: Vec<String>,
 }
 
 /// Client-side WebSocket sender implementing [`DatagramSender`].
@@ -559,6 +562,7 @@ pub async fn establish_harp_session(
         upload_endpoint: response.transport.upload_endpoint,
         download_endpoint: response.transport.download_endpoint,
         poll_interval_ms: response.config.poll_interval_ms,
+        server_capabilities: response.transport.capabilities,
     })
 }
 
@@ -1181,8 +1185,29 @@ const LOG_HARP_H2_STREAMS: &str = "HARP transport: using HTTP/2 streams";
 /// Preferred binding value for HTTP/2 streaming.
 const BINDING_H2: &str = "h2";
 
+/// Preferred binding value for WebSocket streaming.
+const BINDING_STREAM: &str = "stream";
+
 /// Preferred binding value for HTTP polling.
 const BINDING_POLL: &str = "poll";
+
+/// Resolve the effective binding given user preference and server capabilities.
+///
+/// When `preferred_binding` is `Some`, uses it directly. When `None`,
+/// auto-selects using priority h2 > stream > poll based on server capabilities.
+fn resolve_binding(preferred_binding: Option<&str>, server_capabilities: &[String]) -> Option<String> {
+    if let Some(pref) = preferred_binding {
+        return Some(pref.to_string());
+    }
+    // Auto-select: h2 > stream > poll
+    if server_capabilities.iter().any(|c| c == BINDING_H2) {
+        Some(BINDING_H2.to_string())
+    } else if server_capabilities.iter().any(|c| c == BINDING_STREAM) {
+        Some(BINDING_STREAM.to_string())
+    } else {
+        None // fall through to existing WebSocket-then-poll logic
+    }
+}
 
 /// Establish an HTTP/2 connection and open upload/download streams.
 ///
@@ -1513,8 +1538,11 @@ impl HarpClientTransport {
         .await?;
         tracing::info!(mode = %session.transport_mode, "HARP handshake complete");
 
+        // Resolve effective binding from preference + server capabilities
+        let effective_binding = resolve_binding(self.preferred_binding.as_deref(), &session.server_capabilities);
+
         // HTTP/2 streaming path
-        if self.preferred_binding.as_deref() == Some(BINDING_H2) {
+        if effective_binding.as_deref() == Some(BINDING_H2) {
             let (sender, receiver) = connect_harp_h2(
                 &self.server_name,
                 port,
@@ -1531,7 +1559,7 @@ impl HarpClientTransport {
             });
         }
 
-        let use_polling = self.preferred_binding.as_deref() == Some(BINDING_POLL);
+        let use_polling = effective_binding.as_deref() == Some(BINDING_POLL);
         if use_polling {
             tracing::info!("HARP transport: forced HTTP polling (preferred_binding=poll)");
         }
@@ -1619,8 +1647,11 @@ impl HarpClientTransport {
         .await?;
         tracing::info!(mode = %session.transport_mode, "HARP CDN handshake complete");
 
+        // Resolve effective binding from preference + server capabilities
+        let effective_binding = resolve_binding(self.preferred_binding.as_deref(), &session.server_capabilities);
+
         // HTTP/2 streaming path through CDN
-        if self.preferred_binding.as_deref() == Some(BINDING_H2) {
+        if effective_binding.as_deref() == Some(BINDING_H2) {
             let (sender, receiver) =
                 connect_harp_h2(cdn_domain, port, &session.session_id, self.insecure, self.fwmark, self.tls_profile).await?;
             return Ok(TransportConnection {
@@ -1630,7 +1661,7 @@ impl HarpClientTransport {
             });
         }
 
-        let use_polling = self.preferred_binding.as_deref() == Some(BINDING_POLL);
+        let use_polling = effective_binding.as_deref() == Some(BINDING_POLL);
         if use_polling {
             tracing::info!("HARP CDN transport: forced HTTP polling (preferred_binding=poll)");
         }
@@ -1698,6 +1729,38 @@ mod tests {
 
     // -- Constants for tests --
     const SMALL_PAYLOAD: &[u8] = b"hello-harp";
+
+    // -- AC-7: Client auto-selects h2 when server advertises it
+    #[test]
+    fn client_auto_selects_h2() {
+        let caps = vec!["h2".to_string(), "stream".to_string(), "poll".to_string()];
+        let binding = resolve_binding(None, &caps);
+        assert_eq!(binding.as_deref(), Some(BINDING_H2));
+    }
+
+    // -- AC-8: Client auto-selects stream when server has no h2
+    #[test]
+    fn client_auto_selects_stream_no_h2() {
+        let caps = vec!["stream".to_string(), "poll".to_string()];
+        let binding = resolve_binding(None, &caps);
+        assert_eq!(binding.as_deref(), Some(BINDING_STREAM));
+    }
+
+    // -- Explicit preference overrides auto-select
+    #[test]
+    fn client_explicit_binding_overrides_auto_select() {
+        let caps = vec!["h2".to_string(), "stream".to_string(), "poll".to_string()];
+        let binding = resolve_binding(Some(BINDING_POLL), &caps);
+        assert_eq!(binding.as_deref(), Some(BINDING_POLL));
+    }
+
+    // -- Empty capabilities returns None (fall through to ws-then-poll)
+    #[test]
+    fn client_empty_capabilities_returns_none() {
+        let caps: Vec<String> = vec![];
+        let binding = resolve_binding(None, &caps);
+        assert!(binding.is_none());
+    }
 
     /// Type alias for a pinned, boxed WS sink used in test helpers.
     type MockWsSink = std::pin::Pin<
@@ -2046,6 +2109,7 @@ mod tests {
             tunnel_spawner: None,
             cover_page_enabled: true,
             trust_proxy_headers: false,
+            h2_streaming_enabled: true,
         }
     }
 

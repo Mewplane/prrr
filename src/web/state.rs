@@ -63,4 +63,6 @@ pub struct AppState {
     /// Whether to trust proxy headers for real client IP extraction (default: `false`).
     /// Enable when behind a trusted CDN (e.g., Cloudflare).
     pub trust_proxy_headers: bool,
+    /// Whether the server supports HTTP/2 streaming binding (default: `true`).
+    pub h2_streaming_enabled: bool,
 }
