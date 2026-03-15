@@ -9,11 +9,17 @@
 
 use std::net::Ipv4Addr;
 
-/// Default inner tunnel MTU (IPv6 minimum, works everywhere without fragmentation).
-pub const DEFAULT_TUNNEL_MTU: u16 = 1280;
+/// Default inner tunnel MTU.
+///
+/// Must fit within a single QUIC datagram after encryption (26 bytes) and
+/// MASQUE framing (~4 bytes) overhead. Quinn's min QUIC UDP payload is
+/// 1200 bytes, but QUIC packet headers consume ~30 bytes, leaving ~1170
+/// bytes for datagram payload. With 30 bytes of tunnel overhead:
+/// 1170 − 30 = 1140, rounded down to 1100 for safety.
+pub const DEFAULT_TUNNEL_MTU: u16 = 1100;
 
-/// Minimum allowed tunnel MTU (IPv6 minimum per RFC 8200).
-pub const MIN_TUNNEL_MTU: u16 = 1280;
+/// Minimum allowed tunnel MTU (conservative lower bound).
+pub const MIN_TUNNEL_MTU: u16 = 576;
 
 /// Maximum allowed tunnel MTU (WireGuard-equivalent for Ethernet).
 pub const MAX_TUNNEL_MTU: u16 = 1420;

@@ -309,7 +309,14 @@ async fn handle_client<F: TunFactory>(
     let (tun, _handle) = tun_factory
         .create_tun(&tun_config)
         .map_err(|e| anyhow::anyhow!("TUN creation failed: {e}"))?;
-    tracing::info!(device = tun.name(), address = %gateway_ip, peer = %client_ip, "TUN device created for client");
+    tracing::info!(device = tun.name(), address = %gateway_ip, peer = %client_ip, mtu = tun.mtu(), "TUN device created for client");
+
+    // Log QUIC datagram size budget for debugging MTU issues
+    if let Some(max_dg) = proxy.max_datagram_size() {
+        let overhead = crate::client::TUNNEL_OVERHEAD_BYTES;
+        let safe_mtu = max_dg.saturating_sub(overhead + 4); // +4 for MASQUE framing
+        tracing::info!(max_datagram_size = max_dg, overhead = overhead + 4, safe_mtu, tun_mtu = tun.mtu(), "QUIC datagram budget");
+    }
 
     // Build encrypted channel and pipeline
     let channel = EncryptedChannel::new(resp_result.session_keys.rx_key, resp_result.session_keys.tx_key);

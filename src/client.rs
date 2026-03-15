@@ -87,16 +87,19 @@ pub async fn run_client<T: TunDevice>(
     // Check that TUN MTU fits within the QUIC datagram size budget
     let tun_mtu = usize::from(tun.mtu());
     if let Some(max_dg) = masque_client.max_datagram_size() {
-        let needed = tun_mtu + TUNNEL_OVERHEAD_BYTES;
+        let masque_framing = 4; // varint quarter_stream_id + context_id
+        let total_overhead = TUNNEL_OVERHEAD_BYTES + masque_framing;
+        let needed = tun_mtu + total_overhead;
+        let safe_mtu = max_dg.saturating_sub(total_overhead);
+        tracing::info!(tun_mtu, max_datagram_size = max_dg, overhead = total_overhead, safe_mtu, "QUIC datagram budget");
         if needed > max_dg {
             tracing::error!(
-                tun_mtu = tun_mtu,
-                overhead = TUNNEL_OVERHEAD_BYTES,
+                tun_mtu,
                 max_datagram_size = max_dg,
-                "TUN MTU too large: {tun_mtu} + {TUNNEL_OVERHEAD_BYTES} byte overhead = {needed}, \
+                safe_mtu,
+                "TUN MTU too large: {tun_mtu} + {total_overhead} byte overhead = {needed}, \
                  but QUIC max datagram is {max_dg}. Large packets will be dropped. \
-                 Lower interface.mtu in client config to at most {}.",
-                max_dg.saturating_sub(TUNNEL_OVERHEAD_BYTES)
+                 Lower interface.mtu in client config to at most {safe_mtu}.",
             );
         }
     }

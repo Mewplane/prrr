@@ -46,8 +46,8 @@ pub const DEFAULT_SUBNET: &str = "10.66.66.0/24";
 /// Default DNS servers for VPN clients.
 pub const DEFAULT_DNS_SERVERS: &[&str] = &["1.1.1.1", "8.8.8.8"];
 
-/// Default tunnel MTU.
-pub const DEFAULT_MTU: u16 = 1280;
+/// Default tunnel MTU (must fit in QUIC datagrams after encryption + MASQUE overhead).
+pub const DEFAULT_MTU: u16 = 1100;
 
 /// Default path for server X25519 identity key.
 pub const DEFAULT_IDENTITY_KEY_PATH: &str = "/etc/prrr/keys/server_identity.key";
@@ -1222,7 +1222,7 @@ server_name = "www.google.com"
 [network]
 subnet = "10.66.66.0/24"
 dns_servers = ["1.1.1.1", "8.8.8.8"]
-mtu = 1280
+mtu = 1100
 
 [crypto]
 identity_key_path = "/etc/prrr/keys/server_identity.key"
@@ -1463,7 +1463,7 @@ private_key_path = "/home/user/.local/share/prrr/keys/client.key"
 pq_private_key_path = "/home/user/.local/share/prrr/keys/client_pq.key"
 address = "10.66.66.2/32"
 dns = ["1.1.1.1", "8.8.8.8"]
-mtu = 1280
+mtu = 1100
 
 [routing]
 all_traffic = true
@@ -1802,7 +1802,7 @@ name = "harp"
         assert_eq!(DEFAULT_DATA_DIR, "/var/lib/prrr");
         assert_eq!(DEFAULT_SUBNET, "10.66.66.0/24");
         assert_eq!(DEFAULT_DNS_SERVERS, &["1.1.1.1", "8.8.8.8"]);
-        assert_eq!(DEFAULT_MTU, 1280);
+        assert_eq!(DEFAULT_MTU, 1100);
         assert_eq!(DEFAULT_IDENTITY_KEY_PATH, "/etc/prrr/keys/server_identity.key");
         assert_eq!(DEFAULT_PQ_KEY_PATH, "/etc/prrr/keys/server_pq.key");
         assert_eq!(DEFAULT_REKEY_INTERVAL, 3600);
