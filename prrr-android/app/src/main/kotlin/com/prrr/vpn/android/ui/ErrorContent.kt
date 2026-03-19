@@ -28,6 +28,10 @@ data class ErrorContent(
         private const val MSG_NETWORK_ERROR =
             "A network error occurred. Please check your connection and try again."
 
+        private const val TITLE_TUNNEL_FAILED = "Tunnel Error"
+        private const val MSG_TUNNEL_FAILED =
+            "The encrypted tunnel encountered an error. Please reconnect."
+
         private const val TITLE_NOT_CONNECTED = "Not Connected"
         private const val MSG_NOT_CONNECTED =
             "VPN is not currently connected."
@@ -55,6 +59,12 @@ data class ErrorContent(
         fun fromNetworkError(): ErrorContent = ErrorContent(
             title = TITLE_NETWORK_ERROR,
             message = MSG_NETWORK_ERROR,
+            retryLabel = LABEL_RETRY
+        )
+
+        fun fromTunnelFailed(): ErrorContent = ErrorContent(
+            title = TITLE_TUNNEL_FAILED,
+            message = MSG_TUNNEL_FAILED,
             retryLabel = LABEL_RETRY
         )
 

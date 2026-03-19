@@ -91,7 +91,13 @@ pub async fn run_client<T: TunDevice>(
         let total_overhead = TUNNEL_OVERHEAD_BYTES + masque_framing;
         let needed = tun_mtu + total_overhead;
         let safe_mtu = max_dg.saturating_sub(total_overhead);
-        tracing::info!(tun_mtu, max_datagram_size = max_dg, overhead = total_overhead, safe_mtu, "QUIC datagram budget");
+        tracing::info!(
+            tun_mtu,
+            max_datagram_size = max_dg,
+            overhead = total_overhead,
+            safe_mtu,
+            "QUIC datagram budget"
+        );
         if needed > max_dg {
             tracing::error!(
                 tun_mtu,
@@ -1261,27 +1267,37 @@ async fn connect_harp_h2(
         return Err(anyhow::anyhow!("TCP connect to {addr}: {err}"));
     }
 
-    // TLS handshake with H2-only ALPN
-    let tls_config = build_harp_h2_rustls_config(insecure, profile)?;
-    let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
-    let server_name =
-        rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|e| anyhow::anyhow!("invalid server name '{host}': {e}"))?;
-    let tls_stream = tls_connector
-        .connect(server_name, tcp_stream)
-        .await
-        .map_err(|e| anyhow::anyhow!("TLS handshake for H2 failed: {e}"))?;
-
-    // h2 client handshake over TLS stream
-    let (send_request, connection) = h2::client::handshake(tls_stream)
-        .await
-        .map_err(|e| anyhow::anyhow!("H2 handshake failed: {e}"))?;
-
-    // Spawn connection driver
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            tracing::debug!("H2 connection closed: {e}");
-        }
-    });
+    // H2 handshake: h2c (cleartext) when insecure, h2 (TLS) otherwise
+    let send_request = if insecure {
+        tracing::debug!("H2: using h2c (cleartext HTTP/2)");
+        let (send_request, connection) = h2::client::handshake(tcp_stream)
+            .await
+            .map_err(|e| anyhow::anyhow!("h2c handshake failed: {e}"))?;
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::debug!("h2c connection closed: {e}");
+            }
+        });
+        send_request
+    } else {
+        let tls_config = build_harp_h2_rustls_config(insecure, profile)?;
+        let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+        let server_name =
+            rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|e| anyhow::anyhow!("invalid server name '{host}': {e}"))?;
+        let tls_stream = tls_connector
+            .connect(server_name, tcp_stream)
+            .await
+            .map_err(|e| anyhow::anyhow!("TLS handshake for H2 failed: {e}"))?;
+        let (send_request, connection) = h2::client::handshake(tls_stream)
+            .await
+            .map_err(|e| anyhow::anyhow!("H2 handshake failed: {e}"))?;
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::debug!("H2 connection closed: {e}");
+            }
+        });
+        send_request
+    };
 
     // Encode session_id as URL-safe base64 for URL path
     let session_id_bytes = BASE64
@@ -2113,6 +2129,7 @@ mod tests {
             cover_page_enabled: true,
             trust_proxy_headers: false,
             h2_streaming_enabled: true,
+            active_clients: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -2388,6 +2405,7 @@ mod tests {
                         tun_factory,
                         cancel,
                         active_connections: Arc::new(AtomicU32::new(0)),
+                        active_clients: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
                     },
                 )
                 .await

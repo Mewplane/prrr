@@ -17,7 +17,19 @@ thiserror = "2.0"
 base64 = "0.22"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
-tokio = { version = "1.41", features = ["rt-multi-thread", "time"] }
+tokio = { version = "1.41", features = ["rt-multi-thread", "time", "io-util", "net", "macros"] }
+libc = "0.2"
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-android = { version = "0.2", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+flate2 = "1.1"
+prrr = { path = "..", default-features = false }
+
+[features]
+default = ["android-logging"]
+android-logging = ["dep:tracing-android"]
 
 [build-dependencies]
 uniffi = { version = "0.29", features = ["build"] }

@@ -84,12 +84,14 @@ impl TunConfig {
 /// A real Linux TUN device backed by `tokio_tun`.
 ///
 /// Requires `CAP_NET_ADMIN` or root privileges to create.
+#[cfg(feature = "system-tun")]
 pub struct SystemTun {
     inner: tokio_tun::Tun,
     device_name: String,
     device_mtu: u16,
 }
 
+#[cfg(feature = "system-tun")]
 impl SystemTun {
     /// Create a new system TUN device from a [`TunConfig`].
     pub fn from_config(config: &TunConfig) -> std::io::Result<Self> {
@@ -122,6 +124,7 @@ impl SystemTun {
     }
 }
 
+#[cfg(feature = "system-tun")]
 impl TunDevice for SystemTun {
     fn name(&self) -> &str {
         &self.device_name
@@ -148,10 +151,12 @@ impl TunDevice for SystemTun {
 /// devices don't need a test handle.
 ///
 /// Requires `CAP_NET_ADMIN` or root privileges.
+#[cfg(feature = "system-tun")]
 pub struct SystemTunFactory {
     counter: std::sync::atomic::AtomicU32,
 }
 
+#[cfg(feature = "system-tun")]
 impl SystemTunFactory {
     /// Create a new factory starting device names at `prrr0`.
     pub fn new() -> Self {
@@ -161,12 +166,14 @@ impl SystemTunFactory {
     }
 }
 
+#[cfg(feature = "system-tun")]
 impl Default for SystemTunFactory {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "system-tun")]
 impl super::TunFactory for SystemTunFactory {
     type Tun = SystemTun;
     type Handle = ();

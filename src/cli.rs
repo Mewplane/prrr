@@ -35,7 +35,10 @@ pub fn handle_server_client_action(
     server_args: &ServerArgs,
 ) -> anyhow::Result<()> {
     match action {
-        ServerClientAction::Add { name } => handle_client_add(registry, name),
+        ServerClientAction::Add { name, qr } => {
+            let ctx = build_server_context(config, server_args)?;
+            handle_client_add(registry, &ctx, name, *qr)
+        }
         ServerClientAction::List => handle_client_list(registry),
         ServerClientAction::Remove { name } => handle_client_remove(registry, name),
         ServerClientAction::Export { name, qr, output } => {
@@ -101,24 +104,43 @@ fn build_server_context(config: &ServerConfig, server_args: &ServerArgs) -> anyh
     })
 }
 
-/// Register a new VPN client with auto-generated keys.
-fn handle_client_add(registry: &mut ClientRegistry, name: &str) -> anyhow::Result<()> {
+/// Register a new VPN client and output a complete ready-to-use config.
+///
+/// The config includes the inline `private_key` and works for both Linux CLI
+/// (`prrr client --config <file>`) and mobile import (QR scan). The private
+/// key is generated here and never stored on the server — this is the only
+/// time it is available.
+///
+/// With `--qr`, also writes a QR code SVG to `<name>.svg` for mobile scanning.
+fn handle_client_add(registry: &mut ClientRegistry, ctx: &ServerContext, name: &str, qr: bool) -> anyhow::Result<()> {
     let keypair = KeyPair::generate()?;
     let public_key = *keypair.public_key();
-    let private_key_b64 = BASE64.encode(keypair.private_key_bytes());
 
     let record = registry.add(name, public_key, None)?;
 
-    let public_key_b64 = BASE64.encode(record.public_key);
+    let config_toml = generate_client_config(ctx, &record, Some(keypair.private_key_bytes()))
+        .map_err(|e| anyhow::anyhow!("config generation failed: {e}"))?;
 
-    println!("Client registered:");
-    println!("  Name:        {}", record.name);
-    println!("  ID:          {}", record.id);
-    println!("  IP Address:  {}", record.ip_address);
-    println!("  Public Key:  {public_key_b64}");
-    println!("  Private Key: {private_key_b64}");
-    println!();
-    println!("Save the private key now. It will not be shown again.");
+    eprintln!("Client registered:");
+    eprintln!("  Name:       {}", record.name);
+    eprintln!("  ID:         {}", record.id);
+    eprintln!("  IP Address: {}", record.ip_address);
+
+    if qr {
+        let svg = generate_qr_svg(&config_toml)
+            .map_err(|e| anyhow::anyhow!("QR generation failed: {e}"))?;
+        let qr_path = format!("{name}.svg");
+        std::fs::write(&qr_path, &svg)?;
+        eprintln!("  QR code:    {qr_path}");
+    }
+
+    eprintln!();
+    eprintln!("Config written to stdout. Save it now — the private key will not be shown again.");
+    eprintln!("Usage: prrr server client add {name} > {name}.toml");
+    eprintln!();
+
+    // Config to stdout (pipe-friendly)
+    print!("{config_toml}");
 
     Ok(())
 }
@@ -169,7 +191,7 @@ fn handle_client_export(registry: &ClientRegistry, ctx: &ServerContext, name: &s
         .get_by_name(name)
         .ok_or_else(|| anyhow::anyhow!("client not found: {name}"))?;
 
-    let config_toml = generate_client_config(ctx, &record).map_err(|e| anyhow::anyhow!("config generation failed: {e}"))?;
+    let config_toml = generate_client_config(ctx, &record, None).map_err(|e| anyhow::anyhow!("config generation failed: {e}"))?;
 
     let content = if qr {
         generate_qr_svg(&config_toml).map_err(|e| anyhow::anyhow!("QR generation failed: {e}"))?
@@ -204,7 +226,7 @@ pub fn handle_client_import(source: &str) -> anyhow::Result<()> {
 ///
 /// Reads from file path or `prrr://import` URL, validates as client TOML,
 /// and writes to `<config_dir>/client.toml`.
-fn import_config_to(source: &str, config_dir: &Path) -> anyhow::Result<()> {
+pub fn import_config_to(source: &str, config_dir: &Path) -> anyhow::Result<()> {
     let config_toml = if source.starts_with(IMPORT_URL_PREFIX) {
         decode_import_url(source).map_err(|e| anyhow::anyhow!("URL decode failed: {e}"))?
     } else {
@@ -244,7 +266,7 @@ mod tests {
             kem_public_key: vec![0xBB; 64],
             dns_servers: vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
             mtu: 1280,
-            transport_protocol: "harp".to_string(),
+            transport_protocol: "masque".to_string(),
         }
     }
 
@@ -252,7 +274,7 @@ mod tests {
     #[test]
     fn cli_add_creates_client() {
         let mut registry = test_registry();
-        handle_client_add(&mut registry, TEST_CLIENT_NAME).expect("add should succeed");
+        handle_client_add(&mut registry, &test_server_context(), TEST_CLIENT_NAME, false).expect("add should succeed");
 
         let record = registry.get_by_name(TEST_CLIENT_NAME).expect("client should exist");
         assert_eq!(record.name, TEST_CLIENT_NAME);
@@ -262,8 +284,8 @@ mod tests {
     #[test]
     fn cli_add_duplicate_name_fails() {
         let mut registry = test_registry();
-        handle_client_add(&mut registry, TEST_CLIENT_NAME).expect("first add");
-        let err = handle_client_add(&mut registry, TEST_CLIENT_NAME);
+        handle_client_add(&mut registry, &test_server_context(), TEST_CLIENT_NAME, false).expect("first add");
+        let err = handle_client_add(&mut registry, &test_server_context(), TEST_CLIENT_NAME, false);
         assert!(err.is_err(), "duplicate name should fail");
     }
 
@@ -271,8 +293,8 @@ mod tests {
     #[test]
     fn cli_list_returns_clients() {
         let mut registry = test_registry();
-        handle_client_add(&mut registry, "alice").expect("add alice");
-        handle_client_add(&mut registry, "bob").expect("add bob");
+        handle_client_add(&mut registry, &test_server_context(), "alice", false).expect("add alice");
+        handle_client_add(&mut registry, &test_server_context(), "bob", false).expect("add bob");
 
         // list should succeed (output goes to stdout)
         handle_client_list(&registry).expect("list should succeed");
@@ -290,7 +312,7 @@ mod tests {
     #[test]
     fn cli_remove_revokes_client() {
         let mut registry = test_registry();
-        handle_client_add(&mut registry, TEST_CLIENT_NAME).expect("add");
+        handle_client_add(&mut registry, &test_server_context(), TEST_CLIENT_NAME, false).expect("add");
         assert_eq!(registry.count(), 1);
 
         handle_client_remove(&mut registry, TEST_CLIENT_NAME).expect("remove should succeed");
@@ -310,7 +332,7 @@ mod tests {
     #[test]
     fn cli_export_produces_toml() {
         let mut registry = test_registry();
-        handle_client_add(&mut registry, TEST_CLIENT_NAME).expect("add");
+        handle_client_add(&mut registry, &test_server_context(), TEST_CLIENT_NAME, false).expect("add");
         let ctx = test_server_context();
 
         // Export to file
@@ -329,7 +351,7 @@ mod tests {
     #[test]
     fn cli_export_qr_produces_svg() {
         let mut registry = test_registry();
-        handle_client_add(&mut registry, TEST_CLIENT_NAME).expect("add");
+        handle_client_add(&mut registry, &test_server_context(), TEST_CLIENT_NAME, false).expect("add");
         let ctx = test_server_context();
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -345,7 +367,7 @@ mod tests {
     #[test]
     fn cli_export_writes_to_file() {
         let mut registry = test_registry();
-        handle_client_add(&mut registry, TEST_CLIENT_NAME).expect("add");
+        handle_client_add(&mut registry, &test_server_context(), TEST_CLIENT_NAME, false).expect("add");
         let ctx = test_server_context();
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -389,10 +411,16 @@ mod tests {
     #[test]
     fn cli_import_decodes_url() {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use flate2::Compression;
+        use flate2::write::DeflateEncoder;
+        use std::io::Write;
 
         let toml_content = "[client]\nname = \"url-client\"\n\n[server]\nendpoint = \"10.0.0.1:443\"\n";
-        let encoded = URL_SAFE_NO_PAD.encode(toml_content.as_bytes());
-        let url = format!("prrr://import?config={encoded}");
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(toml_content.as_bytes()).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let encoded = URL_SAFE_NO_PAD.encode(&compressed);
+        let url = format!("prrr://import?z={encoded}");
 
         let dir = tempfile::tempdir().expect("tempdir");
         let output_dir = dir.path().join("config");

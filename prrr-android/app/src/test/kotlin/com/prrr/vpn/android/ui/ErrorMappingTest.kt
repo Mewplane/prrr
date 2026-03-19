@@ -115,6 +115,31 @@ class ErrorMappingTest {
     }
 
     @Test
+    fun `TunnelFailed maps to correct title`() {
+        // Mutant killed: wrong title for TunnelFailed
+        val content = ErrorContent.fromTunnelFailed()
+        assertEquals("Tunnel Error", content.title)
+    }
+
+    @Test
+    fun `TunnelFailed maps to correct message`() {
+        // Mutant killed: wrong message for TunnelFailed
+        val content = ErrorContent.fromTunnelFailed()
+        assertEquals(
+            "The encrypted tunnel encountered an error. Please reconnect.",
+            content.message
+        )
+    }
+
+    @Test
+    fun `TunnelFailed has retry action`() {
+        // Mutant killed: TunnelFailed missing retry action
+        val content = ErrorContent.fromTunnelFailed()
+        assertNotNull(content.retryLabel)
+        assertEquals("Retry", content.retryLabel)
+    }
+
+    @Test
     fun `NotConnected maps to correct title`() {
         // Mutant killed: wrong title for NotConnected
         val content = ErrorContent.fromNotConnected()

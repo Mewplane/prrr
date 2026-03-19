@@ -13,7 +13,9 @@ pub mod tun_device;
 
 pub use mock_tun::{CapturingMockTunFactory, MockTun, MockTunFactory, MockTunHandle};
 pub use pipeline::TunnelPipeline;
-pub use tun_device::{SystemTun, SystemTunFactory, TunConfig, TunDevice};
+#[cfg(feature = "system-tun")]
+pub use tun_device::{SystemTun, SystemTunFactory};
+pub use tun_device::{TunConfig, TunDevice};
 
 /// Factory trait for creating per-client TUN devices.
 ///

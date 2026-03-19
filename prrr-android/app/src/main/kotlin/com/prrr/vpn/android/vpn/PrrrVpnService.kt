@@ -1,4 +1,4 @@
-// FRD: specs/frds/FRD-M011-vpnservice-foundation.md
+// FRD: specs/frds/FRD-M025-android-vpnservice-real-flow.md
 package com.prrr.vpn.android.vpn
 
 import android.app.Notification
@@ -6,6 +6,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
 import android.util.Log
@@ -13,34 +14,31 @@ import androidx.core.app.NotificationCompat
 import com.prrr.vpn.android.MainActivity
 import com.prrr.vpn.android.R
 import com.prrr.vpn.android.storage.ConfigurationManager
-import uniffi.prrr_mobile.ConnectionStatus
+import com.prrr.vpn.android.viewmodel.PrrrVpnServiceAccessor
 import uniffi.prrr_mobile.VpnConnection
-import java.io.FileInputStream
-import java.io.FileOutputStream
 
 private const val TAG = "PrrrVpnService"
 private const val NOTIFICATION_ID = 1
 private const val CHANNEL_ID = "vpn_service"
 private const val CHANNEL_NAME = "VPN Service"
+private const val VPN_SUBNET = "10.66.66.0"
+private const val VPN_SUBNET_PREFIX = 24
 
 /**
- * Android VpnService implementation that manages system VPN interface.
+ * Android VpnService that delegates packet processing to the Rust tunnel pipeline.
  *
- * **Current Limitations:**
- * - Packet processing is a stub (reads from TUN but doesn't forward)
- * - No actual internet connectivity (requires Rust transport integration)
- * - This is foundation infrastructure for UI development
- *
- * **Future Work:**
- * - Integrate real QUIC/MASQUE transport
- * - Implement packet encryption/decryption
- * - Wire up actual tunneling
+ * Flow:
+ * 1. Load configuration from encrypted storage
+ * 2. Create VPN interface via Builder (assigns IP, MTU, DNS, routes)
+ * 3. Detach TUN fd and pass to Rust VpnConnection.connect(tunFd)
+ * 4. Rust creates AndroidTun + EncryptedChannel + TunnelPipeline
+ * 5. Pipeline runs until disconnect() cancels the CancellationToken
  */
 class PrrrVpnService : VpnService() {
 
     private var vpnInterface: ParcelFileDescriptor? = null
-    private var connection: VpnConnection? = null
-    private var packetThread: Thread? = null
+    var connection: VpnConnection? = null
+        private set
 
     companion object {
         const val ACTION_CONNECT = "com.prrr.vpn.android.CONNECT"
@@ -51,6 +49,7 @@ class PrrrVpnService : VpnService() {
         super.onCreate()
         Log.i(TAG, "VpnService onCreate")
         createNotificationChannel()
+        PrrrVpnServiceAccessor.register(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -71,6 +70,7 @@ class PrrrVpnService : VpnService() {
     override fun onDestroy() {
         Log.i(TAG, "VpnService onDestroy")
         disconnect()
+        PrrrVpnServiceAccessor.unregister()
         super.onDestroy()
     }
 
@@ -79,71 +79,114 @@ class PrrrVpnService : VpnService() {
         Log.i(TAG, "connect() called")
 
         // Check if already connected
-        if (vpnInterface != null) {
+        if (connection != null) {
             Log.w(TAG, "Already connected, ignoring")
             return
         }
 
         // Promote to foreground immediately (required for API 26+)
-        val notification = createNotification("Connecting...")
-        startForeground(NOTIFICATION_ID, notification)
+        val notification = createNotification("Resolving server...")
+        startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+
+        // Load configuration from storage
+        val config = ConfigurationManager.loadConfiguration(this)
+        if (config == null) {
+            Log.e(TAG, "No configuration found")
+            updateNotification("Error: No configuration")
+            stopSelf()
+            return
+        }
+
+        Log.i(TAG, "Loaded config for: ${config.clientName}")
+
+        // Resolve DNS on a background thread (Android blocks network on main thread),
+        // then establish the VPN interface on the main thread.
+        val serverHost = config.serverEndpoint.substringBeforeLast(":")
+        Thread {
+            val serverAddr = try {
+                java.net.InetAddress.getByName(serverHost)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to resolve server: $serverHost: ${e.message}")
+                android.os.Handler(mainLooper).post {
+                    updateNotification("Error: DNS resolution failed")
+                    stopSelf()
+                }
+                return@Thread
+            }
+            Log.i(TAG, "Resolved server $serverHost -> ${serverAddr.hostAddress}")
+
+            // Post back to main thread to set up VPN interface (requires main thread)
+            android.os.Handler(mainLooper).post {
+                establishVpn(config, serverAddr)
+            }
+        }.start()
+    }
+
+    @Synchronized
+    private fun establishVpn(config: uniffi.prrr_mobile.VpnConfig, serverAddr: java.net.InetAddress) {
+        if (connection != null) {
+            Log.w(TAG, "Already connected, ignoring")
+            return
+        }
+
+        updateNotification("Connecting...")
 
         try {
-            // Load configuration from storage
-            val config = ConfigurationManager.loadConfiguration(this)
-            if (config == null) {
-                Log.e(TAG, "No configuration found")
-                updateNotification("Error: No configuration")
-                stopSelf()
-                return
-            }
-
-            Log.i(TAG, "Loaded config for: ${config.clientName}")
 
             // Create VPN interface
             val builder = Builder()
                 .setSession("prrr VPN")
-                .addAddress(extractIp(config.assignedIp), 32)
+                .addAddress(extractIp(config.assignedIp), extractPrefix(config.assignedIp))
                 .setMtu(config.mtu.toInt())
 
-            // Add DNS servers
+            // Add DNS servers from config
             config.dnsServers.forEach { dns ->
                 builder.addDnsServer(dns)
             }
 
-            // Route all traffic through VPN
+            // Route all traffic through tunnel
             builder.addRoute("0.0.0.0", 0)
+            builder.addRoute("::", 0)
 
-            // Establish interface
-            vpnInterface = builder.establish()
-            if (vpnInterface == null) {
-                Log.e(TAG, "Failed to establish VPN interface")
-                updateNotification("Error: VPN setup failed")
+            // Exclude the server IP from the tunnel to prevent routing loop.
+            builder.excludeRoute(android.net.IpPrefix(
+                serverAddr, if (serverAddr is java.net.Inet6Address) 128 else 32
+            ))
+            Log.i(TAG, "Excluded server ${serverAddr.hostAddress} from VPN routes")
+
+            // Check VPN consent
+            val prepareIntent = prepare(this)
+            if (prepareIntent != null) {
+                Log.e(TAG, "VPN consent not granted — prepare() returned non-null intent")
+                Log.e(TAG, "Grant consent via: adb shell cmd appops set --uid <uid> ACTIVATE_VPN allow")
+                updateNotification("Error: VPN consent required")
                 stopSelf()
                 return
             }
 
+            // Establish VPN interface
+            val iface = builder.establish()
+            if (iface == null) {
+                Log.e(TAG, "Failed to establish VPN interface (establish returned null)")
+                updateNotification("Error: VPN setup failed")
+                stopSelf()
+                return
+            }
+            vpnInterface = iface
+
             Log.i(TAG, "VPN interface established")
 
-            // Initialize Rust VPN connection
-            connection = VpnConnection(config)
-            connection?.connect()
+            // Detach fd — transfers ownership to Rust (Rust will close it)
+            val tunFd = iface.detachFd()
 
-            Log.i(TAG, "Rust connection initiated")
+            // Initialize Rust VPN connection and start tunnel pipeline
+            val conn = VpnConnection(config)
+            conn.connect(tunFd)
+            connection = conn
 
-            // Check connection status
-            val status = connection?.status()
-            Log.i(TAG, "Connection status: $status")
+            Log.i(TAG, "Rust tunnel pipeline started with fd=$tunFd")
 
-            // Update notification
-            when (status) {
-                ConnectionStatus.CONNECTED -> updateNotification("Connected (Demo Mode)")
-                ConnectionStatus.CONNECTING -> updateNotification("Connecting...")
-                else -> updateNotification("Disconnected")
-            }
-
-            // Start packet processing (stub implementation)
-            startPacketProcessing()
+            updateNotification("Connecting...")
 
         } catch (e: Exception) {
             Log.e(TAG, "Connection failed", e)
@@ -156,15 +199,11 @@ class PrrrVpnService : VpnService() {
     private fun disconnect() {
         Log.i(TAG, "disconnect() called")
 
-        // Stop packet processing thread
-        packetThread?.interrupt()
-        packetThread = null
-
-        // Disconnect Rust connection
+        // Disconnect Rust connection (cancels pipeline via CancellationToken)
         connection?.disconnect()
         connection = null
 
-        // Close VPN interface
+        // Close VPN interface (fd already detached, so this is a no-op on the fd)
         try {
             vpnInterface?.close()
         } catch (e: Exception) {
@@ -179,67 +218,6 @@ class PrrrVpnService : VpnService() {
         stopSelf()
 
         Log.i(TAG, "Disconnected")
-    }
-
-    /**
-     * Start packet processing thread.
-     *
-     * **STUB IMPLEMENTATION:**
-     * - Reads packets from TUN interface
-     * - Logs packet size
-     * - Discards packets (no forwarding)
-     * - No internet connectivity will work
-     *
-     * **TODO:** Replace with real packet handling:
-     * 1. Encrypt packets via Rust
-     * 2. Send via QUIC to server
-     * 3. Receive from server
-     * 4. Decrypt via Rust
-     * 5. Write back to TUN
-     */
-    private fun startPacketProcessing() {
-        val fd = vpnInterface?.fileDescriptor
-        if (fd == null) {
-            Log.w(TAG, "No file descriptor, skipping packet processing")
-            return
-        }
-
-        packetThread = Thread {
-            val inputStream = FileInputStream(fd)
-            // val outputStream = FileOutputStream(fd) // TODO: Use for writing packets back to TUN
-            val buffer = ByteArray(32767) // Max IP packet size
-
-            Log.i(TAG, "Packet processing thread started (STUB MODE)")
-
-            try {
-                while (!Thread.interrupted()) {
-                    // Read packet from TUN interface
-                    val length = inputStream.read(buffer)
-                    if (length > 0) {
-                        // In stub mode, just log and discard
-                        Log.d(TAG, "Received packet from TUN: $length bytes (discarded)")
-
-                        // TODO: Real implementation:
-                        // val packet = buffer.copyOf(length)
-                        // val encrypted = connection?.encryptPacket(packet)
-                        // sendToServer(encrypted)
-                    }
-
-                    // TODO: Receive packets from server and write to TUN
-                    // val received = receiveFromServer()
-                    // val decrypted = connection?.decryptPacket(received)
-                    // outputStream.write(decrypted)
-                }
-            } catch (e: InterruptedException) {
-                Log.i(TAG, "Packet processing thread interrupted")
-            } catch (e: Exception) {
-                Log.e(TAG, "Error in packet processing", e)
-            }
-
-            Log.i(TAG, "Packet processing thread stopped")
-        }
-
-        packetThread?.start()
     }
 
     private fun createNotificationChannel() {
@@ -287,5 +265,13 @@ class PrrrVpnService : VpnService() {
      */
     private fun extractIp(cidr: String): String {
         return cidr.split("/").first()
+    }
+
+    /**
+     * Extract prefix length from CIDR notation.
+     * Example: "10.66.66.2/32" -> 32
+     */
+    private fun extractPrefix(cidr: String): Int {
+        return cidr.split("/").getOrNull(1)?.toIntOrNull() ?: 32
     }
 }

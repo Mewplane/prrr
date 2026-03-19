@@ -37,7 +37,8 @@ import com.prrr.vpn.android.viewmodel.VpnManager
 @Composable
 fun MainScreen(
     vpnManager: VpnManager,
-    onSettingsClick: () -> Unit = {}
+    onSettingsClick: () -> Unit = {},
+    onConnect: () -> Unit = { vpnManager.connect() }
 ) {
     val status by vpnManager.status.collectAsState()
     val config by vpnManager.config.collectAsState()
@@ -86,7 +87,7 @@ fun MainScreen(
 
             // Connection toggle button
             Button(
-                onClick = { toggleConnection(vpnManager, status) },
+                onClick = { toggleConnection(vpnManager, status, onConnect) },
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 40.dp)
@@ -141,10 +142,10 @@ private fun isButtonEnabled(status: ConnectionStatus): Boolean {
     return status != ConnectionStatus.CONNECTING
 }
 
-private fun toggleConnection(vpnManager: VpnManager, status: ConnectionStatus) {
+private fun toggleConnection(vpnManager: VpnManager, status: ConnectionStatus, onConnect: () -> Unit) {
     when (status) {
         ConnectionStatus.CONNECTED -> vpnManager.disconnect()
-        ConnectionStatus.DISCONNECTED, ConnectionStatus.ERROR -> vpnManager.connect()
+        ConnectionStatus.DISCONNECTED, ConnectionStatus.ERROR -> onConnect()
         ConnectionStatus.CONNECTING -> { /* Do nothing */ }
     }
 }

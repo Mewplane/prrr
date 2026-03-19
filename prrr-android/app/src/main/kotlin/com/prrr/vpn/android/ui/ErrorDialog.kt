@@ -50,6 +50,7 @@ fun mapErrorToContent(error: MobileException): ErrorContent {
         is MobileException.ConnectionFailed -> ErrorContent.fromConnectionFailed()
         is MobileException.HandshakeFailed -> ErrorContent.fromHandshakeFailed()
         is MobileException.NetworkException -> ErrorContent.fromNetworkError()
+        is MobileException.TunnelFailed -> ErrorContent.fromTunnelFailed()
         is MobileException.NotConnected -> ErrorContent.fromNotConnected()
     }
 }

@@ -142,6 +142,20 @@ podman-e2e-multi:
 		PRRR_TRANSPORT=harp PRRR_SKIP_BUILD=1 ./deploy/client/run-podman.sh
 	@echo "Podman E2E multi-transport complete"
 
+## e2e-connectivity: Run Rust-native connectivity E2E tests (requires Podman + /dev/net/tun)
+.PHONY: e2e-connectivity
+e2e-connectivity:
+	@echo "Running Rust-native connectivity E2E tests..."
+	cargo test --test e2e_connectivity -- --ignored --nocapture
+	@echo "Connectivity E2E complete"
+
+## e2e-qr: Run QR pipeline roundtrip tests
+.PHONY: e2e-qr
+e2e-qr:
+	@echo "Running QR pipeline E2E tests..."
+	cargo test --test e2e_qr_roundtrip --nocapture
+	@echo "QR pipeline E2E complete"
+
 # =============================================================================
 # Android targets (Feature 3.7)
 # =============================================================================

@@ -59,7 +59,7 @@ pub const DEFAULT_PQ_KEY_PATH: &str = "/etc/prrr/keys/server_pq.key";
 pub const DEFAULT_REKEY_INTERVAL: u64 = 3600;
 
 /// Default transport protocol.
-pub const DEFAULT_TRANSPORT_PROTOCOL: &str = "harp";
+pub const DEFAULT_TRANSPORT_PROTOCOL: &str = "masque";
 
 /// Default QUIC max idle timeout in seconds.
 pub const DEFAULT_MAX_IDLE_TIMEOUT: u64 = 300;
@@ -188,6 +188,9 @@ pub enum ServerClientAction {
     Add {
         /// Client name (must be unique among active clients).
         name: String,
+        /// Also output QR code (SVG) for mobile import.
+        #[arg(long)]
+        qr: bool,
     },
     /// List all registered clients.
     List,
@@ -509,7 +512,9 @@ pub struct ClientServerSection {
 /// `[interface]` section — local tunnel interface.
 #[derive(Debug, Deserialize, Default, PartialEq)]
 pub struct InterfaceSection {
-    /// Path to client X25519 private key.
+    /// Inline client X25519 private key (base64). Preferred over `private_key_path`.
+    pub private_key: Option<String>,
+    /// Path to client X25519 private key (fallback when `private_key` is absent).
     pub private_key_path: Option<String>,
     /// Path to client ML-KEM-768 private key.
     pub pq_private_key_path: Option<String>,
@@ -519,6 +524,8 @@ pub struct InterfaceSection {
     pub dns: Option<Vec<String>>,
     /// Tunnel MTU.
     pub mtu: Option<u16>,
+    /// Transport protocol (e.g. `"masque"` or `"harp"`).
+    pub transport_protocol: Option<String>,
 }
 
 /// `[routing]` section — traffic routing rules.
@@ -1060,7 +1067,10 @@ protocol = "masque"
         match cli.command {
             Command::Server(args) => match args.subcommand {
                 Some(ServerSubcommand::Client(sc)) => match sc.action {
-                    ServerClientAction::Add { ref name } => assert_eq!(name, "alice"),
+                    ServerClientAction::Add { ref name, qr } => {
+                        assert_eq!(name, "alice");
+                        assert!(!qr);
+                    }
                     _ => panic!("expected Add action"),
                 },
                 _ => panic!("expected Client subcommand"),
@@ -1158,7 +1168,7 @@ protocol = "masque"
     // AC-B9b: prrr client import with prrr:// URL
     #[test]
     fn cli_client_import_url_parses() {
-        let url = "prrr://import?config=dGVzdA";
+        let url = "prrr://import?z=dGVzdA";
         let cli = Cli::parse_from(["prrr", "client", "import", url]);
         match cli.command {
             Command::Client(args) => match args.subcommand {
@@ -1471,7 +1481,7 @@ allowed_ips = ["0.0.0.0/0", "::/0"]
 excluded_ips = ["192.168.0.0/16", "10.0.0.0/8"]
 
 [transport]
-protocol = "harp"
+protocol = "masque"
 keep_alive = 25
 
 [obfuscation]
@@ -1806,7 +1816,7 @@ name = "harp"
         assert_eq!(DEFAULT_IDENTITY_KEY_PATH, "/etc/prrr/keys/server_identity.key");
         assert_eq!(DEFAULT_PQ_KEY_PATH, "/etc/prrr/keys/server_pq.key");
         assert_eq!(DEFAULT_REKEY_INTERVAL, 3600);
-        assert_eq!(DEFAULT_TRANSPORT_PROTOCOL, "harp");
+        assert_eq!(DEFAULT_TRANSPORT_PROTOCOL, "masque");
         assert_eq!(DEFAULT_MAX_IDLE_TIMEOUT, 300);
         assert_eq!(DEFAULT_KEEP_ALIVE, 25);
         assert_eq!(DEFAULT_PADDING_STRATEGY, "power-of-two");

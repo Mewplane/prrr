@@ -38,7 +38,7 @@ snow = "0.10.0"
 subtle = "2.6.1"
 thiserror = "2.0.18"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
-tokio-tun = "0.15.2"
+tokio-tun = { version = "0.15.2", optional = true }
 tokio-util = "0.7"
 toml = "1.0"
 tracing = "0.1.44"
@@ -60,6 +60,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 
 # Client distribution — QR code generation (P-009)
 qrcode = "0.14"
+flate2 = "1.1"
 
 # HARP client transport (Step 8)
 futures-util = "0.3.31"
@@ -77,9 +78,14 @@ metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+[features]
+default = ["system-tun"]
+system-tun = ["dep:tokio-tun"]
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 hex-literal = "0.4.1"
+prrr-mobile = { path = "prrr-mobile", default-features = false }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 

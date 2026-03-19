@@ -3,6 +3,7 @@ package com.prrr.vpn.android.storage
 
 import android.content.Context
 import org.junit.Before
+import org.junit.After
 import org.junit.Test
 import org.junit.Assert.*
 import org.junit.runner.RunWith
@@ -10,16 +11,32 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import uniffi.prrr_mobile.VpnConfig
 
+/** Validator that always passes — avoids Rust FFI dependency in JVM tests. */
+class NoOpConfigValidator : ConfigValidator {
+    override fun validate(config: VpnConfig) {
+        // accept everything
+    }
+}
+
 @RunWith(RobolectricTestRunner::class)
 class ConfigurationManagerTest {
 
     private lateinit var context: Context
+    private lateinit var originalValidator: ConfigValidator
 
     @Before
     fun setup() {
         context = RuntimeEnvironment.getApplication()
+        // Replace Rust validator with no-op for JVM testing
+        originalValidator = ConfigurationManager.validator
+        ConfigurationManager.validator = NoOpConfigValidator()
         // Clear any existing configuration before each test
         ConfigurationManager.deleteConfiguration(context)
+    }
+
+    @After
+    fun tearDown() {
+        ConfigurationManager.validator = originalValidator
     }
 
     @Test
@@ -92,7 +109,9 @@ class ConfigurationManagerTest {
             clientPrivateKey = ByteArray(32) { it.toByte() },
             assignedIp = "10.66.66.2/32",
             dnsServers = listOf("1.1.1.1", "8.8.8.8"),
-            mtu = 1420u
+            mtu = 1420u,
+            preferredBinding = null,
+            transportProtocol = null
         )
     }
 }

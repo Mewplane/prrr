@@ -9,7 +9,6 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import uniffi.prrr_mobile.MobileException
 import uniffi.prrr_mobile.VpnConfig
-import uniffi.prrr_mobile.validateConfig
 
 private const val TAG = "ConfigurationManager"
 private const val PREFS_NAME = "prrr_vpn_config"
@@ -24,12 +23,17 @@ private const val KEY_CLIENT_PRIVATE_KEY = "client_private_key"
 private const val KEY_ASSIGNED_IP = "assigned_ip"
 private const val KEY_DNS_SERVERS = "dns_servers"
 private const val KEY_MTU = "mtu"
+private const val KEY_PREFERRED_BINDING = "preferred_binding"
+private const val KEY_TRANSPORT_PROTOCOL = "transport_protocol"
 
 /**
  * Manages secure persistent storage of VPN configuration.
  * Uses Android Keystore + EncryptedSharedPreferences for maximum security.
  */
 object ConfigurationManager {
+
+    /** Validator for config validation. Replaceable for testing. */
+    var validator: ConfigValidator = RustConfigValidator()
 
     /**
      * Save VPN configuration to encrypted storage.
@@ -40,7 +44,7 @@ object ConfigurationManager {
         return try {
             // Validate configuration before saving
             try {
-                validateConfig(config)
+                validator.validate(config)
             } catch (e: MobileException.InvalidConfig) {
                 Log.w(TAG, "Configuration validation failed: ${e.reason}")
                 return SaveResult.ValidationFailed(e.reason)
@@ -58,6 +62,8 @@ object ConfigurationManager {
                 putString(KEY_ASSIGNED_IP, config.assignedIp)
                 putString(KEY_DNS_SERVERS, config.dnsServers.joinToString(","))
                 putInt(KEY_MTU, config.mtu.toInt())
+                putString(KEY_PREFERRED_BINDING, config.preferredBinding)
+                putString(KEY_TRANSPORT_PROTOCOL, config.transportProtocol)
                 apply()
             }
 
@@ -99,12 +105,14 @@ object ConfigurationManager {
                 clientPrivateKey = prefs.getString(KEY_CLIENT_PRIVATE_KEY, null)?.fromBase64() ?: return null,
                 assignedIp = prefs.getString(KEY_ASSIGNED_IP, null) ?: return null,
                 dnsServers = prefs.getString(KEY_DNS_SERVERS, null)?.split(",") ?: return null,
-                mtu = prefs.getInt(KEY_MTU, 1280).toUShort()
+                mtu = prefs.getInt(KEY_MTU, 1280).toUShort(),
+                preferredBinding = prefs.getString(KEY_PREFERRED_BINDING, null),
+                transportProtocol = prefs.getString(KEY_TRANSPORT_PROTOCOL, null)
             )
 
             // Validate loaded configuration
             try {
-                validateConfig(config)
+                validator.validate(config)
             } catch (e: MobileException.InvalidConfig) {
                 Log.w(TAG, "Loaded configuration is invalid: ${e.reason}")
                 deleteConfiguration(context)

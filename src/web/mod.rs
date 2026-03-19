@@ -205,6 +205,7 @@ mod tests {
             cover_page_enabled: true,
             trust_proxy_headers: false,
             h2_streaming_enabled: true,
+            active_clients: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 
