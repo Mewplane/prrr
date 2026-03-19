@@ -68,6 +68,16 @@ pub enum MobileError {
         reason: String,
     },
 
+    /// Tunnel pipeline failed during operation.
+    ///
+    /// This indicates the bidirectional encrypted tunnel encountered
+    /// an unrecoverable error during packet processing.
+    #[error("tunnel failed: {reason}")]
+    TunnelFailed {
+        /// Detailed reason for the tunnel failure
+        reason: String,
+    },
+
     /// Operation requires an active connection but none exists.
     ///
     /// Thrown when attempting operations like getting statistics

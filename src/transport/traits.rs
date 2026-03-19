@@ -8,6 +8,7 @@
 //! server infrastructure and [`TransportConnection`] as the unified
 //! return type from client-side transport connections.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::Ipv4Addr;
 use std::pin::Pin;
@@ -197,6 +198,13 @@ pub struct SharedServerState {
     pub subnet_gateway: Ipv4Addr,
     /// Coordinated shutdown token.
     pub cancel: CancellationToken,
+    /// Cross-transport active client map for session eviction.
+    ///
+    /// When a client connects via any transport, its cancellation token is
+    /// stored here. If the same client reconnects (via any transport), the
+    /// old token is cancelled, causing the old session's TUN device to be
+    /// freed before the new session creates one.
+    pub active_clients: Arc<Mutex<HashMap<uuid::Uuid, CancellationToken>>>,
 }
 
 #[cfg(test)]
@@ -289,6 +297,7 @@ mod tests {
             max_clients,
             subnet_gateway: gateway,
             cancel,
+            active_clients: Arc::new(Mutex::new(HashMap::new())),
         };
 
         assert_eq!(state.max_clients, max_clients);
@@ -362,6 +371,7 @@ mod tests {
             max_clients,
             subnet_gateway: gateway,
             cancel: cancel.clone(),
+            active_clients: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // Increment active connections

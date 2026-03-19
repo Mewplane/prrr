@@ -56,7 +56,7 @@ server_name = "localhost"
 [network]
 subnet = "${PRRR_SUBNET}"
 dns_servers = ["1.1.1.1", "8.8.8.8"]
-mtu = 1280
+mtu = 1100
 
 [crypto]
 identity_key_path = "/etc/prrr/keys/server_identity.key"
@@ -78,40 +78,22 @@ EOF
 
     log "Server config written to ${SERVER_CONFIG}"
 
-    # Register a test client and capture the private key from output
+    # Register a test client — outputs complete config (with inline private_key) to stdout
     log "Registering test client '${PRRR_CLIENT_NAME}'"
-    local add_output
-    add_output=$(prrr server --config "${SERVER_CONFIG}" --listen "${PRRR_LISTEN_ADDR}" \
-        client add "${PRRR_CLIENT_NAME}" 2>/dev/null) || true
-    echo "${add_output}"
-
-    # Extract and save client private key (base64-encoded in output)
-    local client_private_key_b64
-    client_private_key_b64=$(echo "${add_output}" | grep 'Private Key:' | awk '{print $NF}')
-    if [ -z "${client_private_key_b64}" ]; then
-        log "ERROR: Failed to extract client private key from 'client add' output"
-        exit 1
-    fi
-
-    local client_key_file="${PRRR_SHARED_DIR}/client_private.key"
-    echo -n "${client_private_key_b64}" | base64 -d > "${client_key_file}"
-    log "Client private key saved to ${client_key_file}"
-
-    log "Exporting client config to ${CLIENT_CONFIG_SHARED}"
     prrr server --config "${SERVER_CONFIG}" --listen "${PRRR_LISTEN_ADDR}" \
-        client export "${PRRR_CLIENT_NAME}" --output "${CLIENT_CONFIG_SHARED}"
-
-    # Inject private_key_path into the existing [interface] section
-    sed -i "/^\[interface\]/a private_key_path = \"${client_key_file}\"" "${CLIENT_CONFIG_SHARED}"
-    log "Client config patched with private_key_path"
+        client add "${PRRR_CLIENT_NAME}" > "${CLIENT_CONFIG_SHARED}"
+    log "Client config saved to ${CLIENT_CONFIG_SHARED}"
 
     # Signal readiness
     touch "${READY_MARKER}"
     log "Server ready (marker: ${READY_MARKER})"
 
-    # Start the VPN server (exec replaces shell for signal forwarding)
+    # Start the VPN server — tee logs to shared volume for test-runner access
     log "Starting prrr server on ${PRRR_LISTEN_ADDR}"
-    exec prrr server --config "${SERVER_CONFIG}" --listen "${PRRR_LISTEN_ADDR}"
+    prrr server --config "${SERVER_CONFIG}" --listen "${PRRR_LISTEN_ADDR}" 2>&1 | tee "${PRRR_SHARED_DIR}/server.log" &
+    SERVER_PID=$!
+    trap "kill ${SERVER_PID} 2>/dev/null; wait ${SERVER_PID} 2>/dev/null" EXIT
+    wait "${SERVER_PID}"
 }
 
 run_client() {
@@ -143,19 +125,12 @@ run_client() {
     fi
     log "Server endpoint patched to ${server_endpoint}"
 
-    # Transport selection (defaults to harp)
+    # Transport selection (override if PRRR_TRANSPORT is set)
     local transport
-    transport="${PRRR_TRANSPORT:-harp}"
-    if [ "${transport}" = "masque" ]; then
-        # Append [transport] section for MASQUE protocol
-        cat >> "${CLIENT_CONFIG}" <<TRANSPORT_EOF
-
-[transport]
-protocol = "masque"
-TRANSPORT_EOF
-        log "Transport set to MASQUE"
-    else
-        log "Transport set to HARP (default)"
+    transport="${PRRR_TRANSPORT:-}"
+    if [ -n "${transport}" ]; then
+        sed -i "s/transport_protocol = .*/transport_protocol = \"${transport}\"/" "${CLIENT_CONFIG}"
+        log "Transport set to ${transport}"
     fi
 
     # Resolve server name for TLS SNI (defaults to localhost for pod networking)

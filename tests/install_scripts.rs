@@ -348,3 +348,29 @@ fn script_server_has_help_flag() {
     assert!(content.contains("--help"), "Server script must support --help flag");
     assert!(content.contains("usage"), "Server script must have usage function");
 }
+
+/// Install scripts must use the same default MTU as the code.
+/// If the code default changes but scripts aren't updated, every new
+/// server deployment gets a stale MTU that causes QUIC datagram drops.
+#[test]
+fn install_scripts_use_correct_default_mtu() {
+    let expected = format!("mtu = {}", prrr::config::DEFAULT_MTU);
+
+    let server_script = read_script(SERVER_SCRIPT);
+    assert!(
+        server_script.contains(&expected),
+        "scripts/install-server.sh must contain '{expected}'"
+    );
+
+    let deploy_script = read_script("deploy/scripts/install-server.sh");
+    assert!(
+        deploy_script.contains(&expected),
+        "deploy/scripts/install-server.sh must contain '{expected}'"
+    );
+
+    let entrypoint = read_script("deploy/client/entrypoint.sh");
+    assert!(
+        entrypoint.contains(&expected),
+        "deploy/client/entrypoint.sh must contain '{expected}'"
+    );
+}

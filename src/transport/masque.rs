@@ -694,6 +694,16 @@ mod tests {
         assert!(decoded_payload.is_empty());
     }
 
+    /// MASQUE framing for stream_id=0 must produce exactly 2 bytes of overhead.
+    /// TUNNEL_OVERHEAD_BYTES assumes this minimum; if it grows, the MTU budget breaks.
+    #[test]
+    fn masque_framing_overhead_for_stream_zero() {
+        let payload = vec![0u8; 100];
+        let framed = frame_datagram(0, &payload).expect("frame");
+        let overhead = framed.len() - payload.len();
+        assert_eq!(overhead, 2, "stream_id=0 framing must be exactly 2 bytes, got {overhead}");
+    }
+
     // -----------------------------------------------------------------------
     // T-6: CONNECT-UDP handshake: client sends request, proxy accepts
     // -----------------------------------------------------------------------

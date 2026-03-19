@@ -567,7 +567,17 @@ pub async fn create_session(State(state): State<AppState>, req: axum::http::Requ
     // to exit and old TUN devices to be cleaned up.
     let evicted = state.harp_sessions.remove_by_client_id(client_record.id);
     if evicted > 0 {
-        tracing::info!(client_id = %client_record.id, evicted, "evicted stale sessions on reconnect");
+        tracing::info!(client_id = %client_record.id, evicted, "evicted stale HARP sessions on reconnect");
+    }
+
+    // Step 5c: Cross-transport eviction — cancel any MASQUE session for this client.
+    {
+        let mut map = state.active_clients.lock().await;
+        if let Some(old_cancel) = map.remove(&client_record.id) {
+            tracing::info!(client_id = %client_record.id, "evicting cross-transport session (MASQUE→HARP)");
+            old_cancel.cancel();
+            tokio::task::yield_now().await;
+        }
     }
 
     // Step 6: Create session in the store
@@ -595,13 +605,21 @@ pub async fn create_session(State(state): State<AppState>, req: axum::http::Requ
             let _ = registry.log_connection_event(client_record.id, ConnectionEvent::Connect, None, None, 0, 0);
         }
 
+        let pipeline_cancel = state.cancel.child_token();
+
+        // Register in cross-transport active clients map so MASQUE can evict us.
+        {
+            let mut map = state.active_clients.lock().await;
+            map.insert(client_record.id, pipeline_cancel.clone());
+        }
+
         let params = HarpTunnelParams {
             session: Arc::clone(&session),
             session_keys: responder_result.session_keys,
             client_record,
             registry: Arc::clone(&state.registry),
             active_connections: Arc::clone(&state.active_connections),
-            cancel: state.cancel.child_token(),
+            cancel: pipeline_cancel,
             gateway_ip,
         };
 
@@ -1145,6 +1163,7 @@ where
                 cover_page_enabled: true,
                 trust_proxy_headers: false,
                 h2_streaming_enabled: true,
+                active_clients: Arc::clone(&shared.active_clients),
             };
 
             // Spawn periodic idle session reaper
@@ -1228,7 +1247,7 @@ mod tests {
                 noise_public_key: server_noise_public_key,
                 kem_public_key: kem_public_key.clone(),
                 dns_servers: vec!["1.1.1.1".to_string()],
-                mtu: 1280,
+                mtu: 1100,
                 transport_protocol: "harp".to_string(),
             }),
             config_tokens: Arc::new(ConfigTokenStore::new()),
@@ -1237,7 +1256,7 @@ mod tests {
                 server_name: "test.example.com".to_string(),
                 subnet: "10.66.66.0/24".to_string(),
                 dns_servers: vec!["1.1.1.1".to_string()],
-                mtu: 1280,
+                mtu: 1100,
                 max_clients: 100,
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 transport_protocol: "harp".to_string(),
@@ -1254,6 +1273,7 @@ mod tests {
             cover_page_enabled: true,
             trust_proxy_headers: false,
             h2_streaming_enabled: true,
+            active_clients: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -2869,6 +2889,7 @@ mod tests {
             max_clients: TEST_MAX_CLIENTS,
             subnet_gateway: std::net::Ipv4Addr::new(10, 66, 66, 1),
             cancel: cancel.clone(),
+            active_clients: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         });
 
         let transport = HarpServerTransport::new(

@@ -299,7 +299,7 @@ max_clients = $MAX_CLIENTS
 [network]
 subnet = "10.66.66.0/24"
 dns_servers = $DNS_TOML
-mtu = 1280
+mtu = 1100
 $TRANSPORTS
 [keys]
 identity_key_path = "$CONFIG_DIR/keys/server_identity.key"

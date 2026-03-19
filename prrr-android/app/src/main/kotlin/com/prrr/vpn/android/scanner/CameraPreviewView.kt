@@ -2,6 +2,7 @@
 package com.prrr.vpn.android.scanner
 
 import android.util.Log
+import android.util.Size
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
@@ -11,7 +12,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
@@ -53,7 +53,9 @@ fun CameraPreviewView(
                         }
 
                     val imageAnalysis = ImageAnalysis.Builder()
+                        .setTargetResolution(Size(1280, 720))
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                        .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
                         .build()
                         .also {
                             it.setAnalyzer(
@@ -72,6 +74,7 @@ fun CameraPreviewView(
                         imageAnalysis
                     )
 
+                    Log.i(TAG, "Camera bound successfully")
                 } catch (e: Exception) {
                     Log.e(TAG, "Camera initialization failed", e)
                 }

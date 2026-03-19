@@ -7,10 +7,13 @@
 package com.prrr.vpn.android
 
 import android.app.Application
+import android.content.Intent
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -20,6 +23,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.prrr.vpn.android.scanner.RustConfigParser
 import com.prrr.vpn.android.scanner.QRScannerScreen
 import com.prrr.vpn.android.storage.ConfigurationManager
 import com.prrr.vpn.android.storage.SaveResult
@@ -28,14 +32,23 @@ import com.prrr.vpn.android.ui.SettingsScreen
 import com.prrr.vpn.android.ui.theme.PrrrVPNTheme
 import com.prrr.vpn.android.viewmodel.VpnManager
 
+private const val TAG = "MainActivity"
+private const val DEEP_LINK_IMPORT_PREFIX = "prrr://import?"
+private const val DEEP_LINK_CONNECT = "prrr://connect"
+
+/** Monotonically increasing counter — bumped each time a deep link saves a config. */
+private val configReloadTrigger = mutableIntStateOf(0)
+
+/** Bumped when a prrr://connect deep link requests VPN connect. */
+private val connectTrigger = mutableIntStateOf(0)
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        Log.i("prrr", "prrr VPN MainActivity onCreate")
+        Log.i(TAG, "prrr VPN MainActivity onCreate")
 
-        // Test Rust FFI integration
-        testRustIntegration()
+        handleIntent(intent)
 
         setContent {
             PrrrVPNTheme {
@@ -49,16 +62,44 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun testRustIntegration() {
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleIntent(intent)
+    }
+
+    private fun handleIntent(intent: Intent?) {
+        val data = intent?.data?.toString() ?: return
+
+        if (data.startsWith(DEEP_LINK_CONNECT)) {
+            Log.i(TAG, "Connect deep link received")
+            connectTrigger.intValue++
+            return
+        }
+
+        if (!data.startsWith(DEEP_LINK_IMPORT_PREFIX)) return
+
+        Log.i(TAG, "Deep link received: ${data.take(80)}...")
+
         try {
-            // Test parsing a dummy QR config (will fail with invalid data)
-            val testQrData = "prrr://import?config=dGVzdA=="
-            val config = uniffi.prrr_mobile.parseQrConfig(testQrData)
-            Log.i("prrr", "✅ Rust FFI works! Parsed config: ${config.clientName}")
-        } catch (e: uniffi.prrr_mobile.MobileException.InvalidConfig) {
-            Log.i("prrr", "✅ Rust FFI works! Expected error for invalid data: ${e.reason}")
+            val config = RustConfigParser().parse(data)
+            val result = ConfigurationManager.saveConfiguration(this, config)
+            when (result) {
+                is SaveResult.Success -> {
+                    Log.i(TAG, "Deep link config saved: ${config.clientName}")
+                    configReloadTrigger.intValue++
+                }
+                is SaveResult.ValidationFailed -> {
+                    Log.w(TAG, "Deep link config validation failed: ${result.reason}")
+                }
+                is SaveResult.EncryptionFailed -> {
+                    Log.e(TAG, "Deep link config encryption failed")
+                }
+                is SaveResult.Error -> {
+                    Log.e(TAG, "Deep link config save error: ${result.message}")
+                }
+            }
         } catch (e: Exception) {
-            Log.e("prrr", "❌ Rust FFI error: ${e.message}", e)
+            Log.e(TAG, "Deep link config parse failed: ${e.message}")
         }
     }
 }
@@ -71,10 +112,49 @@ fun MainNavigation() {
     )
     var currentScreen by remember { mutableStateOf("main") }
 
+    // Reload config when a deep link imports a new one (including via onNewIntent)
+    val reloadTrigger by configReloadTrigger
+    LaunchedEffect(reloadTrigger) {
+        vpnManager.reloadConfiguration()
+    }
+
+    // Trigger VPN connect when prrr://connect deep link is received.
+    // Waits for config to be loaded (handles race with concurrent import).
+    val connectTriggerValue by connectTrigger
+    val currentConfig by vpnManager.config.collectAsState()
+    var lastHandledConnect by remember { mutableIntStateOf(0) }
+    LaunchedEffect(connectTriggerValue, currentConfig) {
+        if (connectTriggerValue > lastHandledConnect && currentConfig != null) {
+            lastHandledConnect = connectTriggerValue
+            vpnManager.connect()
+        }
+    }
+
+    // VPN consent launcher — shows system dialog, then connects on approval
+    val vpnConsentLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == android.app.Activity.RESULT_OK) {
+            vpnManager.connect()
+        } else {
+            Log.w("MainNavigation", "VPN consent denied")
+        }
+    }
+
+    val connectWithConsent: () -> Unit = {
+        val prepareIntent = vpnManager.prepareVpn()
+        if (prepareIntent != null) {
+            vpnConsentLauncher.launch(prepareIntent)
+        } else {
+            vpnManager.connect()
+        }
+    }
+
     when (currentScreen) {
         "main" -> MainScreen(
             vpnManager = vpnManager,
-            onSettingsClick = { currentScreen = "settings" }
+            onSettingsClick = { currentScreen = "settings" },
+            onConnect = connectWithConsent
         )
         "settings" -> SettingsScreen(
             vpnManager = vpnManager,

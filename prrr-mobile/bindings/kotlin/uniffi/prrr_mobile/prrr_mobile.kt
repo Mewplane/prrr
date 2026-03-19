@@ -728,6 +728,10 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -750,6 +754,10 @@ fun uniffi_prrr_mobile_checksum_func_validate_config(
 fun uniffi_prrr_mobile_checksum_method_vpnconnection_connect(
 ): Short
 fun uniffi_prrr_mobile_checksum_method_vpnconnection_disconnect(
+): Short
+fun uniffi_prrr_mobile_checksum_method_vpnconnection_error_message(
+): Short
+fun uniffi_prrr_mobile_checksum_method_vpnconnection_get_config(
 ): Short
 fun uniffi_prrr_mobile_checksum_method_vpnconnection_stats(
 ): Short
@@ -812,10 +820,14 @@ fun uniffi_prrr_mobile_fn_free_vpnconnection(`ptr`: Pointer,uniffi_out_err: Unif
 ): Unit
 fun uniffi_prrr_mobile_fn_constructor_vpnconnection_new(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Pointer
-fun uniffi_prrr_mobile_fn_method_vpnconnection_connect(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+fun uniffi_prrr_mobile_fn_method_vpnconnection_connect(`ptr`: Pointer,`tunFd`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
 fun uniffi_prrr_mobile_fn_method_vpnconnection_disconnect(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+fun uniffi_prrr_mobile_fn_method_vpnconnection_error_message(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_prrr_mobile_fn_method_vpnconnection_get_config(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 fun uniffi_prrr_mobile_fn_method_vpnconnection_stats(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_prrr_mobile_fn_method_vpnconnection_status(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
@@ -956,10 +968,16 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_prrr_mobile_checksum_func_validate_config() != 30339.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_prrr_mobile_checksum_method_vpnconnection_connect() != 13875.toShort()) {
+    if (lib.uniffi_prrr_mobile_checksum_method_vpnconnection_connect() != 45332.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_prrr_mobile_checksum_method_vpnconnection_disconnect() != 64168.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_prrr_mobile_checksum_method_vpnconnection_error_message() != 45691.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_prrr_mobile_checksum_method_vpnconnection_get_config() != 17752.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_prrr_mobile_checksum_method_vpnconnection_stats() != 13396.toShort()) {
@@ -1157,6 +1175,29 @@ public object FfiConverterUInt: FfiConverter<UInt, Int> {
 
     override fun write(value: UInt, buf: ByteBuffer) {
         buf.putInt(value.toInt())
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterInt: FfiConverter<Int, Int> {
+    override fun lift(value: Int): Int {
+        return value
+    }
+
+    override fun read(buf: ByteBuffer): Int {
+        return buf.getInt()
+    }
+
+    override fun lower(value: Int): Int {
+        return value
+    }
+
+    override fun allocationSize(value: Int) = 4UL
+
+    override fun write(value: Int, buf: ByteBuffer) {
+        buf.putInt(value)
     }
 }
 
@@ -1364,14 +1405,28 @@ public object FfiConverterByteArray: FfiConverterRustBuffer<ByteArray> {
 public interface VpnConnectionInterface {
     
     /**
-     * Initiate VPN connection
+     * Initiate VPN connection using HARP transport with the given TUN fd.
+     *
+     * The `tun_fd` is a raw file descriptor from Android's
+     * `VpnService.Builder.establish()`. Ownership is transferred to Rust;
+     * the fd will be closed when the connection is disconnected.
      */
-    fun `connect`()
+    fun `connect`(`tunFd`: kotlin.Int)
     
     /**
      * Tear down VPN connection
      */
     fun `disconnect`()
+    
+    /**
+     * Get the error message if in Error state
+     */
+    fun `errorMessage`(): kotlin.String?
+    
+    /**
+     * Get the stored VPN configuration
+     */
+    fun `getConfig`(): VpnConfig
     
     /**
      * Get connection statistics (None if not connected)
@@ -1483,14 +1538,18 @@ open class VpnConnection: Disposable, AutoCloseable, VpnConnectionInterface
 
     
     /**
-     * Initiate VPN connection
+     * Initiate VPN connection using HARP transport with the given TUN fd.
+     *
+     * The `tun_fd` is a raw file descriptor from Android's
+     * `VpnService.Builder.establish()`. Ownership is transferred to Rust;
+     * the fd will be closed when the connection is disconnected.
      */
-    @Throws(MobileException::class)override fun `connect`()
+    @Throws(MobileException::class)override fun `connect`(`tunFd`: kotlin.Int)
         = 
     callWithPointer {
     uniffiRustCallWithError(MobileException) { _status ->
     UniffiLib.INSTANCE.uniffi_prrr_mobile_fn_method_vpnconnection_connect(
-        it, _status)
+        it, FfiConverterInt.lower(`tunFd`),_status)
 }
     }
     
@@ -1508,6 +1567,36 @@ open class VpnConnection: Disposable, AutoCloseable, VpnConnectionInterface
 }
     }
     
+    
+
+    
+    /**
+     * Get the error message if in Error state
+     */override fun `errorMessage`(): kotlin.String? {
+            return FfiConverterOptionalString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_prrr_mobile_fn_method_vpnconnection_error_message(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Get the stored VPN configuration
+     */override fun `getConfig`(): VpnConfig {
+            return FfiConverterTypeVpnConfig.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_prrr_mobile_fn_method_vpnconnection_get_config(
+        it, _status)
+}
+    }
+    )
+    }
     
 
     
@@ -1597,7 +1686,11 @@ data class ConnectionStats (
     /**
      * Server round-trip time in milliseconds
      */
-    var `serverLatencyMs`: kotlin.UInt
+    var `serverLatencyMs`: kotlin.UInt, 
+    /**
+     * Active transport protocol name (e.g. "harp/h2", "harp/stream", "masque")
+     */
+    var `activeTransport`: kotlin.String
 ) {
     
     companion object
@@ -1613,6 +1706,7 @@ public object FfiConverterTypeConnectionStats: FfiConverterRustBuffer<Connection
             FfiConverterULong.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterUInt.read(buf),
+            FfiConverterString.read(buf),
         )
     }
 
@@ -1620,7 +1714,8 @@ public object FfiConverterTypeConnectionStats: FfiConverterRustBuffer<Connection
             FfiConverterULong.allocationSize(value.`bytesSent`) +
             FfiConverterULong.allocationSize(value.`bytesReceived`) +
             FfiConverterULong.allocationSize(value.`durationSecs`) +
-            FfiConverterUInt.allocationSize(value.`serverLatencyMs`)
+            FfiConverterUInt.allocationSize(value.`serverLatencyMs`) +
+            FfiConverterString.allocationSize(value.`activeTransport`)
     )
 
     override fun write(value: ConnectionStats, buf: ByteBuffer) {
@@ -1628,6 +1723,7 @@ public object FfiConverterTypeConnectionStats: FfiConverterRustBuffer<Connection
             FfiConverterULong.write(value.`bytesReceived`, buf)
             FfiConverterULong.write(value.`durationSecs`, buf)
             FfiConverterUInt.write(value.`serverLatencyMs`, buf)
+            FfiConverterString.write(value.`activeTransport`, buf)
     }
 }
 
@@ -1668,7 +1764,15 @@ data class VpnConfig (
     /**
      * MTU
      */
-    var `mtu`: kotlin.UShort
+    var `mtu`: kotlin.UShort, 
+    /**
+     * Preferred HARP transport binding: "h2", "stream", or "poll" (None = auto-select)
+     */
+    var `preferredBinding`: kotlin.String?, 
+    /**
+     * Transport protocol: "harp" or "masque" (None = harp)
+     */
+    var `transportProtocol`: kotlin.String?
 ) {
     
     companion object
@@ -1688,6 +1792,8 @@ public object FfiConverterTypeVpnConfig: FfiConverterRustBuffer<VpnConfig> {
             FfiConverterString.read(buf),
             FfiConverterSequenceString.read(buf),
             FfiConverterUShort.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
         )
     }
 
@@ -1699,7 +1805,9 @@ public object FfiConverterTypeVpnConfig: FfiConverterRustBuffer<VpnConfig> {
             FfiConverterByteArray.allocationSize(value.`clientPrivateKey`) +
             FfiConverterString.allocationSize(value.`assignedIp`) +
             FfiConverterSequenceString.allocationSize(value.`dnsServers`) +
-            FfiConverterUShort.allocationSize(value.`mtu`)
+            FfiConverterUShort.allocationSize(value.`mtu`) +
+            FfiConverterOptionalString.allocationSize(value.`preferredBinding`) +
+            FfiConverterOptionalString.allocationSize(value.`transportProtocol`)
     )
 
     override fun write(value: VpnConfig, buf: ByteBuffer) {
@@ -1711,6 +1819,8 @@ public object FfiConverterTypeVpnConfig: FfiConverterRustBuffer<VpnConfig> {
             FfiConverterString.write(value.`assignedIp`, buf)
             FfiConverterSequenceString.write(value.`dnsServers`, buf)
             FfiConverterUShort.write(value.`mtu`, buf)
+            FfiConverterOptionalString.write(value.`preferredBinding`, buf)
+            FfiConverterOptionalString.write(value.`transportProtocol`, buf)
     }
 }
 
@@ -1803,6 +1913,14 @@ sealed class MobileException: kotlin.Exception() {
             get() = "reason=${ `reason` }"
     }
     
+    class TunnelFailed(
+        
+        val `reason`: kotlin.String
+        ) : MobileException() {
+        override val message
+            get() = "reason=${ `reason` }"
+    }
+    
     class NotConnected(
         ) : MobileException() {
         override val message
@@ -1837,7 +1955,10 @@ public object FfiConverterTypeMobileError : FfiConverterRustBuffer<MobileExcepti
             4 -> MobileException.NetworkException(
                 FfiConverterString.read(buf),
                 )
-            5 -> MobileException.NotConnected()
+            5 -> MobileException.TunnelFailed(
+                FfiConverterString.read(buf),
+                )
+            6 -> MobileException.NotConnected()
             else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
         }
     }
@@ -1860,6 +1981,11 @@ public object FfiConverterTypeMobileError : FfiConverterRustBuffer<MobileExcepti
                 + FfiConverterString.allocationSize(value.`reason`)
             )
             is MobileException.NetworkException -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+                + FfiConverterString.allocationSize(value.`reason`)
+            )
+            is MobileException.TunnelFailed -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
                 4UL
                 + FfiConverterString.allocationSize(value.`reason`)
@@ -1893,13 +2019,50 @@ public object FfiConverterTypeMobileError : FfiConverterRustBuffer<MobileExcepti
                 FfiConverterString.write(value.`reason`, buf)
                 Unit
             }
-            is MobileException.NotConnected -> {
+            is MobileException.TunnelFailed -> {
                 buf.putInt(5)
+                FfiConverterString.write(value.`reason`, buf)
+                Unit
+            }
+            is MobileException.NotConnected -> {
+                buf.putInt(6)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
     }
 
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?> {
+    override fun read(buf: ByteBuffer): kotlin.String? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterString.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.String?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterString.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.String?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterString.write(value, buf)
+        }
+    }
 }
 
 

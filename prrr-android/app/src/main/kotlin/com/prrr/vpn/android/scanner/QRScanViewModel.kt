@@ -1,6 +1,7 @@
 // FRD: specs/frds/FRD-M009-qr-code-scanner.md
 package com.prrr.vpn.android.scanner
 
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -8,26 +9,46 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import uniffi.prrr_mobile.MobileException
-import uniffi.prrr_mobile.parseQrConfig
 
-private const val PRRR_URL_PREFIX = "prrr://import"
-private const val ERROR_NOT_PRRR_QR = "This is not a prrr VPN config QR code"
+private const val TAG = "QRScanVM"
 
-class QRScanViewModel : ViewModel() {
+class QRScanViewModel(
+    private val configParser: ConfigParser = RustConfigParser(),
+    private val frameCollector: FrameCollector = FrameCollector()
+) : ViewModel() {
     private val _scanState = MutableStateFlow<ScanState>(ScanState.Idle)
     val scanState: StateFlow<ScanState> = _scanState.asStateFlow()
 
     fun onQRCodeDetected(rawValue: String) {
-        if (!rawValue.startsWith(PRRR_URL_PREFIX)) {
-            _scanState.value = ScanState.Error(ERROR_NOT_PRRR_QR)
+        val result = frameCollector.submit(rawValue) ?: run {
+            Log.d(TAG, "Ignoring non-prrr QR (${rawValue.length} chars): ${rawValue.take(80)}")
             return
         }
 
-        _scanState.value = ScanState.Scanning
+        when (result) {
+            is FrameCollector.Result.SingleFrame -> parseConfig(result.url)
+            is FrameCollector.Result.Complete -> {
+                Log.i(TAG, "Multi-frame complete: ${result.assembledUrl.length} chars")
+                parseConfig(result.assembledUrl)
+            }
+            is FrameCollector.Result.NeedMore -> {
+                Log.i(TAG, "Multi-frame: ${result.received}/${result.total} collected")
+                _scanState.value = ScanState.Collecting(
+                    received = result.received,
+                    total = result.total
+                )
+            }
+            is FrameCollector.Result.Error -> {
+                _scanState.value = ScanState.Error(result.message)
+            }
+        }
+    }
 
+    private fun parseConfig(url: String) {
+        _scanState.value = ScanState.Scanning
         viewModelScope.launch {
             try {
-                val config = parseQrConfig(rawValue)
+                val config = configParser.parse(url)
                 _scanState.value = ScanState.Success(config)
             } catch (e: MobileException.InvalidConfig) {
                 _scanState.value = ScanState.Error(e.reason)
@@ -39,5 +60,6 @@ class QRScanViewModel : ViewModel() {
 
     fun resetState() {
         _scanState.value = ScanState.Idle
+        frameCollector.reset()
     }
 }

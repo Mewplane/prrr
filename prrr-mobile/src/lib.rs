@@ -13,6 +13,10 @@
 mod config;
 mod connection;
 mod error;
+/// Re-exports of core transport types for mobile connection layer.
+pub mod transport_imports;
+/// Android TUN device adapter for `TunnelPipeline`.
+pub mod tun_adapter;
 
 pub use config::{parse_qr_config, validate_config, VpnConfig};
 pub use connection::{ConnectionStats, ConnectionStatus, VpnConnection};
@@ -20,6 +24,30 @@ pub use error::MobileError;
 
 /// Library version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Initialize tracing (Android logcat when available, stderr otherwise).
+pub(crate) fn init_logging() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        #[cfg(feature = "android-logging")]
+        {
+            use tracing_subscriber::{layer::SubscriberExt, EnvFilter};
+            let filter = EnvFilter::new("prrr=debug,prrr_mobile=debug,info");
+            let android_layer = tracing_android::layer("prrr-mobile").expect("android tracing layer");
+            let subscriber = tracing_subscriber::registry()
+                .with(filter)
+                .with(android_layer);
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        }
+        #[cfg(not(feature = "android-logging"))]
+        {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter("prrr=debug,prrr_mobile=debug,info")
+                .try_init();
+        }
+    });
+}
 
 // UniFFI scaffolding
 uniffi::include_scaffolding!("mobile");

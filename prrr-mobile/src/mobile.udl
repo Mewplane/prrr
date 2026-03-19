@@ -13,5 +13,6 @@ interface MobileError {
   ConnectionFailed(string reason);
   HandshakeFailed(string reason);
   NetworkError(string reason);
+  TunnelFailed(string reason);
   NotConnected();
 };

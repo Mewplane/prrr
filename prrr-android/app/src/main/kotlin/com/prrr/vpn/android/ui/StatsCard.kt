@@ -29,6 +29,7 @@ fun StatsCard(stats: ConnectionStats) {
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
+            StatRow("Transport", stats.activeTransport.uppercase())
             StatRow("Duration", formatDuration(stats.durationSecs))
             StatRow("Sent", formatBytes(stats.bytesSent))
             StatRow("Received", formatBytes(stats.bytesReceived))

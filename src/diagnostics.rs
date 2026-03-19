@@ -1986,9 +1986,9 @@ mod tests {
     // MTU below default → pass
     #[test]
     fn mtu_config_below_default_passes() {
-        let result = check_mtu_config(Some(1200));
+        let result = check_mtu_config(Some(1000));
         assert_eq!(result.status, CheckStatus::Pass);
-        assert!(result.message.contains("1200"));
+        assert!(result.message.contains("1000"));
     }
 
     // MTU above default (e.g. 1420) → warn

@@ -294,8 +294,8 @@ fn e2e_podman_entrypoint_uses_transport_env() {
         "entrypoint.sh must reference PRRR_TRANSPORT env var"
     );
     assert!(
-        content.contains("protocol = \"masque\""),
-        "entrypoint.sh must support masque protocol override in client config"
+        content.contains("transport_protocol"),
+        "entrypoint.sh must support transport_protocol override in client config"
     );
 }
 

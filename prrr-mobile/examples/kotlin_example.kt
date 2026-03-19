@@ -83,7 +83,7 @@ fun example2ValidateConfiguration() {
         clientPrivateKey = UByteArray(32) { 0u },  // X25519 key
         assignedIp = "10.66.66.2/32",
         dnsServers = listOf("1.1.1.1", "8.8.8.8"),
-        mtu = 1280u
+        mtu = 1100u
     )
 
     try {
@@ -104,7 +104,7 @@ fun example2ValidateConfiguration() {
         clientPrivateKey = UByteArray(32) { 0u },
         assignedIp = "10.66.66.2/32",
         dnsServers = listOf("1.1.1.1"),
-        mtu = 1280u
+        mtu = 1100u
     )
 
     try {
@@ -139,7 +139,7 @@ fun example3ConnectionLifecycle() {
         clientPrivateKey = UByteArray(32) { 0u },
         assignedIp = "10.66.66.2/32",
         dnsServers = listOf("1.1.1.1", "8.8.8.8"),
-        mtu = 1280u
+        mtu = 1100u
     )
 
     try {
@@ -227,7 +227,7 @@ fun example4ErrorHandling() {
         clientPrivateKey = UByteArray(32) { 0u },
         assignedIp = "10.66.66.2/32",
         dnsServers = listOf("1.1.1.1"),
-        mtu = 1280u
+        mtu = 1100u
     )
 
     try {

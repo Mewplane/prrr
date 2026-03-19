@@ -4,7 +4,8 @@ use base64::Engine;
 
 use crate::MobileError;
 
-const IMPORT_URL_PREFIX: &str = "prrr://import?config=";
+/// Config URL prefix (deflate-compressed + base64url).
+const IMPORT_URL_PREFIX: &str = "prrr://import?z=";
 
 /// VPN configuration for mobile clients
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
@@ -25,6 +26,10 @@ pub struct VpnConfig {
     pub dns_servers: Vec<String>,
     /// MTU
     pub mtu: u16,
+    /// Preferred HARP transport binding: "h2", "stream", or "poll" (None = auto-select)
+    pub preferred_binding: Option<String>,
+    /// Transport protocol: "harp" or "masque" (None = masque)
+    pub transport_protocol: Option<String>,
 }
 
 /// Validate VPN configuration
@@ -88,12 +93,12 @@ pub fn validate_config(config: VpnConfig) -> Result<(), MobileError> {
     }
 
     // Validate MTU is in valid range
-    const MIN_MTU: u16 = 1280;
+    const MIN_MTU: u16 = 576;
     const MAX_MTU: u16 = 1500;
 
     if config.mtu < MIN_MTU || config.mtu > MAX_MTU {
         return Err(MobileError::InvalidConfig {
-            reason: format!("mtu must be between {} and {}, got {}", MIN_MTU, MAX_MTU, config.mtu),
+            reason: format!("mtu must be between {MIN_MTU} and {MAX_MTU}, got {}", config.mtu),
         });
     }
 
@@ -102,23 +107,30 @@ pub fn validate_config(config: VpnConfig) -> Result<(), MobileError> {
 
 /// Parse VPN configuration from QR code data
 ///
-/// Decodes a `prrr://import?config=<base64>` URL and parses the TOML config.
+/// Decodes a `prrr://import?z=<base64>` URL (deflate-compressed TOML) and
+/// parses the config.
 #[uniffi::export]
 pub fn parse_qr_config(qr_data: String) -> Result<VpnConfig, MobileError> {
-    // Decode base64
     let encoded = qr_data.strip_prefix(IMPORT_URL_PREFIX).ok_or_else(|| MobileError::InvalidConfig {
-        reason: "missing prrr://import?config= prefix".to_string(),
+        reason: "missing prrr://import?z= prefix".to_string(),
     })?;
 
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+    let compressed = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(encoded)
         .map_err(|e| MobileError::InvalidConfig {
             reason: format!("base64 decode failed: {e}"),
         })?;
 
-    let toml_str = String::from_utf8(bytes).map_err(|e| MobileError::InvalidConfig {
-        reason: format!("UTF-8 decode failed: {e}"),
-    })?;
+    use flate2::read::DeflateDecoder;
+    use std::io::Read;
+    let mut decoder = DeflateDecoder::new(&compressed[..]);
+    let toml_str = {
+        let mut s = String::new();
+        decoder.read_to_string(&mut s).map_err(|e| MobileError::InvalidConfig {
+            reason: format!("deflate decompress failed: {e}"),
+        })?;
+        s
+    };
 
     // Parse TOML
     let config: TomlConfig = toml::from_str(&toml_str).map_err(|e| MobileError::InvalidConfig {
@@ -155,6 +167,8 @@ struct TomlInterface {
     address: Option<String>,
     dns: Option<Vec<String>>,
     mtu: Option<u16>,
+    preferred_binding: Option<String>,
+    transport_protocol: Option<String>,
 }
 
 fn convert_toml_to_vpn_config(config: TomlConfig) -> Result<VpnConfig, MobileError> {
@@ -217,6 +231,9 @@ fn convert_toml_to_vpn_config(config: TomlConfig) -> Result<VpnConfig, MobileErr
             reason: format!("invalid interface private_key base64: {e}"),
         })?;
 
+    let preferred_binding = interface.preferred_binding;
+    let transport_protocol = interface.transport_protocol;
+
     Ok(VpnConfig {
         client_name,
         server_endpoint,
@@ -226,6 +243,8 @@ fn convert_toml_to_vpn_config(config: TomlConfig) -> Result<VpnConfig, MobileErr
         assigned_ip,
         dns_servers,
         mtu,
+        preferred_binding,
+        transport_protocol,
     })
 }
 
@@ -233,9 +252,22 @@ fn convert_toml_to_vpn_config(config: TomlConfig) -> Result<VpnConfig, MobileErr
 mod tests {
     use super::*;
 
+    /// Deflate-compress and base64url-encode, returning a `prrr://import?z=...` URL.
+    fn compress_to_qr_url(toml: &str) -> String {
+        use flate2::Compression;
+        use flate2::write::DeflateEncoder;
+        use std::io::Write;
+
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(toml.as_bytes()).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&compressed);
+        format!("{IMPORT_URL_PREFIX}{encoded}")
+    }
+
     #[test]
     fn test_parse_valid_qr_config_minimal() {
-        // Test mutant: verify we actually decode base64
+        // Test mutant: verify we actually decode deflate + base64
         let config_toml = r#"
 [client]
 name = "test-client"
@@ -249,10 +281,9 @@ pq_public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 address = "10.66.66.2/32"
 dns = ["1.1.1.1"]
-mtu = 1280
+mtu = 1100
 "#;
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(config_toml);
-        let qr_data = format!("{}{}", IMPORT_URL_PREFIX, encoded);
+        let qr_data = compress_to_qr_url(config_toml);
 
         let result = parse_qr_config(qr_data);
         assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
@@ -262,7 +293,7 @@ mtu = 1280
         assert_eq!(config.server_endpoint, "vpn.example.com:443");
         assert_eq!(config.assigned_ip, "10.66.66.2/32");
         assert_eq!(config.dns_servers, vec!["1.1.1.1"]);
-        assert_eq!(config.mtu, 1280);
+        assert_eq!(config.mtu, 1100);
     }
 
     #[test]
@@ -290,8 +321,7 @@ mtu = 1280
     fn test_parse_invalid_toml() {
         // Test mutant: verify TOML validation
         let invalid_toml = "not valid toml {{{";
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(invalid_toml);
-        let qr_data = format!("{}{}", IMPORT_URL_PREFIX, encoded);
+        let qr_data = compress_to_qr_url(invalid_toml);
 
         let result = parse_qr_config(qr_data);
         assert!(matches!(result, Err(MobileError::InvalidConfig { .. })));
@@ -313,10 +343,9 @@ pq_public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 address = "10.66.66.2/32"
 dns = ["1.1.1.1"]
-mtu = 1280
+mtu = 1100
 "#;
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(config_toml);
-        let qr_data = format!("{}{}", IMPORT_URL_PREFIX, encoded);
+        let qr_data = compress_to_qr_url(config_toml);
 
         let result = parse_qr_config(qr_data);
         assert!(matches!(result, Err(MobileError::InvalidConfig { .. })));
@@ -336,10 +365,9 @@ name = "test"
 private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 address = "10.66.66.2/32"
 dns = ["1.1.1.1"]
-mtu = 1280
+mtu = 1100
 "#;
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(config_toml);
-        let qr_data = format!("{}{}", IMPORT_URL_PREFIX, encoded);
+        let qr_data = compress_to_qr_url(config_toml);
 
         let result = parse_qr_config(qr_data);
         assert!(matches!(result, Err(MobileError::InvalidConfig { .. })));
@@ -359,7 +387,9 @@ mtu = 1280
             client_private_key: vec![0u8; 32],
             assigned_ip: "10.66.66.2/32".to_string(),
             dns_servers: vec!["1.1.1.1".to_string()],
-            mtu: 1280,
+            mtu: 1100,
+            preferred_binding: None,
+            transport_protocol: None,
         };
 
         let result = validate_config(config);
@@ -380,7 +410,9 @@ mtu = 1280
             client_private_key: vec![0u8; 32],
             assigned_ip: "10.66.66.2/32".to_string(),
             dns_servers: vec!["1.1.1.1".to_string()],
-            mtu: 1280,
+            mtu: 1100,
+            preferred_binding: None,
+            transport_protocol: None,
         };
 
         let result = validate_config(config);
@@ -401,7 +433,9 @@ mtu = 1280
             client_private_key: vec![0u8; 32],
             assigned_ip: "10.66.66.2/32".to_string(),
             dns_servers: vec!["1.1.1.1".to_string()],
-            mtu: 1280,
+            mtu: 1100,
+            preferred_binding: None,
+            transport_protocol: None,
         };
 
         let result = validate_config(config);
@@ -422,7 +456,9 @@ mtu = 1280
             client_private_key: vec![0u8; 32],
             assigned_ip: "10.66.66.2".to_string(), // Missing /32
             dns_servers: vec!["1.1.1.1".to_string()],
-            mtu: 1280,
+            mtu: 1100,
+            preferred_binding: None,
+            transport_protocol: None,
         };
 
         let result = validate_config(config);
@@ -443,7 +479,9 @@ mtu = 1280
             client_private_key: vec![0u8; 32],
             assigned_ip: "10.66.66.2/32".to_string(),
             dns_servers: vec![],
-            mtu: 1280,
+            mtu: 1100,
+            preferred_binding: None,
+            transport_protocol: None,
         };
 
         let result = validate_config(config);
@@ -465,6 +503,8 @@ mtu = 1280
             assigned_ip: "10.66.66.2/32".to_string(),
             dns_servers: vec!["1.1.1.1".to_string()],
             mtu: 9000, // Too large
+            preferred_binding: None,
+            transport_protocol: None,
         };
 
         let result = validate_config(config);
@@ -485,10 +525,195 @@ mtu = 1280
             client_private_key: vec![0u8; 32],
             assigned_ip: "10.66.66.2/32".to_string(),
             dns_servers: vec!["1.1.1.1".to_string()],
-            mtu: 1280,
+            mtu: 1100,
+            preferred_binding: None,
+            transport_protocol: None,
         };
 
         let result = validate_config(config);
         assert!(result.is_ok());
+    }
+
+    /// Helper: build a valid VpnConfig with a custom MTU.
+    fn config_with_mtu(mtu: u16) -> VpnConfig {
+        VpnConfig {
+            client_name: "test".to_string(),
+            server_endpoint: "vpn.example.com:443".to_string(),
+            server_public_key: vec![0u8; 32],
+            server_pq_public_key: vec![0u8; 1184],
+            client_private_key: vec![0u8; 32],
+            assigned_ip: "10.66.66.2/32".to_string(),
+            dns_servers: vec!["1.1.1.1".to_string()],
+            mtu,
+            preferred_binding: None,
+            transport_protocol: None,
+        }
+    }
+
+    /// The default MTU (1100) must be accepted by mobile validation.
+    #[test]
+    fn validate_accepts_default_mtu() {
+        assert!(validate_config(config_with_mtu(1100)).is_ok());
+    }
+
+    /// MTU boundary values: MIN_MTU (576), MAX_MTU (1500), and just outside.
+    #[test]
+    fn validate_mtu_boundaries() {
+        assert!(validate_config(config_with_mtu(576)).is_ok(), "MIN_MTU should pass");
+        assert!(validate_config(config_with_mtu(1100)).is_ok(), "default should pass");
+        assert!(validate_config(config_with_mtu(1500)).is_ok(), "MAX_MTU should pass");
+        assert!(validate_config(config_with_mtu(575)).is_err(), "below MIN should fail");
+        assert!(validate_config(config_with_mtu(1501)).is_err(), "above MAX should fail");
+    }
+
+    // --- Multi-frame QR protocol tests ---
+
+    const MULTI_FRAME_PREFIX: &str = "prrr://import?f=";
+    const MULTI_FRAME_MAX_CHUNK: usize = 300;
+
+    /// Split compressed payload into multi-frame URLs (mirrors JS buildMultiFrameUrls).
+    fn build_multiframe_urls(payload: &str) -> Vec<String> {
+        let chunks: Vec<&str> = payload
+            .as_bytes()
+            .chunks(MULTI_FRAME_MAX_CHUNK)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        let total = chunks.len();
+        chunks
+            .into_iter()
+            .enumerate()
+            .map(|(i, chunk)| format!("{MULTI_FRAME_PREFIX}{}.{total}&z={chunk}", i + 1))
+            .collect()
+    }
+
+    /// Reassemble multi-frame URLs back into a single-frame URL (mirrors Kotlin logic).
+    fn reassemble_multiframe(frame_urls: &[String]) -> String {
+        let mut chunks: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
+        let mut total = 0;
+        for url in frame_urls {
+            let params = url.strip_prefix("prrr://import?").unwrap();
+            let f_param = params.split("&z=").next().unwrap().strip_prefix("f=").unwrap();
+            let chunk_data = params.split("&z=").nth(1).unwrap_or("");
+            let parts: Vec<&str> = f_param.split('.').collect();
+            let index: usize = parts[0].parse().unwrap();
+            total = parts[1].parse().unwrap();
+            chunks.insert(index, chunk_data.to_string());
+        }
+        let payload: String = (1..=total).map(|i| chunks[&i].as_str()).collect();
+        format!("{IMPORT_URL_PREFIX}{payload}")
+    }
+
+    #[test]
+    fn test_multiframe_split_and_reassemble() {
+        // Build a realistic config TOML with ML-KEM-768 key.
+        // Use varied byte pattern (not uniform) so deflate can't compress it
+        // down below the multi-frame threshold.
+        let pq_key: Vec<u8> = (0..1184).map(|i| (i % 251) as u8).collect();
+        let config_toml = format!(
+            r#"[client]
+name = "test-phone"
+
+[server]
+endpoint = "vpn.example.com:443"
+public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+pq_public_key = "{}"
+
+[interface]
+private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+address = "10.66.66.2/32"
+dns = ["1.1.1.1", "8.8.8.8"]
+mtu = 1100
+"#,
+            base64::engine::general_purpose::STANDARD.encode(&pq_key)
+        );
+
+        // Compress to get the payload
+        let qr_url = compress_to_qr_url(&config_toml);
+        let payload = qr_url.strip_prefix(IMPORT_URL_PREFIX).unwrap();
+
+        // Verify payload is large enough to require multiple frames
+        assert!(
+            payload.len() > MULTI_FRAME_MAX_CHUNK,
+            "payload should exceed single chunk: {} chars",
+            payload.len()
+        );
+
+        // Split into frames
+        let frames = build_multiframe_urls(payload);
+        assert!(frames.len() > 1, "should produce multiple frames: {}", frames.len());
+
+        // Each frame should be small enough for easy QR scanning
+        for frame in &frames {
+            assert!(
+                frame.len() < 400,
+                "frame too large for easy scanning: {} chars",
+                frame.len()
+            );
+        }
+
+        // Reassemble (simulating Kotlin collector)
+        let reassembled = reassemble_multiframe(&frames);
+
+        // The reassembled URL should parse successfully
+        let result = parse_qr_config(reassembled);
+        assert!(result.is_ok(), "reassembled config should parse: {:?}", result.err());
+
+        let config = result.unwrap();
+        assert_eq!(config.client_name, "test-phone");
+        assert_eq!(config.server_endpoint, "vpn.example.com:443");
+        assert_eq!(config.assigned_ip, "10.66.66.2/32");
+    }
+
+    #[test]
+    fn test_multiframe_shuffled_order() {
+        // Frames can arrive in any order — reassembly should still work
+        let pq_key: Vec<u8> = (0..1184).map(|i| ((i * 7 + 3) % 251) as u8).collect();
+        let config_toml = format!(
+            r#"[client]
+name = "shuffle-test"
+
+[server]
+endpoint = "vpn.example.com:443"
+public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+pq_public_key = "{}"
+
+[interface]
+private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+address = "10.66.66.5/32"
+dns = ["1.1.1.1"]
+mtu = 1100
+"#,
+            base64::engine::general_purpose::STANDARD.encode(&pq_key)
+        );
+
+        let qr_url = compress_to_qr_url(&config_toml);
+        let payload = qr_url.strip_prefix(IMPORT_URL_PREFIX).unwrap();
+        let mut frames = build_multiframe_urls(payload);
+
+        // Reverse to simulate out-of-order scanning
+        frames.reverse();
+
+        let reassembled = reassemble_multiframe(&frames);
+        let result = parse_qr_config(reassembled);
+        assert!(result.is_ok(), "shuffled frames should reassemble: {:?}", result.err());
+        assert_eq!(result.unwrap().client_name, "shuffle-test");
+    }
+
+    #[test]
+    fn test_multiframe_frame_format() {
+        let payload = "ABCDEFGHIJ";
+        // Use tiny chunk size for testing
+        let chunks: Vec<&str> = payload.as_bytes().chunks(4).map(|c| std::str::from_utf8(c).unwrap()).collect();
+        let total = chunks.len();
+        let frames: Vec<String> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, chunk)| format!("{MULTI_FRAME_PREFIX}{}.{total}&z={chunk}", i + 1))
+            .collect();
+
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0], "prrr://import?f=1.3&z=ABCD");
+        assert_eq!(frames[1], "prrr://import?f=2.3&z=EFGH");
+        assert_eq!(frames[2], "prrr://import?f=3.3&z=IJ");
     }
 }

@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use base64::Engine as _;
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 
@@ -161,6 +162,10 @@ async fn main() -> anyhow::Result<()> {
             });
             let config_tokens = std::sync::Arc::new(prrr::distribution::ConfigTokenStore::new());
 
+            // Cross-transport session eviction map shared between HARP and MASQUE.
+            let active_clients: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<uuid::Uuid, tokio_util::sync::CancellationToken>>> =
+                std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
             // Start web admin if enabled
             let web_task = if config.web_admin.as_ref().and_then(|w| w.enabled).unwrap_or(false) {
                 let web_config = config.web_admin.as_ref().expect("web_admin present when enabled");
@@ -270,6 +275,7 @@ async fn main() -> anyhow::Result<()> {
                             }
                         )
                     }),
+                    active_clients: std::sync::Arc::clone(&active_clients),
                 };
                 tracing::info!(%listen_addr, "starting web admin server");
                 Some(tokio::spawn(prrr::web::run_web_server(listen_addr, app_state)))
@@ -318,6 +324,7 @@ async fn main() -> anyhow::Result<()> {
                 max_clients,
                 subnet_gateway,
                 cancel: cancel.clone(),
+                active_clients: std::sync::Arc::clone(&active_clients),
             });
 
             // Spawn each enabled transport
@@ -447,16 +454,18 @@ async fn main() -> anyhow::Result<()> {
             let config_kem_key = config.server.as_ref().and_then(|s| s.pq_public_key.as_deref());
             let server_kem_pub = prrr::config::resolve_server_kem_key(args.server_pq_public_key.as_deref(), config_kem_key)?;
 
-            // Resolve client Noise IK keypair: load from config path or generate ephemeral
-            let noise_keypair = match config.interface.as_ref().and_then(|i| i.private_key_path.as_deref()) {
-                Some(key_path) => {
-                    let key_bytes = std::fs::read(key_path).map_err(|e| anyhow::anyhow!("failed to read client key {key_path}: {e}"))?;
-                    prrr::handshake::noise_ik::KeyPair::from_private_key(&key_bytes)?
-                }
-                None => {
-                    tracing::info!("no client key path configured, generating ephemeral keypair");
-                    prrr::handshake::noise_ik::KeyPair::generate()?
-                }
+            // Resolve client Noise IK keypair: inline key > key file > ephemeral
+            let noise_keypair = if let Some(key_b64) = config.interface.as_ref().and_then(|i| i.private_key.as_deref()) {
+                let key_bytes = base64::engine::general_purpose::STANDARD.decode(key_b64)
+                    .map_err(|e| anyhow::anyhow!("invalid inline private_key base64: {e}"))?;
+                tracing::info!("using inline private_key from config");
+                prrr::handshake::noise_ik::KeyPair::from_private_key(&key_bytes)?
+            } else if let Some(key_path) = config.interface.as_ref().and_then(|i| i.private_key_path.as_deref()) {
+                let key_bytes = std::fs::read(key_path).map_err(|e| anyhow::anyhow!("failed to read client key {key_path}: {e}"))?;
+                prrr::handshake::noise_ik::KeyPair::from_private_key(&key_bytes)?
+            } else {
+                tracing::info!("no client key configured, generating ephemeral keypair");
+                prrr::handshake::noise_ik::KeyPair::generate()?
             };
 
             // Create real system TUN device from client config
@@ -489,11 +498,12 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("failed to create TUN device (need root/CAP_NET_ADMIN): {e}"))?;
             tracing::info!(name = tun_config.name, address = %tun_address, gateway = %gateway, mtu = tun_mtu, "TUN device created");
 
-            // Resolve transport protocol: config > default ("harp")
+            // Resolve transport protocol: interface.transport_protocol > transport.protocol > default
             let transport_protocol = config
-                .transport
+                .interface
                 .as_ref()
-                .and_then(|t| t.protocol.as_deref())
+                .and_then(|i| i.transport_protocol.as_deref())
+                .or_else(|| config.transport.as_ref().and_then(|t| t.protocol.as_deref()))
                 .unwrap_or(prrr::config::DEFAULT_TRANSPORT_PROTOCOL);
 
             // Resolve fwmark for policy routing

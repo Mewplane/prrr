@@ -58,6 +58,8 @@ pub struct MultiServerParams<F: TunFactory> {
     pub cancel: CancellationToken,
     /// Externally observable active connection counter.
     pub active_connections: Arc<AtomicU32>,
+    /// Cross-transport active client map for session eviction.
+    pub active_clients: Arc<Mutex<std::collections::HashMap<uuid::Uuid, CancellationToken>>>,
 }
 
 /// Run the VPN server in multi-client mode.
@@ -125,6 +127,7 @@ pub async fn run_multi_server_on_endpoint<F: TunFactory>(
         tun_factory,
         cancel,
         active_connections,
+        active_clients,
     } = params;
     // Serialize KEM DK bytes once (KemKeyPair is not Clone)
     let kem_dk_bytes = Arc::new(kem_keypair.dk_bytes());
@@ -161,11 +164,15 @@ pub async fn run_multi_server_on_endpoint<F: TunFactory>(
 
         // Spawn per-client handler
         let active_count = Arc::clone(&active_count);
-        let kem_dk_bytes = Arc::clone(&kem_dk_bytes);
-        let noise_private = Arc::clone(&noise_private);
-        let registry = Arc::clone(&registry);
-        let tun_factory = Arc::clone(&tun_factory);
         let client_cancel = cancel.child_token();
+        let ctx = Arc::new(ClientHandlerCtx {
+            noise_private: Arc::clone(&noise_private),
+            noise_public,
+            kem_dk_bytes: Arc::clone(&kem_dk_bytes),
+            registry: Arc::clone(&registry),
+            tun_factory: Arc::clone(&tun_factory),
+            active_clients: Arc::clone(&active_clients),
+        });
 
         active_count.fetch_add(1, Ordering::Relaxed);
 
@@ -177,11 +184,7 @@ pub async fn run_multi_server_on_endpoint<F: TunFactory>(
 
             let result = handle_client(
                 incoming,
-                &noise_private,
-                noise_public,
-                &kem_dk_bytes,
-                &registry,
-                &*tun_factory,
+                &ctx,
                 client_cancel,
             )
             .await;
@@ -213,16 +216,28 @@ pub async fn run_multi_server_on_endpoint<F: TunFactory>(
     Ok(())
 }
 
+/// Per-connection context shared across all client handlers.
+struct ClientHandlerCtx<F: TunFactory> {
+    noise_private: Arc<Vec<u8>>,
+    noise_public: [u8; 32],
+    kem_dk_bytes: Arc<Vec<u8>>,
+    registry: Arc<Mutex<ClientRegistry>>,
+    tun_factory: Arc<F>,
+    active_clients: Arc<Mutex<std::collections::HashMap<uuid::Uuid, CancellationToken>>>,
+}
+
 /// Handle a single client connection (runs in its own tokio task).
 async fn handle_client<F: TunFactory>(
     incoming: quinn::Incoming,
-    noise_private: &[u8],
-    noise_public: [u8; 32],
-    kem_dk_bytes: &[u8],
-    registry: &Mutex<ClientRegistry>,
-    tun_factory: &F,
+    ctx: &ClientHandlerCtx<F>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
+    let noise_private = &ctx.noise_private;
+    let noise_public = ctx.noise_public;
+    let kem_dk_bytes = &ctx.kem_dk_bytes;
+    let registry = &ctx.registry;
+    let tun_factory = &*ctx.tun_factory;
+    let active_clients = &ctx.active_clients;
     let connection = incoming.await?;
     let remote_addr = connection.remote_address();
     tracing::info!("client connected from {remote_addr}");
@@ -280,6 +295,18 @@ async fn handle_client<F: TunFactory>(
         }
     };
 
+    // Evict previous session for this client (if any) so the old TUN is freed.
+    {
+        let mut map = active_clients.lock().await;
+        if let Some(old_cancel) = map.remove(&client_id) {
+            tracing::info!("evicting previous session for client {client_id}");
+            old_cancel.cancel();
+            // Yield briefly so the old task can clean up its TUN device.
+            tokio::task::yield_now().await;
+        }
+        map.insert(client_id, cancel.clone());
+    }
+
     // Update last_seen and log connect event
     {
         let mut reg = registry.lock().await;
@@ -309,7 +336,20 @@ async fn handle_client<F: TunFactory>(
     let (tun, _handle) = tun_factory
         .create_tun(&tun_config)
         .map_err(|e| anyhow::anyhow!("TUN creation failed: {e}"))?;
-    tracing::info!(device = tun.name(), address = %gateway_ip, peer = %client_ip, "TUN device created for client");
+    tracing::info!(device = tun.name(), address = %gateway_ip, peer = %client_ip, mtu = tun.mtu(), "TUN device created for client");
+
+    // Log QUIC datagram size budget for debugging MTU issues
+    if let Some(max_dg) = proxy.max_datagram_size() {
+        let overhead = crate::client::TUNNEL_OVERHEAD_BYTES;
+        let safe_mtu = max_dg.saturating_sub(overhead + 4); // +4 for MASQUE framing
+        tracing::info!(
+            max_datagram_size = max_dg,
+            overhead = overhead + 4,
+            safe_mtu,
+            tun_mtu = tun.mtu(),
+            "QUIC datagram budget"
+        );
+    }
 
     // Build encrypted channel and pipeline
     let channel = EncryptedChannel::new(resp_result.session_keys.rx_key, resp_result.session_keys.tx_key);
@@ -320,6 +360,12 @@ async fn handle_client<F: TunFactory>(
 
     tracing::info!("pipeline running for client {client_id}");
     let pipeline_result = pipeline.run(cancel).await;
+
+    // Remove from active clients map (only if we're still the registered session).
+    {
+        let mut map = active_clients.lock().await;
+        map.remove(&client_id);
+    }
 
     // Persist traffic stats
     {
@@ -448,6 +494,7 @@ where
                 tun_factory: Arc::clone(&self.tun_factory),
                 cancel: cancel.clone(),
                 active_connections: Arc::clone(&shared.active_connections),
+                active_clients: Arc::clone(&shared.active_clients),
             };
 
             run_multi_server(
@@ -567,6 +614,7 @@ mod tests {
                     tun_factory,
                     cancel: cancel_clone,
                     active_connections: Arc::new(AtomicU32::new(0)),
+                    active_clients: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 },
             )
             .await
@@ -625,6 +673,7 @@ mod tests {
                         tun_factory,
                         cancel,
                         active_connections: Arc::new(AtomicU32::new(0)),
+                        active_clients: Arc::new(Mutex::new(std::collections::HashMap::new())),
                     },
                 )
                 .await
@@ -731,6 +780,7 @@ mod tests {
                         tun_factory,
                         cancel,
                         active_connections: Arc::new(AtomicU32::new(0)),
+                        active_clients: Arc::new(Mutex::new(std::collections::HashMap::new())),
                     },
                 )
                 .await
@@ -836,6 +886,7 @@ mod tests {
                         tun_factory,
                         cancel,
                         active_connections: Arc::new(AtomicU32::new(0)),
+                        active_clients: Arc::new(Mutex::new(std::collections::HashMap::new())),
                     },
                 )
                 .await
@@ -939,6 +990,7 @@ mod tests {
                         tun_factory,
                         cancel,
                         active_connections: Arc::new(AtomicU32::new(0)),
+                        active_clients: Arc::new(Mutex::new(std::collections::HashMap::new())),
                     },
                 )
                 .await
@@ -1047,6 +1099,7 @@ mod tests {
                         tun_factory,
                         cancel,
                         active_connections: Arc::new(AtomicU32::new(0)),
+                        active_clients: Arc::new(Mutex::new(std::collections::HashMap::new())),
                     },
                 )
                 .await
@@ -1137,6 +1190,7 @@ mod tests {
                         tun_factory,
                         cancel,
                         active_connections,
+                        active_clients: Arc::new(Mutex::new(std::collections::HashMap::new())),
                     },
                 )
                 .await
@@ -1243,6 +1297,7 @@ mod tests {
                         tun_factory,
                         cancel,
                         active_connections: Arc::new(AtomicU32::new(0)),
+                        active_clients: Arc::new(Mutex::new(std::collections::HashMap::new())),
                     },
                 )
                 .await
@@ -1376,6 +1431,7 @@ mod tests {
             max_clients: TEST_MAX_CLIENTS,
             subnet_gateway: std::net::Ipv4Addr::new(10, 66, 66, 1),
             cancel: cancel.clone(),
+            active_clients: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         });
 
         let transport = MasqueServerTransport::new(

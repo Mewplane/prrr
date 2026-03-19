@@ -9,11 +9,17 @@
 
 use std::net::Ipv4Addr;
 
-/// Default inner tunnel MTU (IPv6 minimum, works everywhere without fragmentation).
-pub const DEFAULT_TUNNEL_MTU: u16 = 1280;
+/// Default inner tunnel MTU.
+///
+/// Must fit within a single QUIC datagram after encryption (26 bytes) and
+/// MASQUE framing (~4 bytes) overhead. Quinn's min QUIC UDP payload is
+/// 1200 bytes, but QUIC packet headers consume ~30 bytes, leaving ~1170
+/// bytes for datagram payload. With 30 bytes of tunnel overhead:
+/// 1170 − 30 = 1140, rounded down to 1100 for safety.
+pub const DEFAULT_TUNNEL_MTU: u16 = 1100;
 
-/// Minimum allowed tunnel MTU (IPv6 minimum per RFC 8200).
-pub const MIN_TUNNEL_MTU: u16 = 1280;
+/// Minimum allowed tunnel MTU (conservative lower bound).
+pub const MIN_TUNNEL_MTU: u16 = 576;
 
 /// Maximum allowed tunnel MTU (WireGuard-equivalent for Ethernet).
 pub const MAX_TUNNEL_MTU: u16 = 1420;
@@ -78,12 +84,14 @@ impl TunConfig {
 /// A real Linux TUN device backed by `tokio_tun`.
 ///
 /// Requires `CAP_NET_ADMIN` or root privileges to create.
+#[cfg(feature = "system-tun")]
 pub struct SystemTun {
     inner: tokio_tun::Tun,
     device_name: String,
     device_mtu: u16,
 }
 
+#[cfg(feature = "system-tun")]
 impl SystemTun {
     /// Create a new system TUN device from a [`TunConfig`].
     pub fn from_config(config: &TunConfig) -> std::io::Result<Self> {
@@ -116,6 +124,7 @@ impl SystemTun {
     }
 }
 
+#[cfg(feature = "system-tun")]
 impl TunDevice for SystemTun {
     fn name(&self) -> &str {
         &self.device_name
@@ -142,10 +151,12 @@ impl TunDevice for SystemTun {
 /// devices don't need a test handle.
 ///
 /// Requires `CAP_NET_ADMIN` or root privileges.
+#[cfg(feature = "system-tun")]
 pub struct SystemTunFactory {
     counter: std::sync::atomic::AtomicU32,
 }
 
+#[cfg(feature = "system-tun")]
 impl SystemTunFactory {
     /// Create a new factory starting device names at `prrr0`.
     pub fn new() -> Self {
@@ -155,12 +166,14 @@ impl SystemTunFactory {
     }
 }
 
+#[cfg(feature = "system-tun")]
 impl Default for SystemTunFactory {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "system-tun")]
 impl super::TunFactory for SystemTunFactory {
     type Tun = SystemTun;
     type Handle = ();

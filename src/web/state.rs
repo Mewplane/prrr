@@ -7,6 +7,7 @@
 
 //! Shared application state for web API handlers.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
@@ -65,4 +66,9 @@ pub struct AppState {
     pub trust_proxy_headers: bool,
     /// Whether the server supports HTTP/2 streaming binding (default: `true`).
     pub h2_streaming_enabled: bool,
+    /// Cross-transport active client map for session eviction.
+    ///
+    /// Shared with the MASQUE transport so that reconnecting clients
+    /// via a different transport evict the old session's TUN device.
+    pub active_clients: Arc<Mutex<HashMap<uuid::Uuid, CancellationToken>>>,
 }

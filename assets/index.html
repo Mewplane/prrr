@@ -467,6 +467,141 @@
             const BYTES_DIVISOR = 1024;
             const STATUS_ACTIVE = "active";
             const STATUS_SUSPENDED = "suspended";
+            const IMPORT_URL_PREFIX = "prrr://import?z=";
+
+            // --- Client-side crypto helpers ---
+
+            // Generate X25519 keypair in the browser. Returns { publicKey, privateKey } as Uint8Array.
+            async function generateX25519Keypair() {
+                const keyPair = await crypto.subtle.generateKey(
+                    { name: "X25519" },
+                    true, // extractable
+                    ["deriveBits"],
+                );
+                const pubRaw = await crypto.subtle.exportKey("raw", keyPair.publicKey);
+                const privRaw = await crypto.subtle.exportKey("pkcs8", keyPair.privateKey);
+                // PKCS8 for X25519 is 48 bytes: 16-byte header + 32-byte key
+                const PKCS8_HEADER_LEN = 16;
+                const privBytes = new Uint8Array(privRaw).slice(PKCS8_HEADER_LEN);
+                return {
+                    publicKey: new Uint8Array(pubRaw),
+                    privateKey: privBytes,
+                };
+            }
+
+            // Base64-encode Uint8Array (standard base64, for TOML key values).
+            function toBase64(bytes) {
+                let binary = "";
+                for (const b of bytes) binary += String.fromCharCode(b);
+                return btoa(binary);
+            }
+
+            // Base64url-encode Uint8Array (no padding, for prrr:// URL).
+            function toBase64url(bytes) {
+                return toBase64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+            }
+
+            // Deflate-compress a string and return Uint8Array (raw deflate, no zlib wrapper).
+            async function deflateCompress(str) {
+                const input = new TextEncoder().encode(str);
+                const ds = new CompressionStream("deflate-raw");
+                const writer = ds.writable.getWriter();
+                writer.write(input);
+                writer.close();
+                const chunks = [];
+                const reader = ds.readable.getReader();
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    chunks.push(value);
+                }
+                const totalLen = chunks.reduce((s, c) => s + c.length, 0);
+                const result = new Uint8Array(totalLen);
+                let offset = 0;
+                for (const c of chunks) {
+                    result.set(c, offset);
+                    offset += c.length;
+                }
+                return result;
+            }
+
+            // Build compressed base64url payload from config TOML string.
+            async function compressConfig(configToml) {
+                const compressed = await deflateCompress(configToml);
+                return toBase64url(compressed);
+            }
+
+            // Max chars of base64url data per QR frame. Targets QR version ~12
+            // which is reliably scannable by phone cameras.
+            const MAX_CHUNK_CHARS = 300;
+            const FRAME_CYCLE_MS = 2000;
+            const MULTI_FRAME_URL_PREFIX = "prrr://import?f=";
+
+            // Split compressed payload into multi-frame QR URLs.
+            // Format: prrr://import?f=<index>.<total>&z=<chunk>
+            function buildMultiFrameUrls(payload) {
+                const chunks = [];
+                for (let i = 0; i < payload.length; i += MAX_CHUNK_CHARS) {
+                    chunks.push(payload.slice(i, i + MAX_CHUNK_CHARS));
+                }
+                return chunks.map((chunk, i) =>
+                    MULTI_FRAME_URL_PREFIX + (i + 1) + "." + chunks.length + "&z=" + chunk
+                );
+            }
+
+            // Generate SVG QR code from a string using qrcode-generator.
+            // Dynamically loads the library on first use.
+            let qrGeneratorLoaded = false;
+            async function loadQrGenerator() {
+                if (qrGeneratorLoaded) return;
+                await new Promise((resolve, reject) => {
+                    const s = document.createElement("script");
+                    s.src = "https://unpkg.com/qrcode-generator@1.4.4/qrcode.js";
+                    s.onload = resolve;
+                    s.onerror = reject;
+                    document.head.appendChild(s);
+                });
+                qrGeneratorLoaded = true;
+            }
+
+            async function generateQrSvg(data) {
+                await loadQrGenerator();
+                // Type 0 = auto-detect version, ECL M = medium
+                const QR_ECL_M = "M";
+                const QR_TYPE_AUTO = 0;
+                const qr = qrcode(QR_TYPE_AUTO, QR_ECL_M);
+                qr.addData(data);
+                qr.make();
+                return qr.createSvgTag({ scalable: true });
+            }
+
+            // Generate array of SVG frames for animated multi-frame QR.
+            async function generateMultiFrameQrSvgs(configToml) {
+                const payload = await compressConfig(configToml);
+                const urls = buildMultiFrameUrls(payload);
+                const svgs = [];
+                for (const url of urls) {
+                    svgs.push(await generateQrSvg(url));
+                }
+                return svgs;
+            }
+
+            // Patch server config TOML: replace private_key_path with inline private_key.
+            // The config format is otherwise wire-compatible with the mobile parser —
+            // server_name and other unknown fields are ignored by serde, and
+            // transport_protocol is already in [interface].
+            function patchConfigForMobile(configToml, privateKeyB64) {
+                let lines = configToml.split("\n");
+                let result = [];
+                for (const line of lines) {
+                    if (line.startsWith("private_key_path")) {
+                        result.push('private_key = "' + privateKeyB64 + '"');
+                    } else {
+                        result.push(line);
+                    }
+                }
+                return result.join("\n");
+            }
 
             // --- API Client ---
             const api = {
@@ -519,10 +654,12 @@
                 getClient(id) {
                     return this.request("/clients/" + id);
                 },
-                createClient(name) {
+                createClient(name, publicKeyB64) {
+                    const body = { name };
+                    if (publicKeyB64) body.public_key = publicKeyB64;
                     return this.request("/clients", {
                         method: "POST",
-                        body: JSON.stringify({ name }),
+                        body: JSON.stringify(body),
                     });
                 },
                 deleteClient(id) {
@@ -730,17 +867,25 @@
                     loading: false,
                     error: null,
                     result: null,
-                    qrSvg: null,
+                    qrFrames: null,
+                    qrFrameIndex: 0,
                     shareUrl: null,
                     qrLoading: false,
                     urlLoading: false,
                 };
+                _qrTimer = null;
 
                 onSubmit = async (e) => {
                     e.preventDefault();
                     this.setState({ loading: true, error: null });
                     try {
-                        const result = await api.createClient(this.state.name);
+                        // Generate X25519 keypair client-side — private key never leaves the browser
+                        const keypair = await generateX25519Keypair();
+                        const pubB64 = toBase64(keypair.publicKey);
+                        const privB64 = toBase64(keypair.privateKey);
+                        const result = await api.createClient(this.state.name, pubB64);
+                        // Store private key in component state (memory only, not sent to server)
+                        this._clientPrivateKeyB64 = privB64;
                         this.setState({ result, loading: false });
                         this.props.onCreated();
                     } catch (err) {
@@ -748,11 +893,25 @@
                     }
                 };
 
+                componentWillUnmount() {
+                    if (this._qrTimer) clearInterval(this._qrTimer);
+                }
+
                 onShowQr = async () => {
                     this.setState({ qrLoading: true });
                     try {
-                        const svg = await api.getClientQr(this.state.result.id);
-                        this.setState({ qrSvg: svg, qrLoading: false });
+                        // Fetch config TOML, patch with client-side private key, generate QR locally
+                        const config = await api.getClientConfig(this.state.result.id);
+                        const mobileConfig = patchConfigForMobile(config, this._clientPrivateKeyB64);
+                        const frames = await generateMultiFrameQrSvgs(mobileConfig);
+                        this.setState({ qrFrames: frames, qrFrameIndex: 0, qrLoading: false });
+                        // Start cycling through frames
+                        if (this._qrTimer) clearInterval(this._qrTimer);
+                        this._qrTimer = setInterval(() => {
+                            this.setState(s => ({
+                                qrFrameIndex: (s.qrFrameIndex + 1) % s.qrFrames.length
+                            }));
+                        }, FRAME_CYCLE_MS);
                     } catch (err) {
                         this.setState({ error: err.message, qrLoading: false });
                     }
@@ -778,9 +937,13 @@
 
                 onDownloadConfig = async () => {
                     try {
-                        const config = await api.getClientConfig(
+                        let config = await api.getClientConfig(
                             this.state.result.id,
                         );
+                        // Patch with inline private_key — works for both CLI and mobile
+                        if (this._clientPrivateKeyB64) {
+                            config = patchConfigForMobile(config, this._clientPrivateKeyB64);
+                        }
                         const blob = new Blob([config], { type: "text/plain" });
                         const url = URL.createObjectURL(blob);
                         const a = document.createElement("a");
@@ -800,7 +963,8 @@
                         loading,
                         error,
                         result,
-                        qrSvg,
+                        qrFrames,
+                        qrFrameIndex,
                         shareUrl,
                         qrLoading,
                         urlLoading,
@@ -852,24 +1016,26 @@
                                                       >${result.public_key}</span
                                                   >
                                               </div>
-                                              ${result.private_key &&
+                                              ${this._clientPrivateKeyB64 &&
                                               html`
                                                   <div class="result-row">
                                                       <span class="result-label"
                                                           >Private Key</span
                                                       >
                                                       <span class="result-value"
-                                                          >${result.private_key}</span
+                                                          >${this._clientPrivateKeyB64}</span
                                                       >
                                                   </div>
                                               `}
                                           </div>
-                                          ${result.private_key &&
+                                          ${this._clientPrivateKeyB64 &&
                                           html`
                                               <div
                                                   class="alert alert-error mt-1"
                                               >
-                                                  Save the private key now. It
+                                                  Private key was generated in
+                                                  your browser and never sent to
+                                                  the server. Save it now — it
                                                   will not be shown again.
                                               </div>
                                           `}
@@ -903,15 +1069,25 @@
                                                   Download Config
                                               </button>
                                           </div>
-                                          ${qrSvg &&
+                                          ${qrFrames &&
                                           html`
                                               <div
                                                   class="result-box mt-1"
                                                   style="text-align:center"
-                                                  dangerouslySetInnerHTML=${{
-                                                      __html: qrSvg,
-                                                  }}
-                                              />
+                                              >
+                                                  <div
+                                                      dangerouslySetInnerHTML=${{
+                                                          __html: qrFrames[qrFrameIndex],
+                                                      }}
+                                                  />
+                                                  <div
+                                                      class="text-sm text-dim mt-1"
+                                                  >
+                                                      Frame ${qrFrameIndex + 1}/${qrFrames.length}
+                                                      — point phone camera at
+                                                      animated QR
+                                                  </div>
+                                              </div>
                                           `}
                                           ${shareUrl &&
                                           html`

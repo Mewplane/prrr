@@ -26,10 +26,19 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTop"
             android:theme="@style/Theme.PrrrVPN">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Deep link for config import (FRD: specs/frds/FRD-M015-deep-link-config-import.md) -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="prrr" android:host="import" />
+                <data android:scheme="prrr" android:host="connect" />
             </intent-filter>
         </activity>
 
@@ -38,6 +47,7 @@
             android:name=".vpn.PrrrVpnService"
             android:permission="android.permission.BIND_VPN_SERVICE"
             android:exported="true"
+            android:foregroundServiceType="specialUse"
             tools:ignore="MissingClass">
             <intent-filter>
                 <action android:name="android.net.VpnService" />

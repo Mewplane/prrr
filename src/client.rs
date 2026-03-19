@@ -40,6 +40,31 @@ use crate::web::harp::{HarpSessionRequest, HarpSessionResponse};
 /// Total: 26 bytes per packet.
 pub const TUNNEL_OVERHEAD_BYTES: usize = NONCE_COUNTER_LEN + crate::crypto::aead::TAG_LEN + 2;
 
+/// Worst-case MASQUE HTTP Datagram framing overhead (varint quarter_stream_id + context_id).
+/// Typically 2 bytes for stream_id=0, but budget checks use 4 for safety.
+pub const MASQUE_FRAMING_OVERHEAD: usize = 4;
+
+/// Minimum QUIC datagram payload available after QUIC packet headers.
+/// Quinn's minimum QUIC UDP payload is 1200 bytes; QUIC headers consume ~30 bytes.
+pub const MIN_QUIC_DATAGRAM_PAYLOAD: usize = 1170;
+
+/// Check whether a TUN MTU fits within the QUIC datagram budget.
+///
+/// Returns `Ok(safe_mtu)` if the MTU fits, or `Err(message)` if packets would be dropped.
+pub fn check_mtu_budget(tun_mtu: u16, max_datagram_size: usize) -> Result<u16, String> {
+    let total_overhead = TUNNEL_OVERHEAD_BYTES + MASQUE_FRAMING_OVERHEAD;
+    let needed = usize::from(tun_mtu) + total_overhead;
+    let safe_mtu = max_datagram_size.saturating_sub(total_overhead);
+    if needed <= max_datagram_size {
+        Ok(safe_mtu as u16)
+    } else {
+        Err(format!(
+            "TUN MTU {tun_mtu} + {total_overhead} byte overhead = {needed}, \
+             exceeds QUIC datagram limit {max_datagram_size}. Safe MTU: {safe_mtu}"
+        ))
+    }
+}
+
 /// Run the VPN client.
 ///
 /// Connects to the server at `server_addr`, performs the hybrid handshake,
@@ -85,19 +110,21 @@ pub async fn run_client<T: TunDevice>(
     tracing::info!("MASQUE tunnel established");
 
     // Check that TUN MTU fits within the QUIC datagram size budget
-    let tun_mtu = usize::from(tun.mtu());
     if let Some(max_dg) = masque_client.max_datagram_size() {
-        let needed = tun_mtu + TUNNEL_OVERHEAD_BYTES;
-        if needed > max_dg {
-            tracing::error!(
-                tun_mtu = tun_mtu,
-                overhead = TUNNEL_OVERHEAD_BYTES,
-                max_datagram_size = max_dg,
-                "TUN MTU too large: {tun_mtu} + {TUNNEL_OVERHEAD_BYTES} byte overhead = {needed}, \
-                 but QUIC max datagram is {max_dg}. Large packets will be dropped. \
-                 Lower interface.mtu in client config to at most {}.",
-                max_dg.saturating_sub(TUNNEL_OVERHEAD_BYTES)
-            );
+        let tun_mtu = tun.mtu();
+        match check_mtu_budget(tun_mtu, max_dg) {
+            Ok(safe_mtu) => {
+                tracing::info!(
+                    tun_mtu,
+                    max_datagram_size = max_dg,
+                    overhead = TUNNEL_OVERHEAD_BYTES + MASQUE_FRAMING_OVERHEAD,
+                    safe_mtu,
+                    "QUIC datagram budget"
+                );
+            }
+            Err(msg) => {
+                tracing::error!("{msg}");
+            }
         }
     }
 
@@ -1258,27 +1285,37 @@ async fn connect_harp_h2(
         return Err(anyhow::anyhow!("TCP connect to {addr}: {err}"));
     }
 
-    // TLS handshake with H2-only ALPN
-    let tls_config = build_harp_h2_rustls_config(insecure, profile)?;
-    let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
-    let server_name =
-        rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|e| anyhow::anyhow!("invalid server name '{host}': {e}"))?;
-    let tls_stream = tls_connector
-        .connect(server_name, tcp_stream)
-        .await
-        .map_err(|e| anyhow::anyhow!("TLS handshake for H2 failed: {e}"))?;
-
-    // h2 client handshake over TLS stream
-    let (send_request, connection) = h2::client::handshake(tls_stream)
-        .await
-        .map_err(|e| anyhow::anyhow!("H2 handshake failed: {e}"))?;
-
-    // Spawn connection driver
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            tracing::debug!("H2 connection closed: {e}");
-        }
-    });
+    // H2 handshake: h2c (cleartext) when insecure, h2 (TLS) otherwise
+    let send_request = if insecure {
+        tracing::debug!("H2: using h2c (cleartext HTTP/2)");
+        let (send_request, connection) = h2::client::handshake(tcp_stream)
+            .await
+            .map_err(|e| anyhow::anyhow!("h2c handshake failed: {e}"))?;
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::debug!("h2c connection closed: {e}");
+            }
+        });
+        send_request
+    } else {
+        let tls_config = build_harp_h2_rustls_config(insecure, profile)?;
+        let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+        let server_name =
+            rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|e| anyhow::anyhow!("invalid server name '{host}': {e}"))?;
+        let tls_stream = tls_connector
+            .connect(server_name, tcp_stream)
+            .await
+            .map_err(|e| anyhow::anyhow!("TLS handshake for H2 failed: {e}"))?;
+        let (send_request, connection) = h2::client::handshake(tls_stream)
+            .await
+            .map_err(|e| anyhow::anyhow!("H2 handshake failed: {e}"))?;
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::debug!("H2 connection closed: {e}");
+            }
+        });
+        send_request
+    };
 
     // Encode session_id as URL-safe base64 for URL path
     let session_id_bytes = BASE64
@@ -2084,7 +2121,7 @@ mod tests {
                 noise_public_key: server_noise_public_key,
                 kem_public_key,
                 dns_servers: vec!["1.1.1.1".to_string()],
-                mtu: 1280,
+                mtu: 1100,
                 transport_protocol: "harp".to_string(),
             }),
             config_tokens: Arc::new(ConfigTokenStore::new()),
@@ -2093,7 +2130,7 @@ mod tests {
                 server_name: "test.example.com".to_string(),
                 subnet: "10.66.66.0/24".to_string(),
                 dns_servers: vec!["1.1.1.1".to_string()],
-                mtu: 1280,
+                mtu: 1100,
                 max_clients: 100,
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 transport_protocol: "harp".to_string(),
@@ -2110,6 +2147,7 @@ mod tests {
             cover_page_enabled: true,
             trust_proxy_headers: false,
             h2_streaming_enabled: true,
+            active_clients: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -2385,6 +2423,7 @@ mod tests {
                         tun_factory,
                         cancel,
                         active_connections: Arc::new(AtomicU32::new(0)),
+                        active_clients: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
                     },
                 )
                 .await
@@ -2640,5 +2679,72 @@ mod tests {
         let config = build_harp_h2_rustls_config(false, TlsProfile::Default).unwrap();
         let expected_alpn: Vec<Vec<u8>> = vec![b"h2".to_vec()];
         assert_eq!(config.alpn_protocols, expected_alpn, "H2 config ALPN should be [h2] in secure mode");
+    }
+
+    // -----------------------------------------------------------------------
+    // MTU budget tests
+    // -----------------------------------------------------------------------
+
+    /// TUNNEL_OVERHEAD_BYTES must equal the sum of its crypto components.
+    #[test]
+    fn tunnel_overhead_equals_components() {
+        use crate::transport::encrypted_channel::NONCE_COUNTER_LEN;
+        use crate::crypto::aead::TAG_LEN;
+        assert_eq!(
+            TUNNEL_OVERHEAD_BYTES,
+            NONCE_COUNTER_LEN + TAG_LEN + 2,
+            "overhead = nonce({NONCE_COUNTER_LEN}) + tag({TAG_LEN}) + masque_min(2)"
+        );
+    }
+
+    /// The default MTU, after encryption + MASQUE framing, must fit in a QUIC datagram.
+    /// This is the single most important MTU invariant.
+    #[test]
+    fn default_mtu_fits_quic_datagram_budget() {
+        let needed = usize::from(crate::config::DEFAULT_MTU)
+            + TUNNEL_OVERHEAD_BYTES
+            + MASQUE_FRAMING_OVERHEAD;
+        assert!(
+            needed <= MIN_QUIC_DATAGRAM_PAYLOAD,
+            "DEFAULT_MTU {} + overhead {} = {needed}, exceeds QUIC budget {MIN_QUIC_DATAGRAM_PAYLOAD}",
+            crate::config::DEFAULT_MTU,
+            TUNNEL_OVERHEAD_BYTES + MASQUE_FRAMING_OVERHEAD,
+        );
+    }
+
+    /// check_mtu_budget returns Ok for the default MTU.
+    #[test]
+    fn budget_check_accepts_default_mtu() {
+        assert!(
+            check_mtu_budget(crate::config::DEFAULT_MTU, MIN_QUIC_DATAGRAM_PAYLOAD).is_ok()
+        );
+    }
+
+    /// check_mtu_budget rejects MTU that would exceed the budget.
+    #[test]
+    fn budget_check_rejects_oversized_mtu() {
+        assert!(check_mtu_budget(1150, MIN_QUIC_DATAGRAM_PAYLOAD).is_err());
+    }
+
+    /// End-to-end: encrypt a DEFAULT_MTU-sized packet and frame it,
+    /// verify the wire size fits in a QUIC datagram.
+    #[test]
+    fn max_mtu_packet_through_real_encrypt_and_frame() {
+        use crate::transport::encrypted_channel::EncryptedChannel;
+        use crate::transport::masque::frame_datagram;
+
+        let tx_key = [0x42u8; 32];
+        let rx_key = [0x43u8; 32];
+        let mut channel = EncryptedChannel::new(tx_key, rx_key);
+
+        let plaintext = vec![0xABu8; usize::from(crate::config::DEFAULT_MTU)];
+        let encrypted = channel.send(&plaintext).unwrap();
+        let framed = frame_datagram(0, &encrypted).unwrap();
+
+        assert!(
+            framed.len() <= MIN_QUIC_DATAGRAM_PAYLOAD,
+            "encrypted+framed packet ({} bytes) exceeds QUIC budget ({MIN_QUIC_DATAGRAM_PAYLOAD})",
+            framed.len()
+        );
     }
 }

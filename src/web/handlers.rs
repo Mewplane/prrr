@@ -442,7 +442,7 @@ pub async fn get_client_config(
         .ok_or_else(|| ApiError::NotFound(format!("client not found: {id}")))?;
 
     let config =
-        crate::distribution::generate_client_config(&state.server_context, &record).map_err(|e| ApiError::Internal(e.to_string()))?;
+        crate::distribution::generate_client_config(&state.server_context, &record, None).map_err(|e| ApiError::Internal(e.to_string()))?;
 
     Ok((
         StatusCode::OK,
@@ -462,7 +462,7 @@ pub async fn get_client_qr(
         .ok_or_else(|| ApiError::NotFound(format!("client not found: {id}")))?;
 
     let config =
-        crate::distribution::generate_client_config(&state.server_context, &record).map_err(|e| ApiError::Internal(e.to_string()))?;
+        crate::distribution::generate_client_config(&state.server_context, &record, None).map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let svg = crate::distribution::generate_qr_svg(&config).map_err(|e| ApiError::Internal(e.to_string()))?;
 
@@ -492,7 +492,7 @@ pub async fn create_config_url(
         .ok_or_else(|| ApiError::NotFound(format!("client not found: {id}")))?;
 
     let config =
-        crate::distribution::generate_client_config(&state.server_context, &record).map_err(|e| ApiError::Internal(e.to_string()))?;
+        crate::distribution::generate_client_config(&state.server_context, &record, None).map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let token = state.config_tokens.insert(config).await;
     let url = format!("{CONFIG_TOKEN_PATH_PREFIX}{token}");
@@ -575,7 +575,7 @@ mod tests {
             server_name: "www.google.com".to_string(),
             subnet: "10.66.66.0/24".to_string(),
             dns_servers: vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
-            mtu: 1280,
+            mtu: 1100,
             max_clients: 100,
             version: env!("CARGO_PKG_VERSION").to_string(),
             transport_protocol: "masque".to_string(),
@@ -603,7 +603,7 @@ mod tests {
                 noise_public_key: [0xAA; 32],
                 kem_public_key: vec![0xBB; 64],
                 dns_servers: vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
-                mtu: 1280,
+                mtu: 1100,
                 transport_protocol: "harp".to_string(),
             }),
             config_tokens: Arc::new(ConfigTokenStore::new()),
@@ -617,6 +617,7 @@ mod tests {
             cover_page_enabled: true,
             trust_proxy_headers: false,
             h2_streaming_enabled: true,
+            active_clients: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -691,7 +692,7 @@ mod tests {
         assert_eq!(body.server_name, "www.google.com");
         assert_eq!(body.subnet, "10.66.66.0/24");
         assert_eq!(body.dns_servers, vec!["1.1.1.1", "8.8.8.8"]);
-        assert_eq!(body.mtu, 1280);
+        assert_eq!(body.mtu, 1100);
         assert_eq!(body.max_clients, 100);
         assert_eq!(body.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(body.transport_protocol, "masque");
