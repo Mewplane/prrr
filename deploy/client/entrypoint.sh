@@ -56,7 +56,7 @@ server_name = "localhost"
 [network]
 subnet = "${PRRR_SUBNET}"
 dns_servers = ["1.1.1.1", "8.8.8.8"]
-mtu = 1280
+mtu = 1100
 
 [crypto]
 identity_key_path = "/etc/prrr/keys/server_identity.key"

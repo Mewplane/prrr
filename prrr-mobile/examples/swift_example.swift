@@ -80,7 +80,7 @@ func example2_validateConfiguration() {
         clientPrivateKey: [UInt8](repeating: 0, count: 32),  // X25519 key
         assignedIp: "10.66.66.2/32",
         dnsServers: ["1.1.1.1", "8.8.8.8"],
-        mtu: 1280
+        mtu: 1100
     )
 
     do {
@@ -104,7 +104,7 @@ func example2_validateConfiguration() {
         clientPrivateKey: [UInt8](repeating: 0, count: 32),
         assignedIp: "10.66.66.2/32",
         dnsServers: ["1.1.1.1"],
-        mtu: 1280
+        mtu: 1100
     )
 
     do {
@@ -140,7 +140,7 @@ func example3_connectionLifecycle() {
         clientPrivateKey: [UInt8](repeating: 0, count: 32),
         assignedIp: "10.66.66.2/32",
         dnsServers: ["1.1.1.1", "8.8.8.8"],
-        mtu: 1280
+        mtu: 1100
     )
 
     do {
@@ -231,7 +231,7 @@ func example4_errorHandling() {
         clientPrivateKey: [UInt8](repeating: 0, count: 32),
         assignedIp: "10.66.66.2/32",
         dnsServers: ["1.1.1.1"],
-        mtu: 1280
+        mtu: 1100
     )
 
     do {

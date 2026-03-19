@@ -40,7 +40,7 @@ fn test_server_context() -> ServerContext {
         noise_public_key: [0xAA; X25519_KEY_LEN],
         kem_public_key: vec![0x42; MLKEM768_EK_LEN],
         dns_servers: vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
-        mtu: 1280,
+        mtu: 1100,
         transport_protocol: "masque".to_string(),
     }
 }

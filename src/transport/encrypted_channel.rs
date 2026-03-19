@@ -585,4 +585,26 @@ mod tests {
         assert_eq!(channel.tx_key, [0u8; KEY_LEN]);
         assert_eq!(channel.rx_key, [0u8; KEY_LEN]);
     }
+
+    /// Encrypted wire size must be exactly plaintext + NONCE_COUNTER_LEN + TAG_LEN.
+    /// TUNNEL_OVERHEAD_BYTES depends on this formula being exact.
+    #[test]
+    fn encrypted_wire_size_is_plaintext_plus_overhead() {
+        use crate::crypto::aead::TAG_LEN;
+
+        let mut channel = EncryptedChannel::new(TEST_TX_KEY, TEST_RX_KEY);
+        let expected_overhead = NONCE_COUNTER_LEN + TAG_LEN;
+
+        for size in [0, 1, 576, 1100, 1420] {
+            let plaintext = vec![0xABu8; size];
+            let encrypted = channel.send(&plaintext).unwrap();
+            assert_eq!(
+                encrypted.len(),
+                size + expected_overhead,
+                "wire size for {size}-byte plaintext: expected {} got {}",
+                size + expected_overhead,
+                encrypted.len()
+            );
+        }
+    }
 }

@@ -32,6 +32,13 @@
 -keep class * extends androidx.lifecycle.ViewModel { *; }
 
 # ===========================================================================
+# Google Tink / ErrorProne annotations (used by EncryptedSharedPreferences)
+# ===========================================================================
+-dontwarn com.google.errorprone.annotations.**
+-dontwarn javax.annotation.Nullable
+-dontwarn javax.annotation.concurrent.GuardedBy
+
+# ===========================================================================
 # R8 mapping file for crash report deobfuscation
 # ===========================================================================
 -printmapping build/outputs/mapping/release/mapping.txt

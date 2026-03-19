@@ -58,9 +58,9 @@ const QR_MIN_DIMENSION: u32 = 200;
 #[cfg(test)]
 const DEFAULT_DNS: &[&str] = &["1.1.1.1", "8.8.8.8"];
 
-/// Default MTU (used in tests).
+/// Default MTU (re-exported from config for test consistency).
 #[cfg(test)]
-const DEFAULT_MTU: u16 = 1280;
+const DEFAULT_MTU: u16 = crate::config::DEFAULT_MTU;
 
 /// CIDR prefix length for per-client address assignment.
 const CLIENT_CIDR_PREFIX: &str = "/32";

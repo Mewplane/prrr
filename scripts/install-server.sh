@@ -457,7 +457,7 @@ server_name = "${effective_server_name}"
 [network]
 subnet = "${DEFAULT_SUBNET}"
 dns_servers = [${dns_toml}]
-mtu = 1280
+mtu = 1100
 
 [crypto]
 identity_key_path = "${PRRR_KEYS_DIR}/server_identity.key"

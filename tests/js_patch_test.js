@@ -63,7 +63,7 @@ pq_public_key = "BBBB"
 private_key_path = "~/.config/prrr/private.key"
 address = "10.66.66.2/32"
 dns = ["1.1.1.1", "8.8.8.8"]
-mtu = 1280
+mtu = 1100
 transport_protocol = "masque"
 `;
 

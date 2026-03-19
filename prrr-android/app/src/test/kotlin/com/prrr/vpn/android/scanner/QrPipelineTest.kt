@@ -150,7 +150,7 @@ class QrPipelineTest {
         private_key = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
         address = "10.66.66.2/32"
         dns = ["1.1.1.1", "8.8.8.8"]
-        mtu = 1280
+        mtu = 1100
         transport_protocol = "harp"
     """.trimIndent()
 
@@ -167,7 +167,7 @@ class QrPipelineTest {
         assertEquals("vpn.example.com:443", config.serverEndpoint)
         assertEquals("10.66.66.2/32", config.assignedIp)
         assertEquals(listOf("1.1.1.1", "8.8.8.8"), config.dnsServers)
-        assertEquals(1280.toUShort(), config.mtu)
+        assertEquals(1100.toUShort(), config.mtu)
         assertEquals("harp", config.transportProtocol)
     }
 

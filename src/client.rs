@@ -40,6 +40,31 @@ use crate::web::harp::{HarpSessionRequest, HarpSessionResponse};
 /// Total: 26 bytes per packet.
 pub const TUNNEL_OVERHEAD_BYTES: usize = NONCE_COUNTER_LEN + crate::crypto::aead::TAG_LEN + 2;
 
+/// Worst-case MASQUE HTTP Datagram framing overhead (varint quarter_stream_id + context_id).
+/// Typically 2 bytes for stream_id=0, but budget checks use 4 for safety.
+pub const MASQUE_FRAMING_OVERHEAD: usize = 4;
+
+/// Minimum QUIC datagram payload available after QUIC packet headers.
+/// Quinn's minimum QUIC UDP payload is 1200 bytes; QUIC headers consume ~30 bytes.
+pub const MIN_QUIC_DATAGRAM_PAYLOAD: usize = 1170;
+
+/// Check whether a TUN MTU fits within the QUIC datagram budget.
+///
+/// Returns `Ok(safe_mtu)` if the MTU fits, or `Err(message)` if packets would be dropped.
+pub fn check_mtu_budget(tun_mtu: u16, max_datagram_size: usize) -> Result<u16, String> {
+    let total_overhead = TUNNEL_OVERHEAD_BYTES + MASQUE_FRAMING_OVERHEAD;
+    let needed = usize::from(tun_mtu) + total_overhead;
+    let safe_mtu = max_datagram_size.saturating_sub(total_overhead);
+    if needed <= max_datagram_size {
+        Ok(safe_mtu as u16)
+    } else {
+        Err(format!(
+            "TUN MTU {tun_mtu} + {total_overhead} byte overhead = {needed}, \
+             exceeds QUIC datagram limit {max_datagram_size}. Safe MTU: {safe_mtu}"
+        ))
+    }
+}
+
 /// Run the VPN client.
 ///
 /// Connects to the server at `server_addr`, performs the hybrid handshake,
@@ -85,28 +110,21 @@ pub async fn run_client<T: TunDevice>(
     tracing::info!("MASQUE tunnel established");
 
     // Check that TUN MTU fits within the QUIC datagram size budget
-    let tun_mtu = usize::from(tun.mtu());
     if let Some(max_dg) = masque_client.max_datagram_size() {
-        let masque_framing = 4; // varint quarter_stream_id + context_id
-        let total_overhead = TUNNEL_OVERHEAD_BYTES + masque_framing;
-        let needed = tun_mtu + total_overhead;
-        let safe_mtu = max_dg.saturating_sub(total_overhead);
-        tracing::info!(
-            tun_mtu,
-            max_datagram_size = max_dg,
-            overhead = total_overhead,
-            safe_mtu,
-            "QUIC datagram budget"
-        );
-        if needed > max_dg {
-            tracing::error!(
-                tun_mtu,
-                max_datagram_size = max_dg,
-                safe_mtu,
-                "TUN MTU too large: {tun_mtu} + {total_overhead} byte overhead = {needed}, \
-                 but QUIC max datagram is {max_dg}. Large packets will be dropped. \
-                 Lower interface.mtu in client config to at most {safe_mtu}.",
-            );
+        let tun_mtu = tun.mtu();
+        match check_mtu_budget(tun_mtu, max_dg) {
+            Ok(safe_mtu) => {
+                tracing::info!(
+                    tun_mtu,
+                    max_datagram_size = max_dg,
+                    overhead = TUNNEL_OVERHEAD_BYTES + MASQUE_FRAMING_OVERHEAD,
+                    safe_mtu,
+                    "QUIC datagram budget"
+                );
+            }
+            Err(msg) => {
+                tracing::error!("{msg}");
+            }
         }
     }
 
@@ -2103,7 +2121,7 @@ mod tests {
                 noise_public_key: server_noise_public_key,
                 kem_public_key,
                 dns_servers: vec!["1.1.1.1".to_string()],
-                mtu: 1280,
+                mtu: 1100,
                 transport_protocol: "harp".to_string(),
             }),
             config_tokens: Arc::new(ConfigTokenStore::new()),
@@ -2112,7 +2130,7 @@ mod tests {
                 server_name: "test.example.com".to_string(),
                 subnet: "10.66.66.0/24".to_string(),
                 dns_servers: vec!["1.1.1.1".to_string()],
-                mtu: 1280,
+                mtu: 1100,
                 max_clients: 100,
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 transport_protocol: "harp".to_string(),
@@ -2661,5 +2679,72 @@ mod tests {
         let config = build_harp_h2_rustls_config(false, TlsProfile::Default).unwrap();
         let expected_alpn: Vec<Vec<u8>> = vec![b"h2".to_vec()];
         assert_eq!(config.alpn_protocols, expected_alpn, "H2 config ALPN should be [h2] in secure mode");
+    }
+
+    // -----------------------------------------------------------------------
+    // MTU budget tests
+    // -----------------------------------------------------------------------
+
+    /// TUNNEL_OVERHEAD_BYTES must equal the sum of its crypto components.
+    #[test]
+    fn tunnel_overhead_equals_components() {
+        use crate::transport::encrypted_channel::NONCE_COUNTER_LEN;
+        use crate::crypto::aead::TAG_LEN;
+        assert_eq!(
+            TUNNEL_OVERHEAD_BYTES,
+            NONCE_COUNTER_LEN + TAG_LEN + 2,
+            "overhead = nonce({NONCE_COUNTER_LEN}) + tag({TAG_LEN}) + masque_min(2)"
+        );
+    }
+
+    /// The default MTU, after encryption + MASQUE framing, must fit in a QUIC datagram.
+    /// This is the single most important MTU invariant.
+    #[test]
+    fn default_mtu_fits_quic_datagram_budget() {
+        let needed = usize::from(crate::config::DEFAULT_MTU)
+            + TUNNEL_OVERHEAD_BYTES
+            + MASQUE_FRAMING_OVERHEAD;
+        assert!(
+            needed <= MIN_QUIC_DATAGRAM_PAYLOAD,
+            "DEFAULT_MTU {} + overhead {} = {needed}, exceeds QUIC budget {MIN_QUIC_DATAGRAM_PAYLOAD}",
+            crate::config::DEFAULT_MTU,
+            TUNNEL_OVERHEAD_BYTES + MASQUE_FRAMING_OVERHEAD,
+        );
+    }
+
+    /// check_mtu_budget returns Ok for the default MTU.
+    #[test]
+    fn budget_check_accepts_default_mtu() {
+        assert!(
+            check_mtu_budget(crate::config::DEFAULT_MTU, MIN_QUIC_DATAGRAM_PAYLOAD).is_ok()
+        );
+    }
+
+    /// check_mtu_budget rejects MTU that would exceed the budget.
+    #[test]
+    fn budget_check_rejects_oversized_mtu() {
+        assert!(check_mtu_budget(1150, MIN_QUIC_DATAGRAM_PAYLOAD).is_err());
+    }
+
+    /// End-to-end: encrypt a DEFAULT_MTU-sized packet and frame it,
+    /// verify the wire size fits in a QUIC datagram.
+    #[test]
+    fn max_mtu_packet_through_real_encrypt_and_frame() {
+        use crate::transport::encrypted_channel::EncryptedChannel;
+        use crate::transport::masque::frame_datagram;
+
+        let tx_key = [0x42u8; 32];
+        let rx_key = [0x43u8; 32];
+        let mut channel = EncryptedChannel::new(tx_key, rx_key);
+
+        let plaintext = vec![0xABu8; usize::from(crate::config::DEFAULT_MTU)];
+        let encrypted = channel.send(&plaintext).unwrap();
+        let framed = frame_datagram(0, &encrypted).unwrap();
+
+        assert!(
+            framed.len() <= MIN_QUIC_DATAGRAM_PAYLOAD,
+            "encrypted+framed packet ({} bytes) exceeds QUIC budget ({MIN_QUIC_DATAGRAM_PAYLOAD})",
+            framed.len()
+        );
     }
 }

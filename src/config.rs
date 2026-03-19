@@ -1834,6 +1834,18 @@ name = "harp"
         assert_eq!(DEFAULT_LOG_RETENTION_DAYS, 7);
     }
 
+    /// MTU constants must be consistent across config and tunnel layers.
+    /// If these drift, clients get a different MTU than the server expects,
+    /// causing silent QUIC datagram drops.
+    #[test]
+    fn config_and_tun_device_default_mtu_match() {
+        assert_eq!(
+            DEFAULT_MTU,
+            crate::tunnel::tun_device::DEFAULT_TUNNEL_MTU,
+            "config::DEFAULT_MTU and tunnel::DEFAULT_TUNNEL_MTU must be identical"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Key resolution tests (FRD-P003)
     // -----------------------------------------------------------------------

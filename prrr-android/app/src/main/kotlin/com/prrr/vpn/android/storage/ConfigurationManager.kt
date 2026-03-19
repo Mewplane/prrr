@@ -105,7 +105,7 @@ object ConfigurationManager {
                 clientPrivateKey = prefs.getString(KEY_CLIENT_PRIVATE_KEY, null)?.fromBase64() ?: return null,
                 assignedIp = prefs.getString(KEY_ASSIGNED_IP, null) ?: return null,
                 dnsServers = prefs.getString(KEY_DNS_SERVERS, null)?.split(",") ?: return null,
-                mtu = prefs.getInt(KEY_MTU, 1280).toUShort(),
+                mtu = prefs.getInt(KEY_MTU, 1100).toUShort(),
                 preferredBinding = prefs.getString(KEY_PREFERRED_BINDING, null),
                 transportProtocol = prefs.getString(KEY_TRANSPORT_PROTOCOL, null)
             )

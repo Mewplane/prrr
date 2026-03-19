@@ -265,7 +265,7 @@ mod tests {
             noise_public_key: [0xAA; 32],
             kem_public_key: vec![0xBB; 64],
             dns_servers: vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
-            mtu: 1280,
+            mtu: 1100,
             transport_protocol: "masque".to_string(),
         }
     }

@@ -47,7 +47,7 @@ fun fakeVpnConfig(
     clientPrivateKey = ByteArray(32),
     assignedIp = "10.66.66.2/32",
     dnsServers = listOf("1.1.1.1"),
-    mtu = 1280u.toUShort(),
+    mtu = 1100u.toUShort(),
     preferredBinding = null,
     transportProtocol = null
 )

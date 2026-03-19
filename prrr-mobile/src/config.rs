@@ -93,12 +93,12 @@ pub fn validate_config(config: VpnConfig) -> Result<(), MobileError> {
     }
 
     // Validate MTU is in valid range
-    const MIN_MTU: u16 = 1280;
+    const MIN_MTU: u16 = 576;
     const MAX_MTU: u16 = 1500;
 
     if config.mtu < MIN_MTU || config.mtu > MAX_MTU {
         return Err(MobileError::InvalidConfig {
-            reason: format!("mtu must be between {} and {}, got {}", MIN_MTU, MAX_MTU, config.mtu),
+            reason: format!("mtu must be between {MIN_MTU} and {MAX_MTU}, got {}", config.mtu),
         });
     }
 
@@ -281,7 +281,7 @@ pq_public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 address = "10.66.66.2/32"
 dns = ["1.1.1.1"]
-mtu = 1280
+mtu = 1100
 "#;
         let qr_data = compress_to_qr_url(config_toml);
 
@@ -293,7 +293,7 @@ mtu = 1280
         assert_eq!(config.server_endpoint, "vpn.example.com:443");
         assert_eq!(config.assigned_ip, "10.66.66.2/32");
         assert_eq!(config.dns_servers, vec!["1.1.1.1"]);
-        assert_eq!(config.mtu, 1280);
+        assert_eq!(config.mtu, 1100);
     }
 
     #[test]
@@ -343,7 +343,7 @@ pq_public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 address = "10.66.66.2/32"
 dns = ["1.1.1.1"]
-mtu = 1280
+mtu = 1100
 "#;
         let qr_data = compress_to_qr_url(config_toml);
 
@@ -365,7 +365,7 @@ name = "test"
 private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 address = "10.66.66.2/32"
 dns = ["1.1.1.1"]
-mtu = 1280
+mtu = 1100
 "#;
         let qr_data = compress_to_qr_url(config_toml);
 
@@ -387,7 +387,7 @@ mtu = 1280
             client_private_key: vec![0u8; 32],
             assigned_ip: "10.66.66.2/32".to_string(),
             dns_servers: vec!["1.1.1.1".to_string()],
-            mtu: 1280,
+            mtu: 1100,
             preferred_binding: None,
             transport_protocol: None,
         };
@@ -410,7 +410,7 @@ mtu = 1280
             client_private_key: vec![0u8; 32],
             assigned_ip: "10.66.66.2/32".to_string(),
             dns_servers: vec!["1.1.1.1".to_string()],
-            mtu: 1280,
+            mtu: 1100,
             preferred_binding: None,
             transport_protocol: None,
         };
@@ -433,7 +433,7 @@ mtu = 1280
             client_private_key: vec![0u8; 32],
             assigned_ip: "10.66.66.2/32".to_string(),
             dns_servers: vec!["1.1.1.1".to_string()],
-            mtu: 1280,
+            mtu: 1100,
             preferred_binding: None,
             transport_protocol: None,
         };
@@ -456,7 +456,7 @@ mtu = 1280
             client_private_key: vec![0u8; 32],
             assigned_ip: "10.66.66.2".to_string(), // Missing /32
             dns_servers: vec!["1.1.1.1".to_string()],
-            mtu: 1280,
+            mtu: 1100,
             preferred_binding: None,
             transport_protocol: None,
         };
@@ -479,7 +479,7 @@ mtu = 1280
             client_private_key: vec![0u8; 32],
             assigned_ip: "10.66.66.2/32".to_string(),
             dns_servers: vec![],
-            mtu: 1280,
+            mtu: 1100,
             preferred_binding: None,
             transport_protocol: None,
         };
@@ -525,13 +525,45 @@ mtu = 1280
             client_private_key: vec![0u8; 32],
             assigned_ip: "10.66.66.2/32".to_string(),
             dns_servers: vec!["1.1.1.1".to_string()],
-            mtu: 1280,
+            mtu: 1100,
             preferred_binding: None,
             transport_protocol: None,
         };
 
         let result = validate_config(config);
         assert!(result.is_ok());
+    }
+
+    /// Helper: build a valid VpnConfig with a custom MTU.
+    fn config_with_mtu(mtu: u16) -> VpnConfig {
+        VpnConfig {
+            client_name: "test".to_string(),
+            server_endpoint: "vpn.example.com:443".to_string(),
+            server_public_key: vec![0u8; 32],
+            server_pq_public_key: vec![0u8; 1184],
+            client_private_key: vec![0u8; 32],
+            assigned_ip: "10.66.66.2/32".to_string(),
+            dns_servers: vec!["1.1.1.1".to_string()],
+            mtu,
+            preferred_binding: None,
+            transport_protocol: None,
+        }
+    }
+
+    /// The default MTU (1100) must be accepted by mobile validation.
+    #[test]
+    fn validate_accepts_default_mtu() {
+        assert!(validate_config(config_with_mtu(1100)).is_ok());
+    }
+
+    /// MTU boundary values: MIN_MTU (576), MAX_MTU (1500), and just outside.
+    #[test]
+    fn validate_mtu_boundaries() {
+        assert!(validate_config(config_with_mtu(576)).is_ok(), "MIN_MTU should pass");
+        assert!(validate_config(config_with_mtu(1100)).is_ok(), "default should pass");
+        assert!(validate_config(config_with_mtu(1500)).is_ok(), "MAX_MTU should pass");
+        assert!(validate_config(config_with_mtu(575)).is_err(), "below MIN should fail");
+        assert!(validate_config(config_with_mtu(1501)).is_err(), "above MAX should fail");
     }
 
     // --- Multi-frame QR protocol tests ---
@@ -590,7 +622,7 @@ pq_public_key = "{}"
 private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 address = "10.66.66.2/32"
 dns = ["1.1.1.1", "8.8.8.8"]
-mtu = 1280
+mtu = 1100
 "#,
             base64::engine::general_purpose::STANDARD.encode(&pq_key)
         );
@@ -649,7 +681,7 @@ pq_public_key = "{}"
 private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 address = "10.66.66.5/32"
 dns = ["1.1.1.1"]
-mtu = 1280
+mtu = 1100
 "#,
             base64::engine::general_purpose::STANDARD.encode(&pq_key)
         );
