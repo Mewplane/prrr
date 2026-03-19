@@ -15,8 +15,8 @@ prrr combines post-quantum cryptography, traffic obfuscation, and pluggable tran
 - **Post-Quantum Security** -- Hybrid X25519 + ML-KEM-768 key exchange protects against both classical and quantum attacks.
 - **Traffic Obfuscation** -- TLS fingerprint mimicry (Chrome/Firefox profiles), adaptive padding, and timing jitter make VPN traffic indistinguishable from regular HTTPS.
 - **Active Probing Resistance** -- HMAC-BLAKE2s token authentication with decoy responses prevents server fingerprinting.
-- **HARP Transport (Default)** -- Tunnels over HTTPS/WebSocket on TCP port 443, indistinguishable from regular web traffic and resistant to UDP blocking.
-- **MASQUE/QUIC Transport (Legacy)** -- Alternative transport over HTTP/3 on UDP port 443 for environments where QUIC performs better.
+- **HARP Transport** -- Tunnels over HTTPS/WebSocket on TCP port 443, indistinguishable from regular web traffic and resistant to UDP blocking.
+- **MASQUE/QUIC Transport (Default)** -- Alternative transport over HTTP/3 on UDP port 443 for environments where QUIC performs better.
 - **Integrated Messaging** -- End-to-end encrypted messaging (Whisper) with PQXDH and double-ratchet protocol.
 - **Web Admin Panel** -- Single-page application for server management, client provisioning, and real-time monitoring.
 - **Client Distribution** -- QR codes, shareable URLs, and TOML config export for easy client onboarding.
