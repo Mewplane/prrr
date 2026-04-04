@@ -78,10 +78,21 @@ class PrrrVpnService : VpnService() {
     private fun connect() {
         Log.i(TAG, "connect() called")
 
-        // Check if already connected
-        if (connection != null) {
-            Log.w(TAG, "Already connected, ignoring")
-            return
+        // If a previous connection exists, check if it's still active
+        connection?.let { conn ->
+            val status = conn.status()
+            if (status == uniffi.prrr_mobile.ConnectionStatus.CONNECTED ||
+                status == uniffi.prrr_mobile.ConnectionStatus.CONNECTING ||
+                status == uniffi.prrr_mobile.ConnectionStatus.RECONNECTING) {
+                Log.w(TAG, "Already connected (status=$status), ignoring")
+                return
+            }
+            // Previous connection is in Error or Disconnected state — clean up
+            Log.i(TAG, "Cleaning up stale connection (status=$status)")
+            conn.disconnect()
+            connection = null
+            try { vpnInterface?.close() } catch (_: Exception) {}
+            vpnInterface = null
         }
 
         // Promote to foreground immediately (required for API 26+)
@@ -135,7 +146,7 @@ class PrrrVpnService : VpnService() {
 
             // Create VPN interface
             val builder = Builder()
-                .setSession("prrr VPN")
+                .setSession("Prrr")
                 .addAddress(extractIp(config.assignedIp), extractPrefix(config.assignedIp))
                 .setMtu(config.mtu.toInt())
 
@@ -244,7 +255,7 @@ class PrrrVpnService : VpnService() {
         )
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("prrr VPN")
+            .setContentTitle("Prrr")
             .setContentText(text)
             .setSmallIcon(R.drawable.ic_vpn_key)
             .setContentIntent(pendingIntent)

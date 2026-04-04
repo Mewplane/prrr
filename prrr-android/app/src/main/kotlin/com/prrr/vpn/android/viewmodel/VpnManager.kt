@@ -166,6 +166,12 @@ class VpnManager(application: Application) : AndroidViewModel(application) {
                     val errorMsg = conn.errorMessage()
                     Log.e(TAG, "Connection error: $errorMsg")
                     _stats.value = null
+                    // Send DISCONNECT to clean up the stale service state,
+                    // so a subsequent connect() can start fresh.
+                    val intent = Intent(getApplication(), PrrrVpnService::class.java).apply {
+                        action = PrrrVpnService.ACTION_DISCONNECT
+                    }
+                    getApplication<Application>().startService(intent)
                     stopStatusPolling()
                 }
                 uniffi.prrr_mobile.ConnectionStatus.DISCONNECTED -> {

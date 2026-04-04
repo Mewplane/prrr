@@ -1,4 +1,3 @@
-// FRD: specs/frds/FRD-M012-main-ui-compose.md
 package com.prrr.vpn.android.ui
 
 import androidx.compose.foundation.layout.Arrangement
@@ -8,6 +7,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Button
@@ -19,6 +19,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -26,13 +27,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
+import com.prrr.vpn.android.ui.theme.PrrrBlack
+import com.prrr.vpn.android.ui.theme.PrrrDanger
+import com.prrr.vpn.android.ui.theme.PrrrTextDim
+import com.prrr.vpn.android.ui.theme.PrrrWhite
 import com.prrr.vpn.android.viewmodel.ConnectionStatus
 import com.prrr.vpn.android.viewmodel.VpnManager
 
-/**
- * Main screen for VPN connection control.
- * Displays status, connection button, and statistics.
- */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(
@@ -47,14 +48,20 @@ fun MainScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("prrr VPN") },
+                title = { Text("Prrr") },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = PrrrBlack,
+                    titleContentColor = PrrrWhite,
+                    actionIconContentColor = PrrrWhite
+                ),
                 actions = {
                     IconButton(onClick = onSettingsClick) {
                         Icon(Icons.Default.Settings, contentDescription = "Settings")
                     }
                 }
             )
-        }
+        },
+        containerColor = PrrrBlack
     ) { paddingValues ->
         Column(
             modifier = Modifier
@@ -63,23 +70,24 @@ fun MainScreen(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.SpaceBetween
         ) {
-            Spacer(modifier = Modifier.height(60.dp))
+            Spacer(modifier = Modifier.height(40.dp))
 
-            // Status icon (large, centered)
+            // Animated cat status icon
             StatusIcon(status = status)
 
             // Status text
             Text(
                 text = getStatusText(status),
-                style = MaterialTheme.typography.headlineMedium
+                style = MaterialTheme.typography.headlineMedium,
+                color = PrrrWhite
             )
 
-            // Server endpoint (if config exists)
+            // Server endpoint
             config?.let { cfg ->
                 Text(
                     text = "via ${cfg.serverEndpoint}",
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    color = PrrrTextDim
                 )
             }
 
@@ -92,8 +100,11 @@ fun MainScreen(
                     .fillMaxWidth()
                     .padding(horizontal = 40.dp)
                     .height(56.dp),
+                shape = RoundedCornerShape(8.dp),
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = getButtonColor(status)
+                    containerColor = getButtonColor(status),
+                    contentColor = getButtonTextColor(status),
+                    disabledContainerColor = PrrrTextDim.copy(alpha = 0.3f)
                 ),
                 enabled = isButtonEnabled(status)
             ) {
@@ -133,8 +144,15 @@ private fun getButtonText(status: ConnectionStatus): String {
 
 private fun getButtonColor(status: ConnectionStatus): Color {
     return when (status) {
-        ConnectionStatus.CONNECTED -> Color(0xFFEF5350) // Red for disconnect
-        else -> Color(0xFF66BB6A) // Green for connect
+        ConnectionStatus.CONNECTED -> PrrrDanger
+        else -> PrrrWhite
+    }
+}
+
+private fun getButtonTextColor(status: ConnectionStatus): Color {
+    return when (status) {
+        ConnectionStatus.CONNECTED -> PrrrWhite
+        else -> PrrrBlack
     }
 }
 
