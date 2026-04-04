@@ -1,29 +1,34 @@
-// FRD: specs/frds/FRD-M012-main-ui-compose.md
 package com.prrr.vpn.android.ui
 
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Card
-import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.prrr.vpn.android.ui.theme.PrrrBorder
+import com.prrr.vpn.android.ui.theme.PrrrSurface
+import com.prrr.vpn.android.ui.theme.PrrrTextDim
+import com.prrr.vpn.android.ui.theme.PrrrWhite
 import uniffi.prrr_mobile.ConnectionStats
 
-/**
- * Card displaying connection statistics.
- * Shows duration, bytes sent/received, and latency.
- */
 @Composable
 fun StatsCard(stats: ConnectionStats) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 24.dp)
+            .border(1.dp, PrrrBorder, RoundedCornerShape(8.dp)),
+        shape = RoundedCornerShape(8.dp),
+        colors = CardDefaults.cardColors(containerColor = PrrrSurface)
     ) {
         Column(
             modifier = Modifier.padding(16.dp),
@@ -48,11 +53,13 @@ private fun StatRow(label: String, value: String) {
     ) {
         Text(
             text = label,
-            style = MaterialTheme.typography.bodyMedium
+            fontSize = 14.sp,
+            color = PrrrTextDim
         )
         Text(
             text = value,
-            style = MaterialTheme.typography.bodyMedium
+            fontSize = 14.sp,
+            color = PrrrWhite
         )
     }
 }

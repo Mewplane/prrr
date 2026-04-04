@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- FRD: specs/frds/FRD-M008-android-project-setup.md -->
 <resources>
-    <string name="app_name">prrr VPN</string>
+    <string name="app_name">Prrr</string>
 </resources>
