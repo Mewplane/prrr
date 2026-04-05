@@ -27,7 +27,11 @@ pub const MIN_PACKET_LEN: usize = NONCE_COUNTER_LEN + TAG_LEN;
 pub const DEFAULT_REKEY_THRESHOLD: u64 = 1 << 32;
 
 /// Default replay window size in packets.
-pub const DEFAULT_REPLAY_WINDOW_SIZE: u64 = 64;
+///
+/// Must be large enough to tolerate out-of-order delivery under high-bandwidth
+/// UDP traffic (e.g., video streaming). 2048 packets covers ~2.8 MB of
+/// reordering at MTU 1400, which is well beyond typical network jitter.
+pub const DEFAULT_REPLAY_WINDOW_SIZE: u64 = 2048;
 
 /// HKDF info string for rekeying.
 const REKEY_INFO: &[u8] = b"prrr-rekey-v1";
@@ -47,27 +51,32 @@ fn encode_nonce(counter: u64) -> [u8; NONCE_LEN] {
 /// Sliding-window replay detector.
 ///
 /// Tracks the highest received nonce and maintains a bitmap of recently
-/// seen nonces within a configurable window behind the highest.
+/// seen nonces within a configurable window behind the highest. Supports
+/// windows larger than 64 packets using a `Vec<u64>` bitmap.
 struct ReplayWindow {
     /// Highest nonce value seen so far.
     highest: u64,
     /// Bitmap of seen nonces in the window `[highest - window_size + 1, highest]`.
-    /// Bit `i` corresponds to nonce `highest - i`.
-    bitmap: u64,
-    /// Window size (max 64, since we use a u64 bitmap).
+    /// Each `u64` covers 64 nonces; bit `age % 64` in block `age / 64`.
+    bitmap: Vec<u64>,
+    /// Window size in packets.
     window_size: u64,
+    /// Whether we have received the first packet yet.
+    initialized: bool,
 }
 
 impl ReplayWindow {
     /// Create a new replay window with the given size.
     ///
-    /// `window_size` is clamped to the range `[1, 64]`.
+    /// `window_size` is clamped to a minimum of 1.
     fn new(window_size: u64) -> Self {
-        let window_size = window_size.clamp(1, 64);
+        let window_size = window_size.max(1);
+        let num_blocks = ((window_size + 63) / 64) as usize;
         Self {
             highest: 0,
-            bitmap: 0,
+            bitmap: vec![0u64; num_blocks],
             window_size,
+            initialized: false,
         }
     }
 
@@ -76,23 +85,20 @@ impl ReplayWindow {
     /// Returns `true` if the nonce should be accepted, `false` if it is a
     /// replay or falls outside the window.
     fn check_and_update(&mut self, nonce: u64) -> bool {
-        if self.highest == 0 && self.bitmap == 0 {
+        if !self.initialized {
             // First packet ever received
             self.highest = nonce;
-            self.bitmap = 1;
+            self.initialized = true;
+            self.set_bit(0);
             return true;
         }
 
         if nonce > self.highest {
             // New highest: shift the window
             let shift = nonce - self.highest;
-            if shift >= self.window_size {
-                self.bitmap = 0;
-            } else {
-                self.bitmap <<= shift;
-            }
-            self.bitmap |= 1;
+            self.shift_window(shift);
             self.highest = nonce;
+            self.set_bit(0);
             return true;
         }
 
@@ -102,15 +108,70 @@ impl ReplayWindow {
             return false;
         }
 
-        let bit = 1u64 << age;
-        if self.bitmap & bit != 0 {
+        if self.get_bit(age) {
             // Already seen — replay
             return false;
         }
 
         // Mark as seen
-        self.bitmap |= bit;
+        self.set_bit(age);
         true
+    }
+
+    /// Set the bit at the given age (0 = highest nonce).
+    fn set_bit(&mut self, age: u64) {
+        let block = (age / 64) as usize;
+        let bit = age % 64;
+        if block < self.bitmap.len() {
+            self.bitmap[block] |= 1u64 << bit;
+        }
+    }
+
+    /// Get the bit at the given age.
+    fn get_bit(&self, age: u64) -> bool {
+        let block = (age / 64) as usize;
+        let bit = age % 64;
+        if block < self.bitmap.len() {
+            self.bitmap[block] & (1u64 << bit) != 0
+        } else {
+            false
+        }
+    }
+
+    /// Shift the window forward by `shift` positions.
+    fn shift_window(&mut self, shift: u64) {
+        if shift >= self.window_size {
+            // Entire window is invalidated
+            for block in &mut self.bitmap {
+                *block = 0;
+            }
+            return;
+        }
+
+        let block_shift = (shift / 64) as usize;
+        let bit_shift = (shift % 64) as u32;
+
+        if block_shift > 0 {
+            // Shift whole blocks
+            let len = self.bitmap.len();
+            for i in (block_shift..len).rev() {
+                self.bitmap[i] = self.bitmap[i - block_shift];
+            }
+            for i in 0..block_shift.min(len) {
+                self.bitmap[i] = 0;
+            }
+        }
+
+        if bit_shift > 0 {
+            // Shift remaining bits within blocks (block 0 is least significant)
+            let len = self.bitmap.len();
+            for i in (0..len).rev() {
+                self.bitmap[i] <<= bit_shift;
+                if i > 0 {
+                    self.bitmap[i] |= self.bitmap[i - 1] >> (64 - bit_shift);
+                }
+            }
+        }
     }
 }
 

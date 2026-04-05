@@ -33,8 +33,11 @@ help:
 	@echo "  podman-e2e-masque - Run Podman E2E with MASQUE transport"
 	@echo "  podman-e2e-harp  - Run Podman E2E with HARP transport"
 	@echo "  podman-e2e-multi - Run Podman E2E with both transports"
-	@echo "  android-debug    - Build Android debug APK"
-	@echo "  android-release  - Build Android release AAB and APK"
+	@echo "  android-native   - Build Rust .so for Android (requires NDK)"
+	@echo "  android-debug    - Build native + debug APK"
+	@echo "  android-debug-apk - Build debug APK (Gradle only, skip native)"
+	@echo "  android-release  - Build native + release AAB and APK"
+	@echo "  android-install  - Build debug APK and install on device"
 	@echo "  android-test     - Run Android unit tests"
 	@echo "  docker-build     - Build Docker image"
 	@echo "  docker-test      - Build and run tests in Docker"
@@ -161,21 +164,47 @@ e2e-qr:
 # =============================================================================
 
 ANDROID_DIR ?= prrr-android
+NDK_HOME ?= $(HOME)/Android/Sdk/ndk/$(shell ls $(HOME)/Android/Sdk/ndk 2>/dev/null | sort -V | tail -1)
 
-## android-debug: Build Android debug APK
+## android-native: Build Rust native library (.so) for Android
+.PHONY: android-native
+android-native:
+	@echo "Building prrr-mobile native library for Android..."
+	NDK_HOME=$(NDK_HOME) bash scripts/build-android.sh
+	@echo "Copying .so to Android project..."
+	cp -f target/aarch64-linux-android/release/libprrr_mobile.so $(ANDROID_DIR)/app/src/main/jniLibs/arm64-v8a/libprrr_mobile.so
+	cp -f target/x86_64-linux-android/release/libprrr_mobile.so $(ANDROID_DIR)/app/src/main/jniLibs/x86_64/libprrr_mobile.so 2>/dev/null || true
+	cp -f target/prrr_mobile.aar $(ANDROID_DIR)/app/libs/prrr_mobile.aar
+	@echo "Native library build complete"
+
+## android-debug: Build Android debug APK (native + Gradle)
 .PHONY: android-debug
-android-debug:
+android-debug: android-native
 	@echo "Building Android debug APK..."
 	cd $(ANDROID_DIR) && ./gradlew assembleDebug
 	@echo "Debug APK: $(ANDROID_DIR)/app/build/outputs/apk/debug/app-debug.apk"
 
-## android-release: Build Android release AAB and APK
+## android-debug-apk: Build Android debug APK (Gradle only, skip native rebuild)
+.PHONY: android-debug-apk
+android-debug-apk:
+	@echo "Building Android debug APK (Gradle only)..."
+	cd $(ANDROID_DIR) && ./gradlew assembleDebug
+	@echo "Debug APK: $(ANDROID_DIR)/app/build/outputs/apk/debug/app-debug.apk"
+
+## android-release: Build Android release AAB and APK (native + Gradle)
 .PHONY: android-release
-android-release:
+android-release: android-native
 	@echo "Building Android release AAB..."
 	cd $(ANDROID_DIR) && ./gradlew bundleRelease assembleRelease
 	@echo "Release AAB: $(ANDROID_DIR)/app/build/outputs/bundle/release/app-release.aab"
 	@echo "Release APK: $(ANDROID_DIR)/app/build/outputs/apk/release/app-release.apk"
+
+## android-install: Build debug APK and install on connected device
+.PHONY: android-install
+android-install: android-debug
+	@echo "Installing on connected device..."
+	adb install -r $(ANDROID_DIR)/app/build/outputs/apk/debug/app-debug.apk
+	@echo "Installed"
 
 ## android-test: Run Android unit tests
 .PHONY: android-test

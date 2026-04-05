@@ -255,6 +255,14 @@ make fmt               # Format code
 make build             # Build all binaries
 make install           # Install to ~/.cargo/bin
 
+# Android
+make android-native    # Cross-compile Rust .so for Android (requires NDK_HOME)
+make android-debug     # Full build: native .so + Gradle debug APK
+make android-debug-apk # Gradle-only APK build (skip native, for Kotlin-only changes)
+make android-release   # Full build: native .so + Gradle release APK/AAB
+make android-install   # Build debug APK and install on connected device via adb
+make android-test      # Run Android unit tests
+
 # Docker
 make docker-build      # Build Docker image
 make docker-test       # Build and run tests in container
@@ -262,6 +270,14 @@ make docker-test       # Build and run tests in container
 # Benchmarks
 make bench             # Run benchmarks
 ```
+
+### Android Build Notes
+
+- `NDK_HOME` must point to Android NDK r25+. Auto-detected from `~/Android/Sdk/ndk/`.
+- Rust cross-compilation targets must be installed: `rustup target add aarch64-linux-android x86_64-linux-android armv7-linux-androideabi i686-linux-android`
+- `make android-debug` rebuilds both native Rust code and the Kotlin app. Use `make android-debug-apk` when only editing Kotlin/UI code.
+- The native library is at `prrr-android/app/src/main/jniLibs/arm64-v8a/libprrr_mobile.so`.
+- If `.cargo/config.toml` has stale NDK paths, delete it and re-run `make android-native` to regenerate.
 
 ---
 

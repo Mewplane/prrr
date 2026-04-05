@@ -11,6 +11,12 @@ Thank you for your interest in contributing to prrr. This document covers develo
 - `shellcheck` (for linting installation scripts)
 - `cargo-audit` (for dependency auditing)
 
+#### Android Development (optional)
+
+- Android NDK r25+ (set `NDK_HOME` or install via Android SDK Manager)
+- Android SDK with platform API 34
+- Rust cross-compilation targets: `rustup target add aarch64-linux-android x86_64-linux-android armv7-linux-androideabi i686-linux-android`
+
 ### Building
 
 ```bash
@@ -27,6 +33,7 @@ make testv         # All tests with stdout output
 make lint          # Clippy + format check + cargo audit
 make bench         # Performance benchmarks
 make shellcheck    # Lint installation scripts
+make android-test  # Android unit tests
 ```
 
 All tests run without root privileges using `MockTun` (a channel-based TUN device simulator).
@@ -43,6 +50,12 @@ All tests run without root privileges using `MockTun` (a channel-based TUN devic
 | `make bench` | Run benchmarks |
 | `make shellcheck` | Lint shell scripts |
 | `make clean` | Clean build artifacts |
+| `make android-native` | Build Rust .so for Android (requires NDK) |
+| `make android-debug` | Full Android build: native + debug APK |
+| `make android-debug-apk` | Gradle-only APK (skip native rebuild) |
+| `make android-release` | Full Android build: native + release APK/AAB |
+| `make android-install` | Build and install debug APK on device |
+| `make android-test` | Run Android unit tests |
 
 ## Code Standards
 
@@ -156,15 +169,19 @@ src/                   # Library and binary source
   obfuscation/         # TLS mimicry, padding, probe resistance
   messaging/           # Whisper messaging
   web/                 # REST API, auth, SPA frontend
+prrr-mobile/           # UniFFI mobile library (iOS/Android FFI bindings)
+prrr-android/          # Android app (Kotlin/Jetpack Compose)
 tests/                 # Integration tests
 benches/               # Performance benchmarks
 specs/                 # Specifications
   frds/                # Feature requirements documents
   production/          # Production roadmap
 docs/                  # User-facing documentation
-scripts/               # Installation scripts
+scripts/               # Build & installation scripts
+  build-android.sh     # Cross-compile Rust for Android
+  build-ios.sh         # Cross-compile Rust for iOS
 deploy/                # Deployment (Terraform)
-assets/                # Embedded frontend
+assets/                # Embedded frontend, logos, cat animation
 ```
 
 ## Reporting Issues
