@@ -111,7 +111,8 @@ class ConfigurationManagerTest {
             dnsServers = listOf("1.1.1.1", "8.8.8.8"),
             mtu = 1420u,
             preferredBinding = null,
-            transportProtocol = null
+            transportProtocol = null,
+            fullTunnel = null
         )
     }
 }

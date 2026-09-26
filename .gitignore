@@ -1,3 +1,6 @@
+# Local secret files (never commit)
+server.yaml
+creds
 target
 .claude
 .agents

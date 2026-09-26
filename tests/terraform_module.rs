@@ -3,9 +3,15 @@
 //!
 //! Validates that the Terraform files exist and contain all required
 //! resources, variables, and outputs per SPEC.md §5.
+//!
+//! QUARANTINE: The DigitalOcean-specific assertions in this file encode a
+//! superseded design. Commit `97c0421` replaced `deploy/terraform/` with a
+//! vendor-neutral SSH-based module (see the `main.tf` header). The DO-specific
+//! tests are quarantined with `#[ignore = "BUG-stale-terraform-do-tests: ..."]`
+//! pending a maintainer decision; see `specs/bugs/BUG-stale-terraform-do-tests.md`.
+//! Tests that still validate the current generic module are left active.
 
-use std::fs;
-use std::path::Path;
+use std::{fs, path::Path};
 
 /// Base path for the Terraform module.
 const TF_DIR: &str = "deploy/terraform";
@@ -50,11 +56,13 @@ fn terraform_outputs_exists() {
 }
 
 #[test]
+#[ignore = "BUG-stale-terraform-do-tests: stale FRD-P012 DO-specific assertions vs vendor-neutral SSH module (commit 97c0421)"]
 fn terraform_cloud_init_exists() {
     assert!(Path::new(CLOUD_INIT).is_file(), "cloud-init.yml missing");
 }
 
 #[test]
+#[ignore = "BUG-stale-terraform-do-tests: stale FRD-P012 DO-specific assertions vs vendor-neutral SSH module (commit 97c0421)"]
 fn terraform_readme_exists() {
     let path = Path::new(README);
     assert!(path.is_file(), "README.md missing");
@@ -71,6 +79,7 @@ fn terraform_readme_exists() {
 }
 
 #[test]
+#[ignore = "BUG-stale-terraform-do-tests: stale FRD-P012 DO-specific assertions vs vendor-neutral SSH module (commit 97c0421)"]
 fn terraform_templates_dir_exists() {
     let path = Path::new(TF_DIR).join("templates");
     assert!(path.is_dir(), "templates/ directory missing");
@@ -92,6 +101,7 @@ fn terraform_main_required_version() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "BUG-stale-terraform-do-tests: stale FRD-P012 DO-specific assertions vs vendor-neutral SSH module (commit 97c0421)"]
 fn terraform_main_do_provider() {
     let content = read_tf(MAIN_TF);
     assert!(
@@ -106,6 +116,7 @@ fn terraform_main_do_provider() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "BUG-stale-terraform-do-tests: stale FRD-P012 DO-specific assertions vs vendor-neutral SSH module (commit 97c0421)"]
 fn terraform_main_droplet() {
     let content = read_tf(MAIN_TF);
     assert!(content.contains("digitalocean_droplet"), "main.tf must define a droplet resource");
@@ -119,6 +130,7 @@ fn terraform_main_droplet() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "BUG-stale-terraform-do-tests: stale FRD-P012 DO-specific assertions vs vendor-neutral SSH module (commit 97c0421)"]
 fn terraform_main_firewall() {
     let content = read_tf(MAIN_TF);
     assert!(content.contains("digitalocean_firewall"), "main.tf must define a firewall resource");
@@ -131,6 +143,7 @@ fn terraform_main_firewall() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "BUG-stale-terraform-do-tests: stale FRD-P012 DO-specific assertions vs vendor-neutral SSH module (commit 97c0421)"]
 fn terraform_main_dns() {
     let content = read_tf(MAIN_TF);
     assert!(content.contains("digitalocean_domain"), "main.tf must define a domain resource");
@@ -145,6 +158,7 @@ fn terraform_main_dns() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "BUG-stale-terraform-do-tests: stale FRD-P012 DO-specific assertions vs vendor-neutral SSH module (commit 97c0421)"]
 fn terraform_variables_all_defined() {
     let content = read_tf(VARIABLES_TF);
     let required_vars = [
@@ -171,6 +185,7 @@ fn terraform_variables_all_defined() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "BUG-stale-terraform-do-tests: stale FRD-P012 DO-specific assertions vs vendor-neutral SSH module (commit 97c0421)"]
 fn terraform_variables_sensitive() {
     let content = read_tf(VARIABLES_TF);
     // Count "sensitive = true" occurrences — must be at least 2 (do_token, admin_password)
@@ -204,6 +219,7 @@ fn terraform_outputs_defined() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "BUG-stale-terraform-do-tests: stale FRD-P012 DO-specific assertions vs vendor-neutral SSH module (commit 97c0421)"]
 fn terraform_cloud_init_content() {
     let content = read_tf(CLOUD_INIT);
     assert!(content.contains("#cloud-config"), "cloud-init must start with #cloud-config");
@@ -225,6 +241,7 @@ fn terraform_cloud_init_content() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "BUG-stale-terraform-do-tests: stale FRD-P012 DO-specific assertions vs vendor-neutral SSH module (commit 97c0421)"]
 fn terraform_cloud_init_variables() {
     let content = read_tf(CLOUD_INIT);
     assert!(content.contains("${admin_password}"), "cloud-init must template admin_password");
@@ -238,6 +255,7 @@ fn terraform_cloud_init_variables() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "BUG-stale-terraform-do-tests: stale FRD-P012 DO-specific assertions vs vendor-neutral SSH module (commit 97c0421)"]
 fn terraform_firewall_ssh_restricted() {
     let content = read_tf(MAIN_TF);
     // SSH rule should reference admin_ip_addresses, not open to all
@@ -253,6 +271,7 @@ fn terraform_firewall_ssh_restricted() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "BUG-stale-terraform-do-tests: stale FRD-P012 DO-specific assertions vs vendor-neutral SSH module (commit 97c0421)"]
 fn terraform_firewall_vpn_public() {
     let content = read_tf(MAIN_TF);
     // VPN rule should allow 0.0.0.0/0 and ::/0
@@ -265,6 +284,7 @@ fn terraform_firewall_vpn_public() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "BUG-stale-terraform-do-tests: stale FRD-P012 DO-specific assertions vs vendor-neutral SSH module (commit 97c0421)"]
 fn terraform_droplet_tags() {
     let content = read_tf(MAIN_TF);
     assert!(content.contains("tags"), "Droplet must have tags");
@@ -277,6 +297,7 @@ fn terraform_droplet_tags() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "BUG-stale-terraform-do-tests: stale FRD-P012 DO-specific assertions vs vendor-neutral SSH module (commit 97c0421)"]
 fn terraform_main_provider_block() {
     let content = read_tf(MAIN_TF);
     assert!(content.contains("provider \"digitalocean\""), "main.tf must have a provider block");
@@ -284,6 +305,7 @@ fn terraform_main_provider_block() {
 }
 
 #[test]
+#[ignore = "BUG-stale-terraform-do-tests: stale FRD-P012 DO-specific assertions vs vendor-neutral SSH module (commit 97c0421)"]
 fn terraform_droplet_ssh_keys() {
     let content = read_tf(MAIN_TF);
     assert!(content.contains("ssh_keys"), "Droplet must reference ssh_keys");
@@ -291,6 +313,7 @@ fn terraform_droplet_ssh_keys() {
 }
 
 #[test]
+#[ignore = "BUG-stale-terraform-do-tests: stale FRD-P012 DO-specific assertions vs vendor-neutral SSH module (commit 97c0421)"]
 fn terraform_droplet_region() {
     let content = read_tf(MAIN_TF);
     assert!(content.contains("var.region"), "Droplet must use var.region");
@@ -298,6 +321,7 @@ fn terraform_droplet_region() {
 }
 
 #[test]
+#[ignore = "BUG-stale-terraform-do-tests: stale FRD-P012 DO-specific assertions vs vendor-neutral SSH module (commit 97c0421)"]
 fn terraform_dns_a_record() {
     let content = read_tf(MAIN_TF);
     assert!(
@@ -309,6 +333,7 @@ fn terraform_dns_a_record() {
 }
 
 #[test]
+#[ignore = "BUG-stale-terraform-do-tests: stale FRD-P012 DO-specific assertions vs vendor-neutral SSH module (commit 97c0421)"]
 fn terraform_firewall_outbound() {
     let content = read_tf(MAIN_TF);
     assert!(content.contains("outbound_rule"), "Firewall must have outbound rules");
@@ -317,6 +342,7 @@ fn terraform_firewall_outbound() {
 }
 
 #[test]
+#[ignore = "BUG-stale-terraform-do-tests: stale FRD-P012 DO-specific assertions vs vendor-neutral SSH module (commit 97c0421)"]
 fn terraform_cloud_init_cleanup() {
     let content = read_tf(CLOUD_INIT);
     assert!(content.contains("rm"), "cloud-init must clean up temporary install script");
@@ -324,6 +350,7 @@ fn terraform_cloud_init_cleanup() {
 }
 
 #[test]
+#[ignore = "BUG-stale-terraform-do-tests: stale FRD-P012 DO-specific assertions vs vendor-neutral SSH module (commit 97c0421)"]
 fn terraform_outputs_use_droplet_ip() {
     let content = read_tf(OUTPUTS_TF);
     assert!(
@@ -356,6 +383,7 @@ fn terraform_variables_have_types() {
 }
 
 #[test]
+#[ignore = "BUG-stale-terraform-do-tests: stale FRD-P012 DO-specific assertions vs vendor-neutral SSH module (commit 97c0421)"]
 fn terraform_cloud_init_packages() {
     let content = read_tf(CLOUD_INIT);
     assert!(content.contains("packages:"), "cloud-init must have packages section");

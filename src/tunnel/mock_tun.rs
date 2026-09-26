@@ -5,8 +5,7 @@
 //! [`MockTun`] implements [`TunDevice`] using tokio channels, enabling
 //! deterministic packet injection and capture in tests.
 
-use tokio::sync::Mutex;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 use super::tun_device::TunDevice;
 

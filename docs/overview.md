@@ -99,6 +99,7 @@ The codebase is organized into focused modules:
 | `server` | Multi-client VPN server orchestrator |
 | `client` | VPN client orchestrator |
 | `registry` | Client management and IP allocation (SQLite) |
+| `ecosystem` | Ecosystem registry descriptor publication ([details](ecosystem.md)) |
 | `keys` | Persistent server key storage |
 | `crypto` | Cryptographic primitives (AEAD, KDF, X25519, hybrid KEX) |
 | `handshake` | Noise IK + ML-KEM-768 hybrid handshake |
@@ -150,8 +151,19 @@ The registry is a SQLite database that tracks:
 - State (active, suspended, revoked)
 - Activity (last seen timestamp, bytes sent/received)
 - Connection history (connect, disconnect, auth failure events)
+- Client-to-client sharing pairs (canonical, unordered UUID pairs)
 
 IP addresses are allocated sequentially from the subnet (skipping network, gateway, and broadcast addresses) and released when a client is revoked.
+
+### Client-to-Client Authorization (Default Deny)
+
+Each client owns an isolated per-client TUN, so the server is **egress-only by default**: a
+packet from one client destined for another client's VPN IP is dropped. Two clients can reach
+each other only when an admin marks them as an explicit *sharing pair* (see
+[API: Sharing Pairs](api.md#client-to-client-sharing-pairs)). The pair lives in the registry's
+`sharing_pairs` table and is consulted on every inter-client packet in the per-client tunnel
+pipeline, so revoking a pair stops forwarding immediately. Egress (internet-bound) traffic is
+never gated by this check.
 
 ### Obfuscation
 

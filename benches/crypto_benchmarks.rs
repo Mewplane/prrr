@@ -3,11 +3,11 @@
 //! Benchmarks for cryptographic primitives: AEAD, X25519, ML-KEM, HKDF.
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-
-use prrr::crypto::aead;
-use prrr::crypto::hybrid_kex::{self, KemKeyPair};
-use prrr::crypto::kdf;
-use prrr::crypto::x25519;
+use prrr::crypto::{
+    aead,
+    hybrid_kex::{self, KemKeyPair},
+    kdf, x25519,
+};
 
 const AEAD_KEY: [u8; aead::KEY_LEN] = [0x42; aead::KEY_LEN];
 const AEAD_NONCE: [u8; aead::NONCE_LEN] = [0x01; aead::NONCE_LEN];

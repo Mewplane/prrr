@@ -229,6 +229,7 @@ impl HarpFrameReader {
 // ---------------------------------------------------------------------------
 
 use std::sync::Arc;
+
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 
 use crate::tunnel::pipeline::{DatagramReceiver, DatagramSender};
@@ -473,8 +474,7 @@ mod tests {
 
     #[test]
     fn encrypted_channel_payload_round_trip() {
-        use crate::crypto::aead::KEY_LEN;
-        use crate::transport::encrypted_channel::EncryptedChannel;
+        use crate::{crypto::aead::KEY_LEN, transport::encrypted_channel::EncryptedChannel};
 
         let tx_key = [0x01u8; KEY_LEN];
         let rx_key = [0x02u8; KEY_LEN];

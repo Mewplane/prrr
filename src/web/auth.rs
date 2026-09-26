@@ -8,15 +8,11 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
-use axum::http::Request;
-use axum::middleware::Next;
-use axum::response::Response;
+use axum::{extract::State, http::Request, middleware::Next, response::Response};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 
-use super::errors::ApiError;
-use super::state::AppState;
+use super::{errors::ApiError, state::AppState};
 
 /// Expected admin username (single-user auth model).
 const ADMIN_USERNAME: &str = "admin";
@@ -135,21 +131,20 @@ fn verify_password(password: &str, hash: &str) -> Result<bool, ApiError> {
 #[cfg(test)]
 mod tests {
     // FRD: specs/frds/FRD-P006.md
-    use super::*;
-    use crate::web::AppState;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::{Arc, atomic::AtomicU32};
 
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
-    use axum::routing::{get, post};
-    use axum::{Json, Router};
+    use axum::{
+        Json, Router,
+        body::Body,
+        http::{Request, StatusCode},
+        routing::{get, post},
+    };
     use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
     use tower::ServiceExt;
 
-    use crate::config::DEFAULT_SESSION_TIMEOUT;
-    use crate::registry::ClientRegistry;
+    use super::*;
+    use crate::{config::DEFAULT_SESSION_TIMEOUT, registry::ClientRegistry, web::AppState};
 
     /// Test password: "test-password-123"
     /// Generated with: echo -n "test-password-123" | argon2 testsalt -id -t 2 -m 16 -p 1 -l 32 -e
@@ -169,9 +164,13 @@ mod tests {
     }
 
     fn test_app_state() -> AppState {
-        use crate::distribution::{ConfigTokenStore, ServerContext};
-        use crate::web::handlers::{ServerConfigResponse, TransportInfoResponse};
-        use crate::web::harp::HarpSessionStore;
+        use crate::{
+            distribution::{ConfigTokenStore, ServerContext},
+            web::{
+                handlers::{ServerConfigResponse, TransportInfoResponse},
+                harp::HarpSessionStore,
+            },
+        };
         let registry = ClientRegistry::new("10.66.66.0/24").expect("valid subnet");
         AppState {
             registry: Arc::new(Mutex::new(registry)),

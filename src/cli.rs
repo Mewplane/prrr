@@ -5,15 +5,22 @@
 //! Each handler takes the minimum required state (registry, server context)
 //! and performs the requested operation, printing results to stdout.
 
-use std::path::Path;
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+};
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
+use toml_edit::{Array, DocumentMut, Item, Table, value};
 
-use crate::config::{DEFAULT_IDENTITY_KEY_PATH, DEFAULT_PQ_KEY_PATH, ServerArgs, ServerClientAction, ServerConfig};
-use crate::distribution::{ServerContext, decode_import_url, generate_client_config, generate_qr_svg};
-use crate::handshake::noise_ik::KeyPair;
-use crate::registry::ClientRegistry;
+use crate::{
+    config::{
+        ClientRouteAction, DEFAULT_IDENTITY_KEY_PATH, DEFAULT_PQ_KEY_PATH, ServerArgs, ServerClientAction, ServerConfig, SharingAction,
+    },
+    distribution::{ServerContext, decode_import_url, generate_client_config, generate_qr_svg},
+    handshake::noise_ik::KeyPair,
+    registry::ClientRegistry,
+    sharing::SharingStore,
+};
 
 /// Default client configuration directory.
 const DEFAULT_CLIENT_CONFIG_DIR: &str = ".config/prrr";
@@ -127,8 +134,7 @@ fn handle_client_add(registry: &mut ClientRegistry, ctx: &ServerContext, name: &
     eprintln!("  IP Address: {}", record.ip_address);
 
     if qr {
-        let svg = generate_qr_svg(&config_toml)
-            .map_err(|e| anyhow::anyhow!("QR generation failed: {e}"))?;
+        let svg = generate_qr_svg(&config_toml).map_err(|e| anyhow::anyhow!("QR generation failed: {e}"))?;
         let qr_path = format!("{name}.svg");
         std::fs::write(&qr_path, &svg)?;
         eprintln!("  QR code:    {qr_path}");
@@ -245,14 +251,192 @@ pub fn import_config_to(source: &str, config_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Manage hostname resources in a client TOML configuration.
+pub fn handle_client_route_action(config_path: Option<&Path>, action: &ClientRouteAction, out: &mut impl Write) -> anyhow::Result<()> {
+    let path = config_path.map(Path::to_path_buf).unwrap_or_else(default_client_config_path);
+    let source = if path.exists() {
+        std::fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+    let mut document = source
+        .parse::<DocumentMut>()
+        .map_err(|error| anyhow::anyhow!("invalid client config: {error}"))?;
+
+    match action {
+        ClientRouteAction::Add { resource } => {
+            let resource = crate::routing::normalize_resource(resource)?;
+            let array = resource_array(&mut document)?;
+            if normalized_resource_values(array)?.contains(&resource) {
+                writeln!(out, "resource already configured: {resource}")?;
+                return Ok(());
+            }
+            array.push(resource.as_str());
+            write_client_document(&path, &document)?;
+            writeln!(out, "resource added: {resource}")?;
+        }
+        ClientRouteAction::Remove { resource } => {
+            let resource = crate::routing::normalize_resource(resource)?;
+            let array = resource_array(&mut document)?;
+            let mut next = Array::new();
+            let mut removed = false;
+            for item in array.iter() {
+                let current = item
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("client config routing.resources must contain strings"))?;
+                if crate::routing::normalize_resource(current)? == resource {
+                    removed = true;
+                } else {
+                    next.push(item.clone());
+                }
+            }
+            if !removed {
+                anyhow::bail!("resource not configured: {resource}");
+            }
+            *array = next;
+            write_client_document(&path, &document)?;
+            writeln!(out, "resource removed: {resource}")?;
+        }
+        ClientRouteAction::List => {
+            let resources = document
+                .get("routing")
+                .and_then(Item::as_table)
+                .and_then(|routing| routing.get("resources"))
+                .and_then(Item::as_array)
+                .map(normalized_resource_values)
+                .transpose()?
+                .unwrap_or_default();
+            if resources.is_empty() {
+                writeln!(out, "no resources configured")?;
+            } else {
+                for resource in resources {
+                    writeln!(out, "{resource}")?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn default_client_config_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    Path::new(&home)
+        .join(DEFAULT_CLIENT_CONFIG_DIR)
+        .join(DEFAULT_CLIENT_CONFIG_FILENAME)
+}
+
+fn resource_array(document: &mut DocumentMut) -> anyhow::Result<&mut Array> {
+    let routing = document.as_table_mut().entry("routing").or_insert(Item::Table(Table::new()));
+    let resources = routing
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("client config [routing] must be a table"))?
+        .entry("resources")
+        .or_insert(value(Array::new()));
+    resources
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("client config routing.resources must be an array"))
+}
+
+fn normalized_resource_values(array: &Array) -> anyhow::Result<Vec<String>> {
+    array
+        .iter()
+        .map(|item| {
+            let resource = item
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("client config routing.resources must contain strings"))?;
+            crate::routing::normalize_resource(resource)
+        })
+        .collect()
+}
+
+fn write_client_document(path: &Path, document: &DocumentMut) -> anyhow::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("client config path has no filename"))?
+        .to_string_lossy();
+    let temp_path = parent.join(format!(".{file_name}.prrr.{}.tmp", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut temp = options.open(&temp_path)?;
+    temp.write_all(document.to_string().as_bytes())?;
+    temp.sync_all()?;
+    drop(temp);
+    std::fs::rename(&temp_path, path).map_err(|error| {
+        let _ = std::fs::remove_file(&temp_path);
+        anyhow::anyhow!("failed to replace client config: {error}")
+    })
+}
+
+/// Handle a `prrr sharing <action>` subcommand against the given store.
+///
+/// `enable`/`disable` flip the persisted [`SharingState`] (which the daemon
+/// honors so the client accepts/rejects the inter-client route); `status`
+/// prints the live state and the peer mesh address (`none` until Step 5).
+/// Output is written to `out` so the behavior is unit-testable.
+///
+/// [`SharingState`]: crate::sharing::SharingState
+pub fn handle_sharing_action(store: &SharingStore, action: &SharingAction, out: &mut impl std::io::Write) -> anyhow::Result<()> {
+    match action {
+        SharingAction::Enable => {
+            let next = store.load().enable();
+            store.store(&next)?;
+            writeln!(out, "sharing: enabled")?;
+        }
+        SharingAction::Disable => {
+            let next = store.load().disable();
+            store.store(&next)?;
+            writeln!(out, "sharing: disabled")?;
+        }
+        SharingAction::Status => {
+            let state = store.load();
+            writeln!(out, "sharing: {}", if state.enabled { "enabled" } else { "disabled" })?;
+            writeln!(out, "peer mesh address: {}", state.peer_mesh_addr.as_deref().unwrap_or("none"))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     // FRD: specs/frds/FRD-P009B.md
+    // FRD: specs/frds/FRD-004-client-sharing-toggle-and-remote-enable.md
     use super::*;
     use crate::registry::ClientRegistry;
 
     const TEST_SUBNET: &str = "10.66.66.0/24";
     const TEST_CLIENT_NAME: &str = "test-alice";
+
+    // FRD: specs/frds/FRD-resource-routing.md
+    #[test]
+    fn client_route_add_and_remove_edit_a_real_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("client.toml");
+        std::fs::write(&path, "# keep me\n[server]\nendpoint = \"vpn.example:443\"\n").expect("write config");
+
+        handle_client_route_action(
+            Some(&path),
+            &ClientRouteAction::Add {
+                resource: "chatgpt.com".to_string(),
+            },
+            &mut Vec::new(),
+        )
+        .expect("add");
+        let after_add = std::fs::read_to_string(&path).expect("read config");
+        assert!(after_add.contains("# keep me"));
+        assert!(after_add.contains("chatgpt.com"));
+
+        handle_client_route_action(
+            Some(&path),
+            &ClientRouteAction::Remove {
+                resource: "chatgpt.com".to_string(),
+            },
+            &mut Vec::new(),
+        )
+        .expect("remove");
+        assert!(!std::fs::read_to_string(&path).expect("read config").contains("chatgpt.com"));
+    }
 
     fn test_registry() -> ClientRegistry {
         ClientRegistry::new(TEST_SUBNET).expect("valid subnet")
@@ -410,10 +594,10 @@ mod tests {
     // AC-B18: import_config_to decodes prrr:// URL
     #[test]
     fn cli_import_decodes_url() {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use flate2::Compression;
-        use flate2::write::DeflateEncoder;
         use std::io::Write;
+
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        use flate2::{Compression, write::DeflateEncoder};
 
         let toml_content = "[client]\nname = \"url-client\"\n\n[server]\nendpoint = \"10.0.0.1:443\"\n";
         let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
@@ -443,5 +627,59 @@ mod tests {
         let output_dir = dir.path().join("config");
         let err = import_config_to(config_path.to_str().expect("path"), &output_dir);
         assert!(err.is_err(), "invalid TOML should fail");
+    }
+
+    // FRD-004: `prrr sharing enable` then `status` reports enabled and drives
+    // the persisted routing-acceptance state.
+    #[test]
+    fn sharing_enable_then_status_reports_enabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SharingStore::new(dir.path().join(crate::sharing::SHARING_STATE_FILENAME));
+
+        let mut buf = Vec::new();
+        handle_sharing_action(&store, &SharingAction::Enable, &mut buf).expect("enable");
+        assert!(String::from_utf8_lossy(&buf).contains("enabled"));
+        assert!(store.load().enabled, "enable persists routing-acceptance state");
+        assert!(store.load().route_accepted(), "enabled => route accepted");
+
+        let mut status = Vec::new();
+        handle_sharing_action(&store, &SharingAction::Status, &mut status).expect("status");
+        let text = String::from_utf8_lossy(&status);
+        assert!(text.contains("sharing: enabled"));
+        assert!(text.contains("peer mesh address: none"), "no addr until the route is established");
+    }
+
+    // FRD-005: when sharing is established with a probed peer mesh address,
+    // `status` prints that real address (not `none`).
+    #[test]
+    fn sharing_status_shows_established_mesh_address() {
+        const ESTABLISHED_ADDR: &str = "100.64.0.2:51820";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SharingStore::new(dir.path().join(crate::sharing::SHARING_STATE_FILENAME));
+        store
+            .store(&crate::sharing::SharingState::default().establish(ESTABLISHED_ADDR))
+            .expect("store");
+
+        let mut status = Vec::new();
+        handle_sharing_action(&store, &SharingAction::Status, &mut status).expect("status");
+        let text = String::from_utf8_lossy(&status);
+        assert!(
+            text.contains(&format!("peer mesh address: {ESTABLISHED_ADDR}")),
+            "shows real addr, got: {text}"
+        );
+    }
+
+    // FRD-004: `prrr sharing disable` flips the state off (off = no route).
+    #[test]
+    fn sharing_disable_turns_off_route() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SharingStore::new(dir.path().join(crate::sharing::SHARING_STATE_FILENAME));
+        handle_sharing_action(&store, &SharingAction::Enable, &mut Vec::new()).expect("enable");
+
+        let mut buf = Vec::new();
+        handle_sharing_action(&store, &SharingAction::Disable, &mut buf).expect("disable");
+        assert!(String::from_utf8_lossy(&buf).contains("disabled"));
+        assert!(!store.load().enabled);
+        assert!(!store.load().route_accepted(), "off = no route");
     }
 }

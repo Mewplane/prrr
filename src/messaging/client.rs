@@ -9,9 +9,13 @@
 
 use std::collections::HashMap;
 
-use crate::crypto::x25519;
-use crate::messaging::ratchet::{MessageHeader, RatchetConfig, RatchetError, RatchetState};
-use crate::messaging::types::{AckPayload, DataPayload, EncryptedEnvelope, PeerId, WireMessage, WirePayload, generate_msg_id};
+use crate::{
+    crypto::x25519,
+    messaging::{
+        ratchet::{MessageHeader, RatchetConfig, RatchetError, RatchetState},
+        types::{AckPayload, DataPayload, EncryptedEnvelope, PeerId, WireMessage, WirePayload, generate_msg_id},
+    },
+};
 
 // ---------------------------------------------------------------------------
 // Errors

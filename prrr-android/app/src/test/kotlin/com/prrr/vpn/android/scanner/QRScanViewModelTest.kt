@@ -49,7 +49,8 @@ fun fakeVpnConfig(
     dnsServers = listOf("1.1.1.1"),
     mtu = 1100u.toUShort(),
     preferredBinding = null,
-    transportProtocol = null
+    transportProtocol = null,
+    fullTunnel = null
 )
 
 @OptIn(ExperimentalCoroutinesApi::class)

@@ -8,21 +8,23 @@
 //! server infrastructure and [`TransportConnection`] as the unified
 //! return type from client-side transport connections.
 
-use std::collections::HashMap;
-use std::future::Future;
-use std::net::Ipv4Addr;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::{
+    collections::HashMap,
+    future::Future,
+    net::Ipv4Addr,
+    pin::Pin,
+    sync::{Arc, atomic::AtomicU32},
+};
 
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::crypto::hybrid_kex::KemKeyPair;
-use crate::handshake::hybrid::SessionKeys;
-use crate::handshake::noise_ik::KeyPair;
-use crate::registry::ClientRegistry;
-use crate::transport::TransportError;
+use crate::{
+    crypto::hybrid_kex::KemKeyPair,
+    handshake::{hybrid::SessionKeys, noise_ik::KeyPair},
+    registry::ClientRegistry,
+    transport::TransportError,
+};
 
 /// Noise X25519 public key length in bytes.
 const NOISE_PUBLIC_KEY_LEN: usize = 32;
@@ -209,9 +211,10 @@ pub struct SharedServerState {
 
 #[cfg(test)]
 mod tests {
+    use tokio_util::sync::CancellationToken;
+
     use super::*;
     use crate::handshake::noise_ik::KeyPair;
-    use tokio_util::sync::CancellationToken;
 
     /// Noise public key length in bytes.
     const NOISE_PUB_LEN: usize = 32;
@@ -239,8 +242,7 @@ mod tests {
     /// AC-2: TransportConnection can be constructed with mock sender/receiver.
     #[tokio::test]
     async fn transport_connection_with_mock_sender_receiver() {
-        use crate::crypto::aead::KEY_LEN;
-        use crate::handshake::hybrid::SessionKeys;
+        use crate::{crypto::aead::KEY_LEN, handshake::hybrid::SessionKeys};
 
         struct MockSender;
         impl BoxedDatagramSender for MockSender {
@@ -276,9 +278,10 @@ mod tests {
     /// AC-5: SharedServerState can be constructed with test values.
     #[test]
     fn shared_server_state_construction() {
-        use std::net::Ipv4Addr;
-        use std::sync::Arc;
-        use std::sync::atomic::AtomicU32;
+        use std::{
+            net::Ipv4Addr,
+            sync::{Arc, atomic::AtomicU32},
+        };
 
         use crate::crypto::hybrid_kex::KemKeyPair;
 
@@ -349,9 +352,13 @@ mod tests {
     /// AC-5: SharedServerState fields are accessible and functional.
     #[tokio::test]
     async fn shared_server_state_fields_accessible() {
-        use std::net::Ipv4Addr;
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::{
+            net::Ipv4Addr,
+            sync::{
+                Arc,
+                atomic::{AtomicU32, Ordering},
+            },
+        };
 
         use crate::crypto::hybrid_kex::KemKeyPair;
 

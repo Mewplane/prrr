@@ -138,6 +138,42 @@ The binary is at `target/release/prrr`.
 
 ---
 
+## Android App
+
+The Prrr Android app is in `prrr-android/`. Building requires the Android NDK and Rust cross-compilation targets.
+
+### Prerequisites
+
+```bash
+# Install Android NDK via SDK Manager or https://developer.android.com/ndk/downloads
+# Install Rust cross-compilation targets
+rustup target add aarch64-linux-android x86_64-linux-android armv7-linux-androideabi i686-linux-android
+```
+
+### Building
+
+```bash
+# Full build: compile Rust native library + Gradle APK
+make android-debug
+
+# Install on connected device
+make android-install
+
+# Gradle-only build (skip native rebuild when only editing Kotlin)
+make android-debug-apk
+
+# Release build
+make android-release
+```
+
+Set `NDK_HOME` if auto-detection fails:
+
+```bash
+NDK_HOME=/path/to/ndk make android-debug
+```
+
+---
+
 ## Testing
 
 prrr has 774+ tests covering the full protocol stack, including end-to-end data flow tests that verify packets traverse the complete encrypted pipeline across both HARP and MASQUE transports.
@@ -147,6 +183,7 @@ make test          # Run all tests
 make lint          # Clippy + format check
 make bench         # Performance benchmarks
 make shellcheck    # Lint installation scripts
+make android-test  # Android unit tests
 ```
 
 Coverage targets: 90% for critical paths, 85% overall.

@@ -17,9 +17,7 @@
 //! header and extracts exactly that many payload bytes, ignoring any trailing
 //! padding.
 
-use std::fmt;
-use std::str::FromStr;
-use std::time::Duration;
+use std::{fmt, str::FromStr, time::Duration};
 
 use rand::Rng;
 
@@ -729,8 +727,7 @@ mod tests {
 
     #[test]
     fn pad_encrypt_decrypt_unpad_round_trip() {
-        use crate::crypto::aead::KEY_LEN;
-        use crate::transport::encrypted_channel::EncryptedChannel;
+        use crate::{crypto::aead::KEY_LEN, transport::encrypted_channel::EncryptedChannel};
 
         let tx_key = [0x01u8; KEY_LEN];
         let rx_key = [0x02u8; KEY_LEN];

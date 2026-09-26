@@ -5,8 +5,7 @@
 //! Validates configuration, key integrity, port availability, system resources,
 //! and connectivity. Each check reports pass/warn/fail with actionable messages.
 
-use std::net::SocketAddr;
-use std::path::Path;
+use std::{net::SocketAddr, path::Path};
 
 use crate::config::{ClientConfigFile, ServerConfig};
 
@@ -1831,11 +1830,15 @@ mod tests {
         (cert_path.to_str().unwrap().to_string(), key_path.to_str().unwrap().to_string())
     }
 
-    /// Helper: generate a cert with a custom not_after date (year/month/day).
-    fn write_custom_expiry_pem(dir: &std::path::Path, sans: &[&str], not_after_ymd: (i32, u8, u8)) -> (String, String) {
+    /// Helper: generate a cert whose `not_after` is `days_from_now` days after the
+    /// current clock. Using a relative expiry keeps clock-sensitive checks (such as
+    /// the "expiring soon" warning) deterministic regardless of the wall-clock date.
+    /// The `time` source matches the one rcgen uses for the `not_after` field.
+    fn write_relative_expiry_pem(dir: &std::path::Path, sans: &[&str], days_from_now: i64) -> (String, String) {
         let mut params = rcgen::CertificateParams::new(sans.iter().map(|s| s.to_string()).collect::<Vec<_>>()).expect("valid params");
-        params.not_before = rcgen::date_time_ymd(2024, 1, 1);
-        params.not_after = rcgen::date_time_ymd(not_after_ymd.0, not_after_ymd.1, not_after_ymd.2);
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::days(1);
+        params.not_after = now + time::Duration::days(days_from_now);
         let key_pair = rcgen::KeyPair::generate().expect("generate key");
         let cert = params.self_signed(&key_pair).expect("self-sign");
 
@@ -1928,7 +1931,9 @@ mod tests {
     fn tls_cert_expiring_soon_warns() {
         let dir = std::env::temp_dir().join("prrr-diag-test-tls-expiring");
         std::fs::create_dir_all(&dir).expect("create dir");
-        let (cert_path, key_path) = write_custom_expiry_pem(&dir, &["vpn.example.com"], (2026, 4, 1));
+        // Expire halfway into the warn window: strictly in the future (not Fail)
+        // yet strictly within CERT_EXPIRY_WARN_DAYS (Warn), for any wall-clock date.
+        let (cert_path, key_path) = write_relative_expiry_pem(&dir, &["vpn.example.com"], CERT_EXPIRY_WARN_DAYS / 2);
 
         let result = check_tls_cert(Some(&cert_path), Some(&key_path), None);
         assert_eq!(result.status, CheckStatus::Warn);

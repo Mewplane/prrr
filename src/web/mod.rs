@@ -14,12 +14,13 @@ pub mod harp;
 pub mod spa;
 pub mod state;
 
-pub use state::AppState;
-
 use std::net::SocketAddr;
 
-use axum::Router;
-use axum::routing::{delete, get, post};
+use axum::{
+    Router,
+    routing::{delete, get, post},
+};
+pub use state::AppState;
 use tower_http::cors::{Any, CorsLayer};
 
 /// API version prefix for all routes.
@@ -43,6 +44,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/clients/{id}/config", get(handlers::get_client_config))
         .route("/clients/{id}/qr", get(handlers::get_client_qr))
         .route("/clients/{id}/config-url", post(handlers::create_config_url))
+        .route(
+            "/sharing-pairs",
+            get(handlers::list_sharing_pairs).post(handlers::create_sharing_pair),
+        )
+        .route("/sharing-pairs/{a}/{b}", delete(handlers::delete_sharing_pair))
         .route("/stats/overview", get(handlers::stats_overview))
         .route("/stats/traffic", get(handlers::stats_traffic))
         .route("/harp/sessions", get(handlers::list_harp_sessions))
@@ -136,20 +142,25 @@ pub async fn run_web_server_tls(listen_addr: SocketAddr, state: AppState, tls_ce
 #[cfg(test)]
 mod tests {
     // FRD: specs/frds/FRD-P006.md
-    use super::*;
-    use crate::config::DEFAULT_SESSION_TIMEOUT;
-    use crate::registry::ClientRegistry;
-    use crate::web::auth::LoginResponse;
-    use crate::web::handlers::{ClientListResponse, CreateClientResponse, ServerStatusResponse, StatusResponse};
+    use std::sync::{Arc, atomic::AtomicU32};
 
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicU32;
-
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
     use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
     use tower::ServiceExt;
+
+    use super::*;
+    use crate::{
+        config::DEFAULT_SESSION_TIMEOUT,
+        registry::ClientRegistry,
+        web::{
+            auth::LoginResponse,
+            handlers::{ClientListResponse, CreateClientResponse, ServerStatusResponse, StatusResponse},
+        },
+    };
 
     fn test_password_hash() -> String {
         use argon2::PasswordHasher;
@@ -161,9 +172,13 @@ mod tests {
     }
 
     fn test_app_state() -> AppState {
-        use crate::distribution::{ConfigTokenStore, ServerContext};
-        use crate::web::handlers::{ServerConfigResponse, TransportInfoResponse};
-        use crate::web::harp::HarpSessionStore;
+        use crate::{
+            distribution::{ConfigTokenStore, ServerContext},
+            web::{
+                handlers::{ServerConfigResponse, TransportInfoResponse},
+                harp::HarpSessionStore,
+            },
+        };
         let registry = ClientRegistry::new("10.66.66.0/24").expect("valid subnet");
         AppState {
             registry: Arc::new(Mutex::new(registry)),
@@ -732,6 +747,94 @@ mod tests {
 
         let body: HarpSessionListResponse = parse_json(resp).await;
         assert_eq!(body.sessions.len(), 1);
+    }
+
+    // --- Sharing pair integration tests (FRD-003) ---
+
+    // W-4: sharing-pairs list requires auth
+    #[tokio::test]
+    async fn sharing_pairs_require_auth() {
+        let state = test_app_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/sharing-pairs")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // W-1/W-2: allow then revoke a pair through the full authenticated router
+    #[tokio::test]
+    async fn sharing_pair_allow_revoke_through_router() {
+        use crate::web::handlers::{CreateClientResponse, SharingPairListResponse};
+
+        let state = test_app_state();
+        let app = build_router(state);
+        let token = login_and_get_token(&app, "admin-pass").await;
+
+        // Create two clients.
+        let mut ids = Vec::new();
+        for name in ["alice", "bob"] {
+            let resp = app
+                .clone()
+                .oneshot(authed_request(
+                    "POST",
+                    "/api/v1/clients",
+                    &token,
+                    Some(serde_json::json!({ "name": name })),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+            let created: CreateClientResponse = parse_json(resp).await;
+            ids.push(created.id);
+        }
+
+        // Allow the pair.
+        let resp = app
+            .clone()
+            .oneshot(authed_request(
+                "POST",
+                "/api/v1/sharing-pairs",
+                &token,
+                Some(serde_json::json!({"client_a": ids[0], "client_b": ids[1]})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // It appears in the list.
+        let resp = app
+            .clone()
+            .oneshot(authed_request("GET", "/api/v1/sharing-pairs", &token, None))
+            .await
+            .unwrap();
+        let listed: SharingPairListResponse = parse_json(resp).await;
+        assert_eq!(listed.pairs.len(), 1);
+
+        // Revoke it.
+        let resp = app
+            .clone()
+            .oneshot(authed_request(
+                "DELETE",
+                &format!("/api/v1/sharing-pairs/{}/{}", ids[0], ids[1]),
+                &token,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(authed_request("GET", "/api/v1/sharing-pairs", &token, None))
+            .await
+            .unwrap();
+        let listed: SharingPairListResponse = parse_json(resp).await;
+        assert!(listed.pairs.is_empty());
     }
 
     // Terminate session requires auth

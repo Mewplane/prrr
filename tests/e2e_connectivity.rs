@@ -10,10 +10,12 @@
 //! cargo test --test e2e_connectivity -- --ignored
 //! ```
 
-mod support;
+#[path = "support/podman_client.rs"]
+mod podman_client;
 
 use std::time::Duration;
-use support::podman::{PodmanOrchestrator, Container};
+
+use podman_client::PodmanOrchestrator;
 
 const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const TUNNEL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -28,27 +30,22 @@ fn run_tunnel_test(test_name: &str, transport: &str) {
     orch.create_volume().expect("create volume");
 
     let server_ip = orch.start_server(transport).expect("start server");
-    orch.wait_for_server_ready(SERVER_READY_TIMEOUT)
-        .unwrap_or_else(|e| {
-            let logs = orch.logs(Container::Server).unwrap_or_default();
-            panic!("server not ready: {e}\n--- server logs ---\n{logs}");
-        });
+    orch.wait_for_server_ready(SERVER_READY_TIMEOUT).unwrap_or_else(|e| {
+        let logs = orch.server_logs().unwrap_or_default();
+        panic!("server not ready: {e}\n--- server logs ---\n{logs}");
+    });
 
     orch.start_client(&server_ip, transport).expect("start client");
-    orch.wait_for_tunnel(TUNNEL_TIMEOUT)
-        .unwrap_or_else(|e| {
-            let logs = orch.logs(Container::Client).unwrap_or_default();
-            panic!("tunnel not established: {e}\n--- client logs ---\n{logs}");
-        });
+    orch.wait_for_tunnel(TUNNEL_TIMEOUT).unwrap_or_else(|e| {
+        let logs = orch.client_logs().unwrap_or_default();
+        panic!("tunnel not established: {e}\n--- client logs ---\n{logs}");
+    });
 
-    let ping_ok = orch.ping(Container::Client, VPN_GATEWAY)
-        .expect("ping command");
+    let ping_ok = orch.client_ping(VPN_GATEWAY).expect("ping command");
     if !ping_ok {
-        let client_logs = orch.logs(Container::Client).unwrap_or_default();
-        let server_logs = orch.logs(Container::Server).unwrap_or_default();
-        panic!(
-            "ping through VPN failed\n--- client logs ---\n{client_logs}\n--- server logs ---\n{server_logs}"
-        );
+        let client_logs = orch.client_logs().unwrap_or_default();
+        let server_logs = orch.server_logs().unwrap_or_default();
+        panic!("ping through VPN failed\n--- client logs ---\n{client_logs}\n--- server logs ---\n{server_logs}");
     }
 }
 
@@ -95,8 +92,7 @@ fn e2e_entrypoint_exists_and_executable() {
 
 #[test]
 fn e2e_entrypoint_supports_transport_selection() {
-    let content = std::fs::read_to_string("deploy/client/entrypoint.sh")
-        .expect("read entrypoint.sh");
+    let content = std::fs::read_to_string("deploy/client/entrypoint.sh").expect("read entrypoint.sh");
 
     assert!(content.contains("PRRR_TRANSPORT"), "must support PRRR_TRANSPORT env var");
     assert!(content.contains("[[transports]]"), "must use [[transports]] array config");

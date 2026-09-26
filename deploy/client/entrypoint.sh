@@ -92,7 +92,13 @@ EOF
     log "Starting prrr server on ${PRRR_LISTEN_ADDR}"
     prrr server --config "${SERVER_CONFIG}" --listen "${PRRR_LISTEN_ADDR}" 2>&1 | tee "${PRRR_SHARED_DIR}/server.log" &
     SERVER_PID=$!
-    trap "kill ${SERVER_PID} 2>/dev/null; wait ${SERVER_PID} 2>/dev/null" EXIT
+    # Function trap (not an inline string) so $SERVER_PID is read safely when
+    # the trap fires and shellcheck's SC2064 stays satisfied.
+    cleanup_server() {
+        kill "${SERVER_PID}" 2>/dev/null || true
+        wait "${SERVER_PID}" 2>/dev/null || true
+    }
+    trap cleanup_server EXIT
     wait "${SERVER_PID}"
 }
 

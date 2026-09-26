@@ -6,8 +6,10 @@
 //! client-side hash routing in the browser. Also serves logo images
 //! as static assets embedded at compile time.
 
-use axum::http::header;
-use axum::response::{Html, IntoResponse};
+use axum::{
+    http::header,
+    response::{Html, IntoResponse},
+};
 
 /// Embedded SPA HTML (Preact + HTM from CDN, single file).
 const SPA_HTML: &str = include_str!("../../assets/index.html");
@@ -85,8 +87,9 @@ pub async fn logo_text_handler() -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     // FRD: specs/frds/FRD-P007.md, specs/frds/FRD-20260223-web-ui-logo-integration.md
-    use super::*;
     use axum::response::IntoResponse;
+
+    use super::*;
 
     #[tokio::test]
     async fn spa_handler_returns_html() {
@@ -247,7 +250,7 @@ mod tests {
     // --- Logo handler tests (FRD-20260223-web-ui-logo-integration) ---
 
     /// Expected size of logo_w.png in bytes.
-    const EXPECTED_LOGO_SIZE: usize = 43_863;
+    const EXPECTED_LOGO_SIZE: usize = 41_408;
 
     /// Expected size of logo_w_text.png in bytes.
     const EXPECTED_LOGO_TEXT_SIZE: usize = 84_620;

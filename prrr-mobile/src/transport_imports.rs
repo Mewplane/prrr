@@ -6,26 +6,22 @@
 //! handshake, and tunnel infrastructure. [`VpnConnection`](crate::VpnConnection)
 //! uses these types to establish real VPN tunnels.
 
-// Transport traits and types
-pub use prrr::transport::{ClientConnectParams, ClientTransport, TransportConnection};
-
-// Encrypted channel for post-handshake packet encryption
-pub use prrr::transport::encrypted_channel::EncryptedChannel;
-
-// HARP client transport implementation and configuration
-pub use prrr::client::{HarpClientConfig, HarpClientTransport};
-
-// Tunnel pipeline and stats
-pub use prrr::tunnel::pipeline::TrafficStats;
-pub use prrr::tunnel::TunnelError;
-pub use prrr::tunnel::TunnelPipeline;
-
-// Handshake types
-pub use prrr::handshake::hybrid::{HybridInitiator, SessionKeys};
-
-// Cryptographic key types
-pub use prrr::crypto::hybrid_kex::KemKeyPair;
-pub use prrr::handshake::noise_ik::KeyPair;
+// Core `prrr` re-exports grouped by area:
+// - client: HARP client transport implementation and configuration
+// - crypto: cryptographic key types
+// - handshake: Noise/hybrid handshake types
+// - transport: transport traits, types, and the post-handshake encrypted channel
+// - tunnel: tunnel pipeline and traffic stats
+pub use prrr::{
+    client::{HarpClientConfig, HarpClientTransport},
+    crypto::hybrid_kex::KemKeyPair,
+    handshake::{
+        hybrid::{HybridInitiator, SessionKeys},
+        noise_ik::KeyPair,
+    },
+    transport::{encrypted_channel::EncryptedChannel, ClientConnectParams, ClientTransport, TransportConnection},
+    tunnel::{pipeline::TrafficStats, TunnelError, TunnelPipeline},
+};
 
 #[cfg(test)]
 mod tests {

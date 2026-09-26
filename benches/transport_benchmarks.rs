@@ -3,9 +3,7 @@
 //! Benchmarks for transport layer: EncryptedChannel send/recv.
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-
-use prrr::crypto::aead::KEY_LEN;
-use prrr::transport::encrypted_channel::EncryptedChannel;
+use prrr::{crypto::aead::KEY_LEN, transport::encrypted_channel::EncryptedChannel};
 
 const TX_KEY: [u8; KEY_LEN] = [0x01; KEY_LEN];
 const RX_KEY: [u8; KEY_LEN] = [0x02; KEY_LEN];

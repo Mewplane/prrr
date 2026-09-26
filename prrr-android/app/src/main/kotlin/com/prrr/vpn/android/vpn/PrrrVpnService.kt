@@ -165,6 +165,22 @@ class PrrrVpnService : VpnService() {
             ))
             Log.i(TAG, "Excluded server ${serverAddr.hostAddress} from VPN routes")
 
+            // Local-LAN auto-exclusion (split-tunnel courtesy, FRD-001): keep the
+            // active LAN subnet on the local link by default so a sibling on the
+            // same Wi-Fi stays reachable. The Rust core is the single source of
+            // truth for which prefixes to exclude. When full_tunnel is set, this
+            // returns an empty list and the LAN is captured by the tunnel.
+            val fullTunnel = config.fullTunnel == true
+            uniffi.prrr_mobile.lanExcludedCidrs(fullTunnel).forEach { cidr ->
+                val parts = cidr.split("/")
+                val prefix = android.net.IpPrefix(
+                    java.net.InetAddress.getByName(parts[0]),
+                    parts.getOrNull(1)?.toIntOrNull() ?: 32
+                )
+                builder.excludeRoute(prefix)
+                Log.i(TAG, "Excluded LAN prefix $cidr from VPN routes")
+            }
+
             // Check VPN consent
             val prepareIntent = prepare(this)
             if (prepareIntent != null) {

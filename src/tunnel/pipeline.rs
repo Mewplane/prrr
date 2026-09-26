@@ -8,21 +8,71 @@
 //!
 //! The pipeline runs until the cancellation token is triggered or an error occurs.
 
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::transport::encrypted_channel::EncryptedChannel;
-use crate::transport::masque::{MasqueClient, MasqueProxy};
-
-use super::TunnelError;
-use super::tun_device::TunDevice;
+use super::{TunnelError, tun_device::TunDevice};
+use crate::transport::{
+    encrypted_channel::EncryptedChannel,
+    masque::{MasqueClient, MasqueProxy},
+};
 
 /// Maximum buffer size for reading IP packets from the TUN device.
 /// Slightly larger than MAX_TUNNEL_MTU to detect oversized packets.
 const TUN_READ_BUF_SIZE: usize = 2048;
+
+/// IP version nibble identifying IPv4 in the first header byte.
+const IPV4_VERSION: u8 = 4;
+/// Minimum length of an IPv4 header (no options).
+const IPV4_MIN_HEADER_LEN: usize = 20;
+/// Byte offset of the destination address within an IPv4 header.
+const IPV4_DST_OFFSET: usize = 16;
+
+/// Extract the IPv4 destination address from a raw IP packet.
+///
+/// Returns `None` for non-IPv4 packets or anything too short to contain an
+/// IPv4 header (fail-closed: the caller treats an unparseable destination as
+/// not an allowed inter-client forward).
+pub fn ipv4_destination(packet: &[u8]) -> Option<std::net::Ipv4Addr> {
+    if packet.len() < IPV4_MIN_HEADER_LEN || (packet[0] >> 4) != IPV4_VERSION {
+        return None;
+    }
+    Some(std::net::Ipv4Addr::new(
+        packet[IPV4_DST_OFFSET],
+        packet[IPV4_DST_OFFSET + 1],
+        packet[IPV4_DST_OFFSET + 2],
+        packet[IPV4_DST_OFFSET + 3],
+    ))
+}
+
+/// Decision gate consulted before a decrypted packet from a client is written
+/// to the server-side TUN.
+///
+/// Implementations resolve the packet's destination and decide whether the
+/// sending client is authorized to reach it. Returning `false` drops the
+/// packet (default-deny for inter-client traffic; egress is unaffected).
+///
+/// The decision is consulted on every packet (no caching), so a revoked
+/// authorization stops forwarding immediately (FRD-003).
+pub trait ForwardGate: Send + Sync {
+    /// Return `true` if the decrypted `packet` from the owning client may be
+    /// delivered (written to the TUN), `false` to drop it.
+    fn allow<'a>(&'a self, packet: &'a [u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+}
+
+/// A gate that allows every packet (used by the client side and tests, where
+/// no inter-client enforcement applies).
+pub struct AllowAllGate;
+
+impl ForwardGate for AllowAllGate {
+    fn allow<'a>(&'a self, _packet: &'a [u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async { true })
+    }
+}
 
 /// Trait for sending datagrams through the MASQUE tunnel.
 ///
@@ -118,6 +168,7 @@ where
     sender: S,
     receiver: R,
     stats: Arc<TrafficStats>,
+    gate: Arc<dyn ForwardGate>,
 }
 
 impl<T, S, R> TunnelPipeline<T, S, R>
@@ -134,12 +185,29 @@ where
     /// - `receiver`: MASQUE receiver for inbound datagrams
     /// - `stats`: Shared traffic byte counters
     pub fn new(tun: T, channel: EncryptedChannel, sender: S, receiver: R, stats: Arc<TrafficStats>) -> Self {
+        Self::with_gate(tun, channel, sender, receiver, stats, Arc::new(AllowAllGate))
+    }
+
+    /// Create a pipeline with an explicit inter-client forwarding gate.
+    ///
+    /// The gate is consulted in the outbound loop before a decrypted packet is
+    /// written to the TUN; a `false` decision drops the packet (default-deny
+    /// inter-client enforcement, FRD-003).
+    pub fn with_gate(
+        tun: T,
+        channel: EncryptedChannel,
+        sender: S,
+        receiver: R,
+        stats: Arc<TrafficStats>,
+        gate: Arc<dyn ForwardGate>,
+    ) -> Self {
         Self {
             tun,
             channel: Mutex::new(channel),
             sender,
             receiver,
             stats,
+            gate,
         }
     }
 
@@ -205,6 +273,11 @@ where
                 ch.recv(&encrypted)?
             };
 
+            if !self.gate.allow(&plaintext).await {
+                // Inter-client forwarding denied (default-deny, FRD-003): drop.
+                continue;
+            }
+
             self.tun.send(&plaintext).await?;
             self.stats.bytes_received.fetch_add(plaintext.len() as u64, Ordering::Relaxed);
         }
@@ -213,14 +286,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::crypto::aead::KEY_LEN;
-    use crate::transport::encrypted_channel::EncryptedChannel;
-    use crate::tunnel::mock_tun::MockTun;
-    use crate::tunnel::tun_device::DEFAULT_TUNNEL_MTU;
     use std::sync::Arc;
-    use tokio::sync::Mutex as TokioMutex;
-    use tokio::sync::mpsc;
+
+    use tokio::sync::{Mutex as TokioMutex, mpsc};
+
+    use super::*;
+    use crate::{
+        crypto::aead::KEY_LEN,
+        transport::encrypted_channel::EncryptedChannel,
+        tunnel::{mock_tun::MockTun, tun_device::DEFAULT_TUNNEL_MTU},
+    };
 
     const TEST_TX_KEY: [u8; KEY_LEN] = [0x01; KEY_LEN];
     const TEST_RX_KEY: [u8; KEY_LEN] = [0x02; KEY_LEN];
@@ -424,6 +499,78 @@ mod tests {
         cancel.cancel();
         let _ = client_task.await;
         let _ = proxy_task.await;
+    }
+
+    // --- Inter-client forwarding gate (FRD-003) ---
+
+    /// Build a minimal IPv4 packet with the given destination address.
+    fn ipv4_packet_to(dst: std::net::Ipv4Addr) -> Vec<u8> {
+        let mut pkt = vec![0u8; IPV4_MIN_HEADER_LEN];
+        pkt[0] = IPV4_VERSION << 4; // version 4, IHL nibble irrelevant for dst parse
+        pkt[IPV4_DST_OFFSET..IPV4_DST_OFFSET + 4].copy_from_slice(&dst.octets());
+        pkt
+    }
+
+    // ipv4_destination parses the dst of a well-formed IPv4 packet
+    #[test]
+    fn ipv4_destination_parses_dst() {
+        let dst = std::net::Ipv4Addr::new(10, 66, 66, 5);
+        assert_eq!(ipv4_destination(&ipv4_packet_to(dst)), Some(dst));
+    }
+
+    // ipv4_destination fails closed on short / non-IPv4 input
+    #[test]
+    fn ipv4_destination_rejects_malformed() {
+        assert_eq!(ipv4_destination(&[]), None, "empty");
+        assert_eq!(ipv4_destination(&[0x45, 0x00]), None, "too short");
+        let mut v6 = vec![0u8; IPV4_MIN_HEADER_LEN];
+        v6[0] = 6 << 4;
+        assert_eq!(ipv4_destination(&v6), None, "IPv6 version nibble");
+    }
+
+    // A dropping gate stops the outbound packet from reaching the TUN
+    #[tokio::test]
+    async fn gate_drops_denied_packet() {
+        struct DenyGate;
+        impl ForwardGate for DenyGate {
+            fn allow<'a>(&'a self, _p: &'a [u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+                Box::pin(async { false })
+            }
+        }
+
+        let (client_tun, client_handle) = MockTun::new(DEFAULT_TUNNEL_MTU);
+        let (endpoint_a, endpoint_b) = MockDatagramEndpoint::new_pair();
+        let endpoint_a = Arc::new(endpoint_a);
+        let endpoint_b = Arc::new(endpoint_b);
+
+        let channel = EncryptedChannel::new(TEST_TX_KEY, TEST_RX_KEY);
+        let pipeline = TunnelPipeline::with_gate(
+            client_tun,
+            channel,
+            Arc::clone(&endpoint_a),
+            Arc::clone(&endpoint_a),
+            Arc::new(TrafficStats::new()),
+            Arc::new(DenyGate),
+        );
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let pipeline_handle = tokio::spawn(async move { pipeline.run(cancel_clone).await });
+
+        // Send a packet from the remote side; the deny gate must drop it.
+        let original = b"denied-inter-client";
+        let encrypted = {
+            let mut enc = EncryptedChannel::new(TEST_RX_KEY, TEST_TX_KEY);
+            enc.send(original).expect("encrypt")
+        };
+        endpoint_b.tx.send(encrypted).await.expect("send");
+
+        // No packet should reach the TUN.
+        let captured = tokio::time::timeout(std::time::Duration::from_millis(300), client_handle.capture_packet()).await;
+        assert!(captured.is_err(), "denied packet must not reach the TUN");
+
+        cancel.cancel();
+        let _ = pipeline_handle.await;
     }
 
     // T-7: Oversized packet dropped

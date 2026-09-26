@@ -15,13 +15,11 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::handshake::noise_ik::KeyPair;
-use crate::transport::ClientTransport;
-use crate::transport::encrypted_channel::EncryptedChannel;
-use crate::transport::traits::ClientConnectParams;
-use crate::tunnel::TunnelError;
-use crate::tunnel::pipeline::TrafficStats;
-use crate::tunnel::tun_device::TunDevice;
+use crate::{
+    handshake::noise_ik::KeyPair,
+    transport::{ClientTransport, encrypted_channel::EncryptedChannel, traits::ClientConnectParams},
+    tunnel::{TunnelError, pipeline::TrafficStats, tun_device::TunDevice},
+};
 
 /// Default initial backoff delay in milliseconds.
 pub const DEFAULT_BACKOFF_INITIAL_MS: u64 = 1000;
@@ -112,6 +110,10 @@ pub struct ReconnectCryptoParams<'a> {
 /// transport connection and torn down before retrying or exiting. This
 /// ensures routing only exists while the tunnel is active.
 ///
+/// When `registrar` is provided, prrr publishes its ecosystem descriptor
+/// (SPEC §3) on tunnel up and updates it to the not-connected state on tunnel
+/// down. Registration is best-effort and never blocks the tunnel.
+///
 /// Exits cleanly when `cancel` is triggered (returns `Ok(())`).
 /// Only retries on transport/pipeline errors, not on cancellation.
 pub async fn run_with_reconnect<T: TunDevice + Clone>(
@@ -120,6 +122,7 @@ pub async fn run_with_reconnect<T: TunDevice + Clone>(
     tun: T,
     config: &ReconnectConfig,
     mut route_manager: Option<&mut crate::routing::RouteManager>,
+    registrar: Option<&crate::ecosystem::EcosystemRegistrar>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let mut backoff = BackoffState::new(config.backoff_initial_ms, config.backoff_max_ms);
@@ -164,6 +167,10 @@ pub async fn run_with_reconnect<T: TunDevice + Clone>(
         if let Some(ref mut rm) = route_manager {
             rm.up();
         }
+        // Register with the ecosystem registry on tunnel up (best-effort).
+        if let Some(reg) = registrar {
+            reg.on_up();
+        }
 
         let channel = EncryptedChannel::new(conn.session_keys.tx_key, conn.session_keys.rx_key);
         let stats = std::sync::Arc::new(TrafficStats::new());
@@ -176,6 +183,9 @@ pub async fn run_with_reconnect<T: TunDevice + Clone>(
                 if let Some(ref mut rm) = route_manager {
                     rm.down();
                 }
+                if let Some(reg) = registrar {
+                    reg.on_down();
+                }
                 tracing::info!("tunnel pipeline exited cleanly");
                 return Ok(());
             }
@@ -184,6 +194,9 @@ pub async fn run_with_reconnect<T: TunDevice + Clone>(
                 if let Some(ref mut rm) = route_manager {
                     rm.down();
                 }
+                if let Some(reg) = registrar {
+                    reg.on_down();
+                }
                 tracing::info!("tunnel pipeline cancelled — shutting down");
                 return Ok(());
             }
@@ -191,6 +204,9 @@ pub async fn run_with_reconnect<T: TunDevice + Clone>(
                 // Tear down routes before retry
                 if let Some(ref mut rm) = route_manager {
                     rm.down();
+                }
+                if let Some(reg) = registrar {
+                    reg.on_down();
                 }
                 if cancel.is_cancelled() {
                     tracing::info!("reconnect loop cancelled after pipeline error");
@@ -295,8 +311,7 @@ mod tests {
 
     #[tokio::test]
     async fn tun_device_arc_wrapper() {
-        use crate::tunnel::mock_tun::MockTun;
-        use crate::tunnel::tun_device::DEFAULT_TUNNEL_MTU;
+        use crate::tunnel::{mock_tun::MockTun, tun_device::DEFAULT_TUNNEL_MTU};
 
         let (tun, handle) = MockTun::new(DEFAULT_TUNNEL_MTU);
         let tun = std::sync::Arc::new(tun);
@@ -319,12 +334,15 @@ mod tests {
     // -- AC-7: run_with_reconnect exits cleanly on cancellation --
     // -- AC-8: run_with_reconnect resets backoff after successful connect --
 
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    };
 
-    use crate::handshake::hybrid::SessionKeys;
-    use crate::transport::TransportError;
-    use crate::transport::traits::TransportConnection;
+    use crate::{
+        handshake::hybrid::SessionKeys,
+        transport::{TransportError, traits::TransportConnection},
+    };
 
     /// Mock transport that fails N times then succeeds once (pipeline immediately errors).
     struct FailNTransport {
@@ -390,8 +408,10 @@ mod tests {
 
     /// Create a mock TransportConnection where receiver immediately returns an error.
     fn mock_transport_connection_that_errors() -> TransportConnection {
-        use crate::crypto::aead::KEY_LEN;
-        use crate::transport::traits::{BoxedDatagramReceiver, BoxedDatagramSender};
+        use crate::{
+            crypto::aead::KEY_LEN,
+            transport::traits::{BoxedDatagramReceiver, BoxedDatagramSender},
+        };
 
         struct ErrorSender;
         impl BoxedDatagramSender for ErrorSender {
@@ -420,8 +440,10 @@ mod tests {
 
     /// Create a mock TransportConnection that blocks forever on recv.
     fn mock_transport_connection() -> TransportConnection {
-        use crate::crypto::aead::KEY_LEN;
-        use crate::transport::traits::{BoxedDatagramReceiver, BoxedDatagramSender};
+        use crate::{
+            crypto::aead::KEY_LEN,
+            transport::traits::{BoxedDatagramReceiver, BoxedDatagramSender},
+        };
 
         struct NoopSender;
         impl BoxedDatagramSender for NoopSender {
@@ -477,8 +499,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconnect_retries_on_connect_error() {
-        use crate::tunnel::mock_tun::MockTun;
-        use crate::tunnel::tun_device::DEFAULT_TUNNEL_MTU;
+        use crate::tunnel::{mock_tun::MockTun, tun_device::DEFAULT_TUNNEL_MTU};
 
         let connect_count = Arc::new(AtomicU32::new(0));
         let transport = FailNTransport::new(2, Arc::clone(&connect_count));
@@ -506,15 +527,14 @@ mod tests {
             cancel_clone.cancel();
         });
 
-        let result = run_with_reconnect(&transport, &crypto.as_params(), tun, &config, None, cancel).await;
+        let result = run_with_reconnect(&transport, &crypto.as_params(), tun, &config, None, None, cancel).await;
 
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn reconnect_exits_on_cancel() {
-        use crate::tunnel::mock_tun::MockTun;
-        use crate::tunnel::tun_device::DEFAULT_TUNNEL_MTU;
+        use crate::tunnel::{mock_tun::MockTun, tun_device::DEFAULT_TUNNEL_MTU};
 
         let connect_count = Arc::new(AtomicU32::new(0));
         let transport = FailNTransport::new(0, Arc::clone(&connect_count));
@@ -541,15 +561,14 @@ mod tests {
             cancel_clone.cancel();
         });
 
-        let result = run_with_reconnect(&transport, &crypto.as_params(), tun, &config, None, cancel).await;
+        let result = run_with_reconnect(&transport, &crypto.as_params(), tun, &config, None, None, cancel).await;
 
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn reconnect_retries_on_pipeline_error() {
-        use crate::tunnel::mock_tun::MockTun;
-        use crate::tunnel::tun_device::DEFAULT_TUNNEL_MTU;
+        use crate::tunnel::{mock_tun::MockTun, tun_device::DEFAULT_TUNNEL_MTU};
 
         let connect_count = Arc::new(AtomicU32::new(0));
         let transport = PipelineErrorTransport {
@@ -580,7 +599,7 @@ mod tests {
             cancel_clone.cancel();
         });
 
-        let result = run_with_reconnect(&transport, &crypto.as_params(), tun, &config, None, cancel).await;
+        let result = run_with_reconnect(&transport, &crypto.as_params(), tun, &config, None, None, cancel).await;
 
         assert!(result.is_ok());
         assert!(connect_count.load(Ordering::Relaxed) >= min_connect_attempts);

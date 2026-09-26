@@ -227,6 +227,68 @@ Re-enable a suspended client.
 
 ---
 
+## Client-to-Client Sharing Pairs
+
+By default the server is **deny-all** for inter-client traffic: a packet from one client
+destined for another client's VPN IP is dropped. To let two clients reach each other, an
+admin must mark them as an explicit *sharing pair*. The authorization is persisted in the
+registry (SQLite) and survives a server restart. Removing the pair stops inter-client
+forwarding immediately; egress (traffic to the internet) is never affected.
+
+Pairs are stored unordered — `(A, B)` and `(B, A)` are the same authorization.
+
+### GET `/api/v1/sharing-pairs`
+
+List all allowed sharing pairs.
+
+**Response (200):**
+
+```json
+{
+  "pairs": [
+    { "client_a": "11111111-1111-1111-1111-111111111111", "client_b": "22222222-2222-2222-2222-222222222222" }
+  ]
+}
+```
+
+### POST `/api/v1/sharing-pairs`
+
+Mark two clients as an allowed sharing pair. Idempotent (allowing an existing pair succeeds).
+
+**Request:**
+
+```json
+{
+  "client_a": "11111111-1111-1111-1111-111111111111",
+  "client_b": "22222222-2222-2222-2222-222222222222"
+}
+```
+
+**Response (201):**
+
+```json
+{
+  "status": "allowed"
+}
+```
+
+Returns **400** if the two ids are equal (self-pair) or if either client id is unknown.
+
+### DELETE `/api/v1/sharing-pairs/{a}/{b}`
+
+Revoke a sharing pair. Idempotent — revoking a non-existent pair still returns 200. The next
+inter-client packet between the two clients is dropped immediately.
+
+**Response (200):**
+
+```json
+{
+  "status": "revoked"
+}
+```
+
+---
+
 ## Distribution Endpoints
 
 These endpoints support client configuration distribution via TOML export, QR codes, and shareable URLs.

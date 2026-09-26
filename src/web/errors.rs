@@ -2,8 +2,10 @@
 
 //! API error types and HTTP response mapping.
 
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use serde::Serialize;
 
 use crate::registry::RegistryError;
@@ -81,9 +83,10 @@ impl From<RegistryError> for ApiError {
 #[cfg(test)]
 mod tests {
     // FRD: specs/frds/FRD-P006.md
-    use super::*;
     use axum::http::StatusCode;
     use uuid::Uuid;
+
+    use super::*;
 
     #[test]
     fn api_error_bad_request_maps_to_400() {

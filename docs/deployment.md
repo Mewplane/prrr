@@ -503,6 +503,30 @@ Returns JSON:
 
 ## Security Hardening
 
+### Client-to-Client Sharing (Default Deny)
+
+prrr is egress-only by default: one client cannot reach another client's VPN IP. This keeps the
+attack surface minimal — there is nothing to disable. To deliberately let two clients reach each
+other (e.g. an ecosystem companion off-LAN), an admin creates an explicit *sharing pair* via the
+admin API:
+
+```bash
+# Allow two clients to communicate
+curl -s -X POST https://ADMIN_HOST:9443/api/v1/sharing-pairs \
+  -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"client_a":"<UUID-A>","client_b":"<UUID-B>"}'
+
+# List allowed pairs
+curl -s https://ADMIN_HOST:9443/api/v1/sharing-pairs -H "Authorization: Bearer $TOKEN"
+
+# Revoke (stops inter-client forwarding immediately)
+curl -s -X DELETE https://ADMIN_HOST:9443/api/v1/sharing-pairs/<UUID-A>/<UUID-B> \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Pairs persist in the registry SQLite database and survive a server restart. See
+[API: Sharing Pairs](api.md#client-to-client-sharing-pairs).
+
 ### Restrict Admin Access by IP
 
 Update firewall to allow admin access only from your IP:

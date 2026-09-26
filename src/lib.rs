@@ -16,6 +16,9 @@ pub mod crypto;
 /// Client configuration distribution: config export, QR codes, short URLs.
 pub mod distribution;
 
+/// Ecosystem registry registration (SPEC §3 descriptor publication).
+pub mod ecosystem;
+
 /// Noise protocol handshake implementations.
 pub mod handshake;
 
@@ -39,6 +42,9 @@ pub mod routing;
 
 /// Client registry for authorized VPN clients.
 pub mod registry;
+
+/// Client-to-client sharing toggle and authorized remote enable (Step 4).
+pub mod sharing;
 
 /// VPN server orchestrator.
 pub mod server;

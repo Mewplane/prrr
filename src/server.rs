@@ -6,23 +6,78 @@
 //! Provides [`run_multi_server`] for multi-client mode with registry-based
 //! authentication, per-client tunnel pipelines, and connection limits.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+};
 
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::crypto::hybrid_kex::KemKeyPair;
-use crate::handshake::hybrid::{HybridResponder, ResponderResult};
-use crate::handshake::noise_ik::KeyPair;
-use crate::registry::ClientRegistry;
-use crate::transport::encrypted_channel::EncryptedChannel;
-use crate::transport::masque::{MasqueProxy, build_masque_server_config};
-use crate::transport::quic::generate_self_signed_cert;
-use crate::tunnel::TunFactory;
-use crate::tunnel::TunnelError;
-use crate::tunnel::tun_device::TunDevice as _;
+use crate::{
+    crypto::hybrid_kex::KemKeyPair,
+    handshake::{
+        hybrid::{HybridResponder, ResponderResult},
+        noise_ik::KeyPair,
+    },
+    registry::ClientRegistry,
+    transport::{
+        encrypted_channel::EncryptedChannel,
+        masque::{MasqueProxy, build_masque_server_config},
+        quic::generate_self_signed_cert,
+    },
+    tunnel::{TunFactory, TunnelError, tun_device::TunDevice as _},
+};
+
+/// Decide whether a packet from `src_id` may be forwarded to the destination
+/// resolved as `dst` (FRD-003, default-deny inter-client routing).
+///
+/// - If `dst` is not a known client IP (egress to the internet, the gateway,
+///   etc.), forwarding is allowed — this gate only governs inter-client traffic.
+/// - If `dst` resolves to the sending client itself, it is allowed.
+/// - Otherwise the packet is an inter-client forward and is allowed **only**
+///   when an explicit sharing pair exists in the registry.
+///
+/// The function is pure with respect to the registry snapshot and is consulted
+/// on every packet, so a revoked pair stops forwarding immediately.
+fn may_forward(registry: &ClientRegistry, src_id: uuid::Uuid, dst: std::net::Ipv4Addr) -> bool {
+    match registry.client_id_for_ip(dst) {
+        None => true,                             // egress / non-client destination
+        Some(dst_id) if dst_id == src_id => true, // packet to the client's own IP
+        Some(dst_id) => registry.is_pair_allowed(src_id, dst_id),
+    }
+}
+
+/// Inter-client forwarding gate backing a per-client [`TunnelPipeline`].
+///
+/// Holds the owning client's id and a shared handle to the registry; consults
+/// [`may_forward`] on every decrypted packet (no caching, so revocation takes
+/// effect immediately). Drops are logged at debug with src/dst (no payload).
+struct SharingGate {
+    src_id: uuid::Uuid,
+    registry: Arc<Mutex<ClientRegistry>>,
+}
+
+impl crate::tunnel::pipeline::ForwardGate for SharingGate {
+    fn allow<'a>(&'a self, packet: &'a [u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(dst) = crate::tunnel::pipeline::ipv4_destination(packet) else {
+                // Unparseable destination: not an inter-client forward, allow
+                // (existing oversize/parse handling applies downstream).
+                return true;
+            };
+            let reg = self.registry.lock().await;
+            let allowed = may_forward(&reg, self.src_id, dst);
+            if !allowed {
+                tracing::debug!(src = %self.src_id, dst = %dst, "dropping inter-client packet: no sharing pair");
+            }
+            allowed
+        })
+    }
+}
 
 /// Perform the hybrid handshake as the server (responder) over MASQUE datagrams.
 ///
@@ -182,12 +237,7 @@ pub async fn run_multi_server_on_endpoint<F: TunFactory>(
                 counter: Arc::clone(&active_count),
             };
 
-            let result = handle_client(
-                incoming,
-                &ctx,
-                client_cancel,
-            )
-            .await;
+            let result = handle_client(incoming, &ctx, client_cancel).await;
 
             if let Err(e) = &result {
                 tracing::warn!("client handler error: {e}");
@@ -356,7 +406,12 @@ async fn handle_client<F: TunFactory>(
 
     let proxy = Arc::new(proxy);
     let stats = Arc::new(crate::tunnel::pipeline::TrafficStats::new());
-    let pipeline = crate::tunnel::pipeline::TunnelPipeline::new(tun, channel, Arc::clone(&proxy), Arc::clone(&proxy), Arc::clone(&stats));
+    let gate = Arc::new(SharingGate {
+        src_id: client_id,
+        registry: Arc::clone(registry),
+    });
+    let pipeline =
+        crate::tunnel::pipeline::TunnelPipeline::with_gate(tun, channel, Arc::clone(&proxy), Arc::clone(&proxy), Arc::clone(&stats), gate);
 
     tracing::info!("pipeline running for client {client_id}");
     let pipeline_result = pipeline.run(cancel).await;
@@ -514,8 +569,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tunnel::MockTun;
-    use crate::tunnel::tun_device::{DEFAULT_TUNNEL_MTU, TunDevice};
+    use crate::tunnel::{
+        MockTun,
+        tun_device::{DEFAULT_TUNNEL_MTU, TunDevice},
+    };
 
     const TEST_SERVER_NAME: &str = "localhost";
     const TEST_LISTEN_ADDR: &str = "127.0.0.1:0";
@@ -536,12 +593,58 @@ mod tests {
         registry.add(name, *keypair.public_key(), None).expect("register client");
     }
 
+    // --- Inter-client forwarding decision (FRD-003) ---
+
+    /// Register a client and return its (id, ip).
+    fn add_client(reg: &mut ClientRegistry, name: &str, fill: u8) -> (uuid::Uuid, std::net::Ipv4Addr) {
+        let r = reg.add(name, [fill; 32], None).expect("add client");
+        (r.id, r.ip_address)
+    }
+
+    // E-1: egress (non-client dst) is always allowed
+    #[test]
+    fn may_forward_allows_egress() {
+        let mut reg = ClientRegistry::new(TEST_SUBNET).expect("registry");
+        let (a, _) = add_client(&mut reg, "a", 0x01);
+        assert!(may_forward(&reg, a, std::net::Ipv4Addr::new(8, 8, 8, 8)), "egress must be allowed");
+    }
+
+    // E-2/E-3: allowed pair forwards; unpaired pair is denied
+    #[test]
+    fn may_forward_pair_gated() {
+        let mut reg = ClientRegistry::new(TEST_SUBNET).expect("registry");
+        let (a, _) = add_client(&mut reg, "a", 0x01);
+        let (b, b_ip) = add_client(&mut reg, "b", 0x02);
+
+        assert!(!may_forward(&reg, a, b_ip), "default-deny: unpaired must be dropped");
+        reg.allow_pair(a, b).expect("allow");
+        assert!(may_forward(&reg, a, b_ip), "allowed pair must forward");
+    }
+
+    // E-4: revoke takes effect immediately
+    #[test]
+    fn may_forward_revoke_immediate() {
+        let mut reg = ClientRegistry::new(TEST_SUBNET).expect("registry");
+        let (a, _) = add_client(&mut reg, "a", 0x01);
+        let (b, b_ip) = add_client(&mut reg, "b", 0x02);
+        reg.allow_pair(a, b).expect("allow");
+        assert!(may_forward(&reg, a, b_ip));
+        reg.revoke_pair(a, b).expect("revoke");
+        assert!(!may_forward(&reg, a, b_ip), "revoked pair must be dropped immediately");
+    }
+
+    // E-5: a client may always reach its own IP
+    #[test]
+    fn may_forward_self_allowed() {
+        let mut reg = ClientRegistry::new(TEST_SUBNET).expect("registry");
+        let (a, a_ip) = add_client(&mut reg, "a", 0x01);
+        assert!(may_forward(&reg, a, a_ip), "client may reach its own IP");
+    }
+
     // AC-6: TunFactory trait creates per-client TUN
     #[test]
     fn tun_factory_creates_tun() {
-        use crate::tunnel::MockTunFactory;
-        use crate::tunnel::TunConfig;
-        use crate::tunnel::TunFactory as _;
+        use crate::tunnel::{MockTunFactory, TunConfig, TunFactory as _};
 
         let factory = MockTunFactory::new(DEFAULT_TUNNEL_MTU);
         let config = TunConfig::new(std::net::Ipv4Addr::new(10, 0, 0, 1));
@@ -1048,9 +1151,11 @@ mod tests {
     // T-P003-14: Integration — KeyStore keys → base64 resolution → client connects
     #[tokio::test]
     async fn integration_keystore_to_client_round_trip() {
-        use crate::config::{resolve_server_kem_key, resolve_server_noise_key};
-        use crate::keys::KeyStore;
-        use crate::tunnel::MockTunFactory;
+        use crate::{
+            config::{resolve_server_kem_key, resolve_server_noise_key},
+            keys::KeyStore,
+            tunnel::MockTunFactory,
+        };
 
         init_crypto_provider();
 
@@ -1372,13 +1477,129 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(TEST_TIMEOUT_SECS), client_task).await;
     }
 
+    // FRD: specs/frds/FRD-003-server-client-to-client-authorization.md
+    // X-1: e2e inter-client enforcement through the real handle_client pipeline.
+    //
+    // Client A sends an IPv4 packet destined for client B's VPN IP. With no
+    // sharing pair, the server's SharingGate drops it before it reaches A's
+    // server-side TUN. After allowing the pair, an identical packet is delivered.
+    #[tokio::test]
+    async fn e2e_inter_client_gated_by_sharing_pair() {
+        use crate::tunnel::CapturingMockTunFactory;
+
+        /// Build a minimal IPv4 packet addressed to `dst`.
+        fn ipv4_to(dst: std::net::Ipv4Addr) -> Vec<u8> {
+            let mut pkt = vec![0u8; 20];
+            pkt[0] = 4 << 4; // IPv4
+            pkt[16..20].copy_from_slice(&dst.octets());
+            pkt
+        }
+
+        let settle_ms: u64 = 500;
+        let drop_window_ms: u64 = 400;
+        let deliver_timeout_secs: u64 = 3;
+
+        let harness = TestHarness::new();
+        let actual_addr = harness.actual_addr;
+        let server_noise_pub = harness.server_noise_pub;
+        let server_kem_pub = harness.server_kem_pub.clone();
+
+        let mut registry = ClientRegistry::new(TEST_SUBNET).expect("registry");
+        let client_a = KeyPair::generate().expect("client a keypair");
+        let client_b = KeyPair::generate().expect("client b keypair");
+        register_client(&mut registry, "client-a", &client_a);
+        register_client(&mut registry, "client-b", &client_b);
+        // Resolve ids/IPs.
+        let (a_id, b_ip) = {
+            let a = registry.get_by_public_key(client_a.public_key()).expect("a");
+            let b = registry.get_by_public_key(client_b.public_key()).expect("b");
+            (a.id, b.ip_address)
+        };
+        let b_id = registry.get_by_public_key(client_b.public_key()).expect("b").id;
+
+        let registry = Arc::new(Mutex::new(registry));
+        let tun_factory = Arc::new(CapturingMockTunFactory::new(DEFAULT_TUNNEL_MTU));
+        let cancel = CancellationToken::new();
+
+        let server_task = {
+            let cancel = cancel.clone();
+            let registry = Arc::clone(&registry);
+            let tun_factory = Arc::clone(&tun_factory);
+            tokio::spawn(async move {
+                run_multi_server_on_endpoint(
+                    harness.endpoint,
+                    &harness.server_noise,
+                    harness.server_kem,
+                    MultiServerParams {
+                        registry,
+                        max_clients: TEST_MAX_CLIENTS,
+                        tun_factory,
+                        cancel,
+                        active_connections: Arc::new(AtomicU32::new(0)),
+                        active_clients: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                    },
+                )
+                .await
+            })
+        };
+
+        // Connect client A only (we drive packets from A toward B's IP).
+        let (a_tun, a_handle) = MockTun::new(DEFAULT_TUNNEL_MTU);
+        let a_cancel = cancel.child_token();
+        let client_task = tokio::spawn(async move {
+            crate::client::run_client(
+                actual_addr,
+                TEST_SERVER_NAME,
+                &client_a,
+                &server_noise_pub,
+                &server_kem_pub,
+                a_tun,
+                25,
+                300,
+                true,
+                a_cancel,
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
+
+        let server_handles = tun_factory.take_handles();
+        assert_eq!(server_handles.len(), 1, "server created one TUN for client A");
+        let a_server_tun = &server_handles[0];
+
+        // --- Denied: no sharing pair → packet to B's IP is dropped ---
+        a_handle.inject_packet(&ipv4_to(b_ip)).await.expect("inject denied");
+        let denied = tokio::time::timeout(std::time::Duration::from_millis(drop_window_ms), a_server_tun.capture_packet()).await;
+        assert!(denied.is_err(), "unpaired inter-client packet must be dropped");
+
+        // --- Allowed: create the pair, identical packet is delivered ---
+        registry.lock().await.allow_pair(a_id, b_id).expect("allow pair");
+        a_handle.inject_packet(&ipv4_to(b_ip)).await.expect("inject allowed");
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(deliver_timeout_secs), a_server_tun.capture_packet())
+            .await
+            .expect("timeout waiting for delivery")
+            .expect("server TUN capture");
+        assert_eq!(
+            crate::tunnel::pipeline::ipv4_destination(&delivered),
+            Some(b_ip),
+            "allowed packet reaches the TUN"
+        );
+
+        drop(server_handles);
+        cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(TEST_TIMEOUT_SECS), server_task).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(TEST_TIMEOUT_SECS), client_task).await;
+    }
+
     // FRD: specs/frds/FRD-20260223-masque-transport-traits.md
     // T-S11-1: MasqueServerTransport::name() returns "masque"
     #[test]
     fn masque_server_transport_name() {
-        use crate::transport::traits::ServerTransport;
-        use crate::tunnel::MockTunFactory;
-        use crate::tunnel::tun_device::DEFAULT_TUNNEL_MTU;
+        use crate::{
+            transport::traits::ServerTransport,
+            tunnel::{MockTunFactory, tun_device::DEFAULT_TUNNEL_MTU},
+        };
 
         let transport = MasqueServerTransport::new(
             TEST_LISTEN_ADDR.parse().expect("valid addr"),
@@ -1394,9 +1615,10 @@ mod tests {
     // T-S11-2: MasqueServerTransport can be used as Box<dyn ServerTransport>
     #[test]
     fn masque_server_transport_trait_object() {
-        use crate::transport::traits::ServerTransport;
-        use crate::tunnel::MockTunFactory;
-        use crate::tunnel::tun_device::DEFAULT_TUNNEL_MTU;
+        use crate::{
+            transport::traits::ServerTransport,
+            tunnel::{MockTunFactory, tun_device::DEFAULT_TUNNEL_MTU},
+        };
 
         let transport: Box<dyn ServerTransport> = Box::new(MasqueServerTransport::new(
             TEST_LISTEN_ADDR.parse().expect("valid addr"),
@@ -1412,9 +1634,10 @@ mod tests {
     // T-S11-3: MasqueServerTransport::run() starts and shuts down cleanly
     #[tokio::test]
     async fn masque_server_transport_run_shutdown() {
-        use crate::transport::traits::{ServerTransport, SharedServerState};
-        use crate::tunnel::MockTunFactory;
-        use crate::tunnel::tun_device::DEFAULT_TUNNEL_MTU;
+        use crate::{
+            transport::traits::{ServerTransport, SharedServerState},
+            tunnel::{MockTunFactory, tun_device::DEFAULT_TUNNEL_MTU},
+        };
 
         init_crypto_provider();
 

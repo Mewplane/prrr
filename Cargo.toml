@@ -22,6 +22,7 @@ chacha20poly1305 = "0.10.1"
 clap = { version = "4.5", features = ["derive", "env"] }
 hkdf = "0.12.4"
 hmac = "0.12.1"
+if-addrs = "0.15.0"
 ipnet = "2.11.0"
 md-5 = "0.10.6"
 ml-kem = "0.2.2"
@@ -41,6 +42,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 tokio-tun = { version = "0.15.2", optional = true }
 tokio-util = "0.7"
 toml = "1.0"
+toml_edit = "0.22.27"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -87,6 +89,9 @@ criterion = { version = "0.5", features = ["html_reports"] }
 hex-literal = "0.4.1"
 prrr-mobile = { path = "prrr-mobile", default-features = false }
 tempfile = "3"
+# Same `time` crate rcgen uses for cert validity; lets diagnostics tests express
+# cert expiry relative to the current clock instead of a fixed calendar date.
+time = "0.3"
 tower = { version = "0.5", features = ["util"] }
 
 [[bench]]

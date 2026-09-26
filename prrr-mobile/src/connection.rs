@@ -1,13 +1,13 @@
 // FRD: specs/frds/FRD-M024-tunnel-pipeline-integration.md
 
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::{
+    sync::{atomic::Ordering, Arc, RwLock},
+    time::{Duration, Instant},
+};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::transport_imports::TrafficStats;
-use crate::{MobileError, VpnConfig};
+use crate::{transport_imports::TrafficStats, MobileError, VpnConfig};
 
 /// Default timeout for HARP transport connection attempts.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -355,7 +355,9 @@ async fn attempt_masque_connection(
         Err(_) => {
             // Try DNS resolution (endpoint is likely "hostname:port")
             use std::net::ToSocketAddrs;
-            config.server_endpoint.to_socket_addrs()
+            config
+                .server_endpoint
+                .to_socket_addrs()
                 .map_err(|e| MobileError::ConnectionFailed {
                     reason: format!("DNS resolution failed for {}: {e}", config.server_endpoint),
                 })?
@@ -424,6 +426,7 @@ mod tests {
             mtu: TEST_MTU,
             preferred_binding: None,
             transport_protocol: None,
+            full_tunnel: None,
         }
     }
 

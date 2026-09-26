@@ -179,6 +179,62 @@ Recommendations:
   - Verify firewall allows UDP port 443
 ```
 
+### Selected resource routing
+
+Manage the hostnames routed through the VPN without editing the TOML by hand:
+
+```bash
+prrr client --config /etc/prrr/client.toml route add chatgpt.com
+prrr client --config /etc/prrr/client.toml route add claude.ai
+prrr client --config /etc/prrr/client.toml route add youtube.com
+prrr client --config /etc/prrr/client.toml route add telegram.org
+prrr client --config /etc/prrr/client.toml route list
+prrr client --config /etc/prrr/client.toml route remove youtube.com
+```
+
+`route add` is idempotent. `route remove` fails if the hostname is not
+configured. The command updates only `[routing].resources` and replaces the
+file atomically, preserving unrelated configuration and comments. Restart the
+client after changing resources so DNS is resolved again and the new `/32`
+routes are installed. Use hostnames, not URLs or wildcard entries; IPv6-only
+answers are not supported by the current IPv4 client tunnel.
+
+### Client-to-Client Sharing (FRD-004)
+
+Opt a client into inter-client routing (the ecosystem off-LAN mesh, SPEC §6).
+Sharing is **off by default**; it is the single explicit capability switch.
+
+```bash
+prrr sharing enable     # opt this client into inter-client routing
+prrr sharing disable    # opt out (and drop any learned peer mesh address)
+prrr sharing status     # show enabled/disabled + peer mesh address
+```
+
+`status` prints the live on-disk state:
+
+```
+sharing: enabled
+peer mesh address: 100.64.0.2:51820
+```
+
+The peer mesh address is `none` until sharing is **established** — i.e. enabled
+and the inter-client route confirmed reachable by a probe. Once established it
+shows the authorized peer's reachable `host:port`, and `disable` clears it back
+to `none`. State is persisted to `$HOME/.config/prrr/sharing.json` (atomic
+write; a missing or corrupt file is read as **disabled** — fail-closed). The
+running daemon honors this state when deciding whether to accept the inter-client
+route, reflects it in the ecosystem descriptor's `flags.client_to_client`, and —
+once probed reachable — publishes the address into `flags.mesh_peer_addr` so a
+sibling reaches the laptop off-LAN with zero configuration (see
+`docs/ecosystem.md`).
+
+**prrr stays the enforcement point.** Sharing also accepts an *authorized remote
+enable request* relayed from `sy`/cathouse (SPEC §9.4), but prrr honors it **only**
+when (a) the server-side sharing-pair authorization exists and (b) the request
+carries a per-use biometric signature that verifies. An unauthorized or unsigned
+request is refused with no state change. The local CLI toggle above is always
+available regardless of the relay.
+
 ### Client Connection Flow
 
 The client:

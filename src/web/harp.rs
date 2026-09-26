@@ -22,34 +22,49 @@
 //! Also provides the [`create_session`] handler for `POST /api/v1/harp/session`
 //! which performs the hybrid Noise IK + ML-KEM-768 handshake over HTTP.
 
-use std::net::Ipv4Addr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    net::Ipv4Addr,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
-use axum::Json;
-use axum::extract::{FromRequest, Path, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL;
+use axum::{
+    Json,
+    extract::{FromRequest, Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD as BASE64_URL},
+};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::crypto::hybrid_kex::KemKeyPair;
-use crate::handshake::hybrid::{HybridResponder, SessionKeys};
-use crate::handshake::noise_ik::KeyPair;
-use crate::registry::{ClientRecord, ClientRegistry, ConnectionEvent};
-use crate::transport::encrypted_channel::EncryptedChannel;
-use crate::transport::harp::{HARP_MAX_PAYLOAD_LEN, HarpFrameReader, HarpFrameType, HarpReceiver, HarpSender};
-use crate::tunnel::TunFactory;
-use crate::tunnel::pipeline::{TrafficStats, TunnelPipeline};
-use crate::tunnel::tun_device::TunDevice as _;
-use crate::web::state::AppState;
+use crate::{
+    crypto::hybrid_kex::KemKeyPair,
+    handshake::{
+        hybrid::{HybridResponder, SessionKeys},
+        noise_ik::KeyPair,
+    },
+    registry::{ClientRecord, ClientRegistry, ConnectionEvent},
+    transport::{
+        encrypted_channel::EncryptedChannel,
+        harp::{HARP_MAX_PAYLOAD_LEN, HarpFrameReader, HarpFrameType, HarpReceiver, HarpSender},
+    },
+    tunnel::{
+        TunFactory,
+        pipeline::{TrafficStats, TunnelPipeline},
+        tun_device::TunDevice as _,
+    },
+    web::state::AppState,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1209,10 +1224,12 @@ mod tests {
 
     /// Build an `AppState` with real server keypairs for handshake testing.
     fn harp_test_app_state() -> AppState {
-        use crate::config::DEFAULT_SESSION_TIMEOUT;
-        use crate::distribution::{ConfigTokenStore, ServerContext};
-        use crate::registry::ClientRegistry;
-        use crate::web::handlers::{ServerConfigResponse, TransportInfoResponse};
+        use crate::{
+            config::DEFAULT_SESSION_TIMEOUT,
+            distribution::{ConfigTokenStore, ServerContext},
+            registry::ClientRegistry,
+            web::handlers::{ServerConfigResponse, TransportInfoResponse},
+        };
 
         let noise_keypair = KeyPair::generate().expect("noise keypair");
         let kem_keypair = KemKeyPair::generate();
@@ -1313,8 +1330,7 @@ mod tests {
 
     /// Send a POST to /api/v1/harp/session and return the response.
     async fn post_session(app: &axum::Router, body: serde_json::Value) -> axum::response::Response {
-        use axum::body::Body;
-        use axum::http::Request;
+        use axum::{body::Body, http::Request};
         use tower::ServiceExt;
 
         let req = Request::builder()
@@ -2200,8 +2216,7 @@ mod tests {
 
     /// Build an `AppState` with a `DefaultHarpTunnelSpawner` backed by `CapturingMockTunFactory`.
     fn harp_test_app_state_with_spawner(max_clients: u32) -> (AppState, Arc<crate::tunnel::CapturingMockTunFactory>) {
-        use crate::tunnel::CapturingMockTunFactory;
-        use crate::tunnel::tun_device::DEFAULT_TUNNEL_MTU;
+        use crate::tunnel::{CapturingMockTunFactory, tun_device::DEFAULT_TUNNEL_MTU};
 
         let tun_factory = Arc::new(CapturingMockTunFactory::new(DEFAULT_TUNNEL_MTU));
         let spawner: Arc<dyn HarpTunnelSpawner> = Arc::new(DefaultHarpTunnelSpawner::new(Arc::clone(&tun_factory), max_clients));
@@ -2541,8 +2556,9 @@ mod tests {
     // Polling Transport Tests (FRD-20260223-harp-polling-transport.md)
     // -----------------------------------------------------------------------
 
-    use crate::transport::harp::HarpFrame;
     use tower::ServiceExt;
+
+    use crate::transport::harp::HarpFrame;
 
     /// Build a POST request with binary body for polling endpoints.
     fn build_poll_request(uri: &str, body: Vec<u8>) -> axum::http::Request<axum::body::Body> {
@@ -2832,9 +2848,10 @@ mod tests {
     // T-S12-3: HarpServerTransport::name() returns "harp"
     #[test]
     fn harp_server_transport_name() {
-        use crate::transport::traits::ServerTransport;
-        use crate::tunnel::MockTunFactory;
-        use crate::tunnel::tun_device::DEFAULT_TUNNEL_MTU;
+        use crate::{
+            transport::traits::ServerTransport,
+            tunnel::{MockTunFactory, tun_device::DEFAULT_TUNNEL_MTU},
+        };
 
         let transport = HarpServerTransport::new(
             "127.0.0.1:0".parse().expect("valid addr"),
@@ -2850,9 +2867,10 @@ mod tests {
     // T-S12-4: HarpServerTransport can be used as Box<dyn ServerTransport>
     #[test]
     fn harp_server_transport_trait_object() {
-        use crate::transport::traits::ServerTransport;
-        use crate::tunnel::MockTunFactory;
-        use crate::tunnel::tun_device::DEFAULT_TUNNEL_MTU;
+        use crate::{
+            transport::traits::ServerTransport,
+            tunnel::{MockTunFactory, tun_device::DEFAULT_TUNNEL_MTU},
+        };
 
         let transport: Box<dyn ServerTransport> = Box::new(HarpServerTransport::new(
             "127.0.0.1:0".parse().expect("valid addr"),
@@ -2868,11 +2886,12 @@ mod tests {
     // T-S12-5: HarpServerTransport::run() starts and shuts down cleanly
     #[tokio::test]
     async fn harp_server_transport_run_shutdown() {
-        use crate::crypto::hybrid_kex::KemKeyPair;
-        use crate::handshake::noise_ik::KeyPair;
-        use crate::transport::traits::{ServerTransport, SharedServerState};
-        use crate::tunnel::MockTunFactory;
-        use crate::tunnel::tun_device::DEFAULT_TUNNEL_MTU;
+        use crate::{
+            crypto::hybrid_kex::KemKeyPair,
+            handshake::noise_ik::KeyPair,
+            transport::traits::{ServerTransport, SharedServerState},
+            tunnel::{MockTunFactory, tun_device::DEFAULT_TUNNEL_MTU},
+        };
 
         let noise_kp = Arc::new(KeyPair::generate().expect("noise keypair"));
         let kem_kp = Arc::new(KemKeyPair::generate());
@@ -3026,8 +3045,7 @@ mod tests {
     // AC-1: H2 upload handler forwards DATA frames to session channel
     #[tokio::test]
     async fn h2_upload_forwards_data_to_channel() {
-        use axum::body::Body;
-        use axum::http::Request;
+        use axum::{body::Body, http::Request};
         use tower::ServiceExt;
 
         let (router, session_id, session) = h2_test_router_with_session();
@@ -3059,8 +3077,7 @@ mod tests {
     // AC-2: H2 upload handler skips KEEPALIVE frames
     #[tokio::test]
     async fn h2_upload_skips_keepalive() {
-        use axum::body::Body;
-        use axum::http::Request;
+        use axum::{body::Body, http::Request};
         use tower::ServiceExt;
 
         let (router, session_id, session) = h2_test_router_with_session();
@@ -3099,8 +3116,7 @@ mod tests {
     // AC-3: H2 upload handler updates last_activity on each frame
     #[tokio::test]
     async fn h2_upload_updates_last_activity() {
-        use axum::body::Body;
-        use axum::http::Request;
+        use axum::{body::Body, http::Request};
         use tower::ServiceExt;
 
         let (router, session_id, session) = h2_test_router_with_session();
@@ -3128,8 +3144,7 @@ mod tests {
     // AC-4: H2 upload returns 200 OK for unknown session
     #[tokio::test]
     async fn h2_upload_unknown_session_returns_200() {
-        use axum::body::Body;
-        use axum::http::Request;
+        use axum::{body::Body, http::Request};
         use tower::ServiceExt;
 
         let state = harp_test_app_state();
@@ -3153,8 +3168,7 @@ mod tests {
     // AC-5: H2 download handler streams frames from session channel
     #[tokio::test]
     async fn h2_download_streams_from_channel() {
-        use axum::body::Body;
-        use axum::http::Request;
+        use axum::{body::Body, http::Request};
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 
@@ -3195,8 +3209,7 @@ mod tests {
     // AC-6: H2 download handler updates last_activity on each frame
     #[tokio::test]
     async fn h2_download_updates_last_activity() {
-        use axum::body::Body;
-        use axum::http::Request;
+        use axum::{body::Body, http::Request};
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 
@@ -3236,8 +3249,7 @@ mod tests {
     // AC-7: H2 download returns 200 OK for unknown session
     #[tokio::test]
     async fn h2_download_unknown_session_returns_200() {
-        use axum::body::Body;
-        use axum::http::Request;
+        use axum::{body::Body, http::Request};
         use tower::ServiceExt;
 
         let state = harp_test_app_state();
@@ -3259,8 +3271,7 @@ mod tests {
     // AC-8: Download route accepts GET method
     #[tokio::test]
     async fn h2_download_accepts_get() {
-        use axum::body::Body;
-        use axum::http::Request;
+        use axum::{body::Body, http::Request};
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 

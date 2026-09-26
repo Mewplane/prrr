@@ -6,9 +6,11 @@
 //! assigned IP addresses, backed by SQLite for persistence.
 //! Clients are identified by their Noise IK X25519 public key.
 
-use std::collections::BTreeSet;
-use std::net::Ipv4Addr;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeSet,
+    net::Ipv4Addr,
+    path::{Path, PathBuf},
+};
 
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -36,7 +38,7 @@ pub const REGISTRY_FILENAME: &str = "clients.json";
 pub const DATABASE_FILENAME: &str = "clients.db";
 
 /// Current schema version.
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 /// Status string stored in SQLite for active clients.
 const STATUS_ACTIVE: &str = "active";
@@ -620,6 +622,84 @@ impl ClientRegistry {
         Ipv4Addr::from(u32::from(self.network_addr) + 1)
     }
 
+    // -- Client-to-client sharing pairs (FRD-003) -----------------------------
+
+    /// Mark two clients as an allowed sharing pair (default is deny).
+    ///
+    /// The pair is stored canonically so `(a, b)` and `(b, a)` are the same
+    /// authorization. Allowing an already-allowed pair is idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::Database`] on SQLite errors.
+    pub fn allow_pair(&mut self, a: Uuid, b: Uuid) -> Result<(), RegistryError> {
+        let (lo, hi) = canonical_pair(a, b);
+        self.conn.execute(
+            "INSERT OR IGNORE INTO sharing_pairs (client_a, client_b) VALUES (?1, ?2)",
+            params![lo, hi],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a sharing-pair authorization. Revoking a missing pair is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::Database`] on SQLite errors.
+    pub fn revoke_pair(&mut self, a: Uuid, b: Uuid) -> Result<(), RegistryError> {
+        let (lo, hi) = canonical_pair(a, b);
+        self.conn
+            .execute("DELETE FROM sharing_pairs WHERE client_a = ?1 AND client_b = ?2", params![lo, hi])?;
+        Ok(())
+    }
+
+    /// Return `true` only if an explicit allow exists for the pair (default deny).
+    pub fn is_pair_allowed(&self, a: Uuid, b: Uuid) -> bool {
+        let (lo, hi) = canonical_pair(a, b);
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sharing_pairs WHERE client_a = ?1 AND client_b = ?2)",
+                params![lo, hi],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false)
+    }
+
+    /// List all allowed sharing pairs as canonical `(lo, hi)` UUID tuples.
+    pub fn list_pairs(&self) -> Vec<(Uuid, Uuid)> {
+        let Ok(mut stmt) = self
+            .conn
+            .prepare("SELECT client_a, client_b FROM sharing_pairs ORDER BY client_a, client_b")
+        else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map([], |row| {
+            let a: String = row.get(0)?;
+            let b: String = row.get(1)?;
+            Ok((a, b))
+        }) else {
+            return Vec::new();
+        };
+        rows.filter_map(|r| r.ok())
+            .filter_map(|(a, b)| Some((Uuid::parse_str(&a).ok()?, Uuid::parse_str(&b).ok()?)))
+            .collect()
+    }
+
+    /// Resolve a non-revoked client's UUID from its assigned VPN IP address.
+    ///
+    /// Returns `None` if no active/suspended client holds that IP (e.g. the
+    /// address is the gateway or an egress destination).
+    pub fn client_id_for_ip(&self, ip: Ipv4Addr) -> Option<Uuid> {
+        self.conn
+            .query_row(
+                "SELECT id FROM clients WHERE ip_address = ?1 AND status != ?2",
+                params![ip.to_string(), STATUS_REVOKED],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|s| Uuid::parse_str(&s).ok())
+    }
+
     // -- Legacy persistence (no-ops with SQLite) ------------------------------
 
     /// Save the registry (no-op with SQLite — data is auto-persisted).
@@ -733,11 +813,28 @@ fn run_migrations(conn: &rusqlite::Connection) -> Result<(), RegistryError> {
         )?;
     }
 
+    if version < 3 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sharing_pairs (
+                 client_a TEXT NOT NULL,
+                 client_b TEXT NOT NULL,
+                 PRIMARY KEY (client_a, client_b)
+             );",
+        )?;
+    }
+
     if version < SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
 
     Ok(())
+}
+
+/// Canonically order a pair of client UUIDs so that `(a, b)` and `(b, a)`
+/// map to the same stored representation.
+fn canonical_pair(a: Uuid, b: Uuid) -> (String, String) {
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    (lo.to_string(), hi.to_string())
 }
 
 /// Convert a SQLite row to a `ClientRecord`.
@@ -787,22 +884,19 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClientRecord> {
 // ---------------------------------------------------------------------------
 
 fn serialize_public_key<S: serde::Serializer>(key: &[u8; PUBLIC_KEY_LEN], serializer: S) -> Result<S::Ok, S::Error> {
-    use base64::Engine;
-    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
     serializer.serialize_str(&BASE64_STANDARD.encode(key))
 }
 
 fn deserialize_public_key<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<[u8; PUBLIC_KEY_LEN], D::Error> {
-    use base64::Engine;
-    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
     let s = String::deserialize(deserializer)?;
     let bytes = BASE64_STANDARD.decode(&s).map_err(serde::de::Error::custom)?;
     bytes.try_into().map_err(|_| serde::de::Error::custom("invalid public key length"))
 }
 
 fn serialize_optional_bytes<S: serde::Serializer>(bytes: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error> {
-    use base64::Engine;
-    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
     match bytes {
         Some(b) => serializer.serialize_str(&BASE64_STANDARD.encode(b)),
         None => serializer.serialize_none(),
@@ -810,8 +904,7 @@ fn serialize_optional_bytes<S: serde::Serializer>(bytes: &Option<Vec<u8>>, seria
 }
 
 fn deserialize_optional_bytes<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error> {
-    use base64::Engine;
-    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
     let opt: Option<String> = Option::deserialize(deserializer)?;
     match opt {
         Some(s) => {
@@ -1298,7 +1391,6 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("query version");
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 2);
     }
 
     // Traffic counters persist across reopen
@@ -1404,5 +1496,109 @@ mod tests {
         assert_eq!(ConnectionEvent::Connect.as_str(), "connect");
         assert_eq!(ConnectionEvent::Disconnect.as_str(), "disconnect");
         assert_eq!(ConnectionEvent::AuthFailed.as_str(), "auth_failed");
+    }
+
+    // --- Client-to-client sharing pairs (FRD-003) ---
+
+    // R-1: default-deny — no allow exists on an empty registry
+    #[test]
+    fn pair_default_deny() {
+        let reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
+        assert!(!reg.is_pair_allowed(Uuid::new_v4(), Uuid::new_v4()));
+    }
+
+    // R-2: allow makes the pair allowed
+    #[test]
+    fn pair_allow_then_allowed() {
+        let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        reg.allow_pair(a, b).expect("allow");
+        assert!(reg.is_pair_allowed(a, b));
+    }
+
+    // R-3: canonical ordering — (A,B) == (B,A) and list is canonical
+    #[test]
+    fn pair_canonical_symmetry() {
+        let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        reg.allow_pair(a, b).expect("allow");
+        assert!(reg.is_pair_allowed(b, a), "query in reverse order must match");
+
+        let pairs = reg.list_pairs();
+        assert_eq!(pairs.len(), 1);
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        assert_eq!(pairs[0], (lo, hi));
+    }
+
+    // R-4: revoke removes the allow immediately
+    #[test]
+    fn pair_revoke_takes_effect() {
+        let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        reg.allow_pair(a, b).expect("allow");
+        reg.revoke_pair(a, b).expect("revoke");
+        assert!(!reg.is_pair_allowed(a, b));
+        assert!(reg.list_pairs().is_empty());
+    }
+
+    // R-5: allowing twice is idempotent (one row)
+    #[test]
+    fn pair_allow_idempotent() {
+        let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        reg.allow_pair(a, b).expect("allow 1");
+        reg.allow_pair(b, a).expect("allow 2 (reverse order)");
+        assert_eq!(reg.list_pairs().len(), 1, "duplicate allow must not create a second row");
+    }
+
+    // R-6: revoking a missing pair is a no-op success
+    #[test]
+    fn pair_revoke_missing_is_noop() {
+        let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
+        reg.revoke_pair(Uuid::new_v4(), Uuid::new_v4()).expect("revoke missing ok");
+    }
+
+    // R-7: allow survives reopening the DB (server restart)
+    #[test]
+    fn pair_persists_across_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join(DATABASE_FILENAME);
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+
+        {
+            let mut reg = ClientRegistry::open(TEST_SUBNET, &db_path).expect("open");
+            reg.allow_pair(a, b).expect("allow");
+        }
+
+        let reg2 = ClientRegistry::open(TEST_SUBNET, &db_path).expect("reopen");
+        assert!(reg2.is_pair_allowed(a, b), "pair must survive restart");
+        assert!(reg2.is_pair_allowed(b, a), "still symmetric after reopen");
+    }
+
+    // R-8: schema version is bumped to 3
+    #[test]
+    fn pair_migration_schema_version() {
+        let reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
+        let version: i32 = reg
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("query version");
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 3);
+    }
+
+    // client_id_for_ip resolves the active client holding an IP, None otherwise
+    #[test]
+    fn client_id_for_ip_resolves() {
+        let mut reg = ClientRegistry::new(TEST_SUBNET).expect("valid subnet");
+        let c1 = reg.add(TEST_CLIENT_NAME, test_public_key(0x01), None).expect("add");
+        assert_eq!(reg.client_id_for_ip(c1.ip_address), Some(c1.id));
+        assert!(reg.client_id_for_ip(Ipv4Addr::new(8, 8, 8, 8)).is_none(), "egress IP has no client");
+
+        reg.remove(c1.id).expect("revoke");
+        assert!(
+            reg.client_id_for_ip(c1.ip_address).is_none(),
+            "revoked client IP no longer resolves"
+        );
     }
 }

@@ -7,9 +7,8 @@
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-use tokio::io::unix::AsyncFd;
-
 use prrr::tunnel::tun_device::TunDevice;
+use tokio::io::unix::AsyncFd;
 
 /// Default device name for the Android TUN adapter.
 const ANDROID_TUN_DEVICE_NAME: &str = "android-tun0";
@@ -120,9 +119,9 @@ impl TunDevice for AndroidTun {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use prrr::tunnel::tun_device::DEFAULT_TUNNEL_MTU;
+
+    use super::*;
 
     /// Test MTU value.
     const TEST_MTU: u16 = 1400;

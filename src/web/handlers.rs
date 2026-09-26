@@ -7,16 +7,16 @@
 
 use std::sync::atomic::Ordering;
 
-use axum::Json;
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::StatusCode,
+};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::errors::ApiError;
-use super::state::AppState;
+use super::{errors::ApiError, state::AppState};
 use crate::handshake::noise_ik::{KeyPair, PUBLIC_KEY_LEN};
 
 // ---------------------------------------------------------------------------
@@ -197,6 +197,31 @@ impl TransportInfoResponse {
     }
 }
 
+/// `POST /api/v1/sharing-pairs` request — two client ids to allow.
+#[derive(Debug, Deserialize)]
+pub struct SharingPairRequest {
+    /// First client id.
+    pub client_a: Uuid,
+    /// Second client id.
+    pub client_b: Uuid,
+}
+
+/// A single allowed sharing pair in list responses.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SharingPairResponse {
+    /// Canonically-lower client id.
+    pub client_a: Uuid,
+    /// Canonically-higher client id.
+    pub client_b: Uuid,
+}
+
+/// `GET /api/v1/sharing-pairs` response.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SharingPairListResponse {
+    /// All allowed sharing pairs.
+    pub pairs: Vec<SharingPairResponse>,
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -323,6 +348,62 @@ pub async fn resume_client(State(state): State<AppState>, Path(id): Path<Uuid>) 
     registry.reactivate(id)?;
     Ok(Json(StatusResponse {
         status: "active".to_string(),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Client-to-client sharing pairs (FRD-003)
+// ---------------------------------------------------------------------------
+
+/// `GET /api/v1/sharing-pairs` — list all allowed sharing pairs.
+pub async fn list_sharing_pairs(State(state): State<AppState>) -> Result<Json<SharingPairListResponse>, ApiError> {
+    let registry = state.registry.lock().await;
+    let pairs = registry
+        .list_pairs()
+        .into_iter()
+        .map(|(client_a, client_b)| SharingPairResponse { client_a, client_b })
+        .collect();
+    Ok(Json(SharingPairListResponse { pairs }))
+}
+
+/// `POST /api/v1/sharing-pairs` — mark two clients as an allowed sharing pair.
+///
+/// Default is deny; this creates the explicit allow. Rejects self-pairs and
+/// unknown client ids with 400.
+pub async fn create_sharing_pair(
+    State(state): State<AppState>,
+    Json(req): Json<SharingPairRequest>,
+) -> Result<(StatusCode, Json<StatusResponse>), ApiError> {
+    if req.client_a == req.client_b {
+        return Err(ApiError::BadRequest("a sharing pair must reference two distinct clients".into()));
+    }
+    let mut registry = state.registry.lock().await;
+    if registry.get(req.client_a).is_none() {
+        return Err(ApiError::BadRequest(format!("unknown client: {}", req.client_a)));
+    }
+    if registry.get(req.client_b).is_none() {
+        return Err(ApiError::BadRequest(format!("unknown client: {}", req.client_b)));
+    }
+    registry.allow_pair(req.client_a, req.client_b)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(StatusResponse {
+            status: "allowed".to_string(),
+        }),
+    ))
+}
+
+/// `DELETE /api/v1/sharing-pairs/{a}/{b}` — revoke a sharing pair.
+///
+/// Idempotent: revoking a pair that does not exist still returns 200.
+pub async fn delete_sharing_pair(
+    State(state): State<AppState>,
+    Path((a, b)): Path<(Uuid, Uuid)>,
+) -> Result<Json<StatusResponse>, ApiError> {
+    let mut registry = state.registry.lock().await;
+    registry.revoke_pair(a, b)?;
+    Ok(Json(StatusResponse {
+        status: "revoked".to_string(),
     }))
 }
 
@@ -540,21 +621,20 @@ fn client_to_response(record: &crate::registry::ClientRecord) -> ClientResponse 
 #[cfg(test)]
 mod tests {
     // FRD: specs/frds/FRD-P006.md
-    use super::*;
-    use crate::config::DEFAULT_SESSION_TIMEOUT;
-    use crate::registry::ClientRegistry;
-    use crate::web::AppState;
+    use std::sync::{Arc, atomic::AtomicU32};
 
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicU32;
-
-    use axum::Router;
-    use axum::body::Body;
-    use axum::http::Request;
-    use axum::routing::{get, post};
+    use axum::{
+        Router,
+        body::Body,
+        http::Request,
+        routing::{get, post},
+    };
     use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
     use tower::ServiceExt;
+
+    use super::*;
+    use crate::{config::DEFAULT_SESSION_TIMEOUT, registry::ClientRegistry, web::AppState};
 
     fn test_jwt_secret() -> Arc<[u8]> {
         Arc::from([0xABu8; 32].as_slice())
@@ -586,8 +666,10 @@ mod tests {
     }
 
     fn test_app_state() -> AppState {
-        use crate::distribution::{ConfigTokenStore, ServerContext};
-        use crate::web::harp::HarpSessionStore;
+        use crate::{
+            distribution::{ConfigTokenStore, ServerContext},
+            web::harp::HarpSessionStore,
+        };
         let registry = ClientRegistry::new("10.66.66.0/24").expect("valid subnet");
         AppState {
             registry: Arc::new(Mutex::new(registry)),
@@ -633,6 +715,8 @@ mod tests {
             .route("/api/v1/clients/{id}/config", get(get_client_config))
             .route("/api/v1/clients/{id}/qr", get(get_client_qr))
             .route("/api/v1/clients/{id}/config-url", post(create_config_url))
+            .route("/api/v1/sharing-pairs", get(list_sharing_pairs).post(create_sharing_pair))
+            .route("/api/v1/sharing-pairs/{a}/{b}", axum::routing::delete(delete_sharing_pair))
             .route("/api/v1/stats/overview", get(stats_overview))
             .route("/api/v1/stats/traffic", get(stats_traffic))
             .route("/api/v1/harp/sessions", get(list_harp_sessions))
@@ -1366,6 +1450,95 @@ mod tests {
         let body: StatusResponse = parse_json(resp).await;
         assert_eq!(body.status, "terminated");
         assert_eq!(state.harp_sessions.active_count(), 0);
+    }
+
+    // ---- Sharing pair tests (FRD-003) ----
+
+    // W-1: POST creates a pair; GET lists it
+    #[tokio::test]
+    async fn sharing_pair_create_and_list() {
+        let state = test_app_state();
+        let (a, b) = {
+            let mut reg = state.registry.lock().await;
+            let a = reg.add("alice", [0x01; PUBLIC_KEY_LEN], None).unwrap().id;
+            let b = reg.add("bob", [0x02; PUBLIC_KEY_LEN], None).unwrap().id;
+            (a, b)
+        };
+        let app = test_router(state);
+
+        let body = serde_json::json!({"client_a": a, "client_b": b});
+        let resp = app
+            .clone()
+            .oneshot(json_request("POST", "/api/v1/sharing-pairs", Some(body)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = app.oneshot(json_request("GET", "/api/v1/sharing-pairs", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let listed: SharingPairListResponse = parse_json(resp).await;
+        assert_eq!(listed.pairs.len(), 1);
+    }
+
+    // W-2: DELETE removes the pair
+    #[tokio::test]
+    async fn sharing_pair_delete() {
+        let state = test_app_state();
+        let (a, b) = {
+            let mut reg = state.registry.lock().await;
+            let a = reg.add("alice", [0x01; PUBLIC_KEY_LEN], None).unwrap().id;
+            let b = reg.add("bob", [0x02; PUBLIC_KEY_LEN], None).unwrap().id;
+            reg.allow_pair(a, b).unwrap();
+            (a, b)
+        };
+        let app = test_router(state);
+
+        let resp = app
+            .clone()
+            .oneshot(json_request("DELETE", &format!("/api/v1/sharing-pairs/{a}/{b}"), None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app.oneshot(json_request("GET", "/api/v1/sharing-pairs", None)).await.unwrap();
+        let listed: SharingPairListResponse = parse_json(resp).await;
+        assert!(listed.pairs.is_empty(), "pair should be gone after delete");
+    }
+
+    // W-3: self-pair is rejected with 400
+    #[tokio::test]
+    async fn sharing_pair_self_rejected() {
+        let state = test_app_state();
+        let a = {
+            let mut reg = state.registry.lock().await;
+            reg.add("alice", [0x01; PUBLIC_KEY_LEN], None).unwrap().id
+        };
+        let app = test_router(state);
+
+        let body = serde_json::json!({"client_a": a, "client_b": a});
+        let resp = app
+            .oneshot(json_request("POST", "/api/v1/sharing-pairs", Some(body)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // W-3: unknown client id is rejected with 400
+    #[tokio::test]
+    async fn sharing_pair_unknown_client_rejected() {
+        let state = test_app_state();
+        let a = {
+            let mut reg = state.registry.lock().await;
+            reg.add("alice", [0x01; PUBLIC_KEY_LEN], None).unwrap().id
+        };
+        let app = test_router(state);
+
+        let body = serde_json::json!({"client_a": a, "client_b": Uuid::new_v4()});
+        let resp = app
+            .oneshot(json_request("POST", "/api/v1/sharing-pairs", Some(body)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     // AC-5: Terminate unknown session returns 404
