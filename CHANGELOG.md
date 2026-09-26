@@ -4,6 +4,34 @@ All notable changes to prrr are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Resource routing had no effect on systemd-service clients**
+  (specs/bugs/BUG-resource-routing-not-effective.md). Three stacked defects:
+  the deployed `/usr/local/bin/prrr-route` hook consumed the space-separated
+  `PRRR_RESOURCE_IPS` with `read <<< "$var"`, producing one malformed route and
+  aborting under `set -e`; the hook never ensured the TUN link is up; and no
+  install path updated the binary + hook the service actually runs
+  (`make install` targets `~/.cargo/bin`).
+- `deploy/client/entrypoint.sh`: SC2064 trap-expansion warning.
+- `deploy/client/install-client.sh`: prefer the fresh repo build over
+  `command -v prrr` (sudo `secure_path` could pick a stale binary and abort
+  with "are the same file" when it is hardlinked to the install target).
+
+### Added
+
+- `[routing].resources` selective resource routing: config-driven hostnames
+  resolved to `/32` VPN routes, with `prrr client ... route add|remove|list`
+  CLI (specs/frds/FRD-resource-routing.md).
+- `make install-system`: installs the client the way `prrr-client.service`
+  runs it (`/usr/local/bin/prrr` + `/usr/local/bin/prrr-route`).
+- `PRRR_ENV_FILE` override in the route hook for black-box testing; hook tests
+  now execute the script against stub `ip`/`resolvectl` instead of grep.
+- `make shellcheck` covers `deploy/client/install-client.sh` and
+  `deploy/client/prrr-route`.
+
 ## [0.1.0] - 2026-02-21
 
 Initial release with full protocol stack, production deployment infrastructure, and web administration.

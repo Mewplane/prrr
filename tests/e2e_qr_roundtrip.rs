@@ -8,15 +8,17 @@
 //! The only allowed difference: `private_key_path` (CLI) vs `private_key`
 //! (mobile) — the server must support both via `generate_client_config`.
 
-use base64::Engine;
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use flate2::Compression;
-use flate2::read::DeflateDecoder;
-use flate2::write::DeflateEncoder;
 use std::io::{Read, Write};
 
-use prrr::distribution::{ServerContext, generate_client_config, generate_qr_svg, decode_import_url};
-use prrr::registry::ClientRegistry;
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
+use flate2::{Compression, read::DeflateDecoder, write::DeflateEncoder};
+use prrr::{
+    distribution::{ServerContext, decode_import_url, generate_client_config, generate_qr_svg},
+    registry::ClientRegistry,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -113,15 +115,23 @@ fn e2e_mobile_config_is_wire_compatible() {
     let private_key = test_private_key();
 
     // Generate config WITH private key (mobile path)
-    let config_toml = generate_client_config(&ctx, &record, Some(&private_key))
-        .expect("generate mobile config");
+    let config_toml = generate_client_config(&ctx, &record, Some(&private_key)).expect("generate mobile config");
 
     // Verify it has private_key (not private_key_path)
-    assert!(config_toml.contains("private_key = \""), "mobile config must have inline private_key");
-    assert!(!config_toml.contains("private_key_path"), "mobile config must NOT have private_key_path");
+    assert!(
+        config_toml.contains("private_key = \""),
+        "mobile config must have inline private_key"
+    );
+    assert!(
+        !config_toml.contains("private_key_path"),
+        "mobile config must NOT have private_key_path"
+    );
 
     // Verify transport_protocol is in [interface] (not separate [transport] section)
-    assert!(config_toml.contains("transport_protocol = \"masque\""), "must have transport_protocol in [interface]");
+    assert!(
+        config_toml.contains("transport_protocol = \"masque\""),
+        "must have transport_protocol in [interface]"
+    );
     assert!(!config_toml.contains("[transport]"), "must NOT have separate [transport] section");
 
     // Compress and encode the way the QR pipeline does
@@ -164,11 +174,16 @@ fn e2e_cli_config_uses_private_key_path() {
     let ctx = test_server_context();
     let (_registry, record) = test_registry_and_record();
 
-    let config_toml = generate_client_config(&ctx, &record, None)
-        .expect("generate CLI config");
+    let config_toml = generate_client_config(&ctx, &record, None).expect("generate CLI config");
 
-    assert!(config_toml.contains("private_key_path = \""), "CLI config must have private_key_path");
-    assert!(!config_toml.contains("\nprivate_key = \""), "CLI config must NOT have inline private_key");
+    assert!(
+        config_toml.contains("private_key_path = \""),
+        "CLI config must have private_key_path"
+    );
+    assert!(
+        !config_toml.contains("\nprivate_key = \""),
+        "CLI config must NOT have inline private_key"
+    );
 
     // Transport protocol must still be in [interface]
     assert!(config_toml.contains("transport_protocol = \"masque\""));
@@ -211,8 +226,7 @@ fn e2e_compressed_payload_is_url_safe() {
     let ctx = test_server_context();
     let (_registry, record) = test_registry_and_record();
 
-    let config_toml = generate_client_config(&ctx, &record, Some(&test_private_key()))
-        .expect("generate config");
+    let config_toml = generate_client_config(&ctx, &record, Some(&test_private_key())).expect("generate config");
 
     let compressed = deflate_compress(config_toml.as_bytes());
     let encoded = URL_SAFE_NO_PAD.encode(&compressed);
@@ -243,8 +257,7 @@ fn e2e_multiframe_split_and_reassemble_roundtrip() {
     let ctx = test_server_context();
     let (_registry, record) = test_registry_and_record();
 
-    let config_toml = generate_client_config(&ctx, &record, Some(&test_private_key()))
-        .expect("generate config");
+    let config_toml = generate_client_config(&ctx, &record, Some(&test_private_key())).expect("generate config");
 
     let compressed = deflate_compress(config_toml.as_bytes());
     let payload = URL_SAFE_NO_PAD.encode(&compressed);
@@ -261,12 +274,7 @@ fn e2e_multiframe_split_and_reassemble_roundtrip() {
 
     // Each frame should be small enough for QR scanning
     for (i, frame) in frames.iter().enumerate() {
-        assert!(
-            frame.len() < 400,
-            "frame {} too large: {} chars",
-            i + 1,
-            frame.len()
-        );
+        assert!(frame.len() < 400, "frame {} too large: {} chars", i + 1, frame.len());
     }
 
     // Reassemble and verify matches original URL
@@ -284,8 +292,7 @@ fn e2e_multiframe_reversed_order_reassembles_correctly() {
     let ctx = test_server_context();
     let (_registry, record) = test_registry_and_record();
 
-    let config_toml = generate_client_config(&ctx, &record, Some(&test_private_key()))
-        .expect("generate config");
+    let config_toml = generate_client_config(&ctx, &record, Some(&test_private_key())).expect("generate config");
 
     let compressed = deflate_compress(config_toml.as_bytes());
     let payload = URL_SAFE_NO_PAD.encode(&compressed);
@@ -309,8 +316,14 @@ fn e2e_different_clients_produce_different_qr_urls() {
     let config_a = generate_client_config(&ctx, &record_a, None).expect("config alice");
     let config_b = generate_client_config(&ctx, &record_b, None).expect("config bob");
 
-    let url_a = format!("{IMPORT_URL_PREFIX}{}", URL_SAFE_NO_PAD.encode(&deflate_compress(config_a.as_bytes())));
-    let url_b = format!("{IMPORT_URL_PREFIX}{}", URL_SAFE_NO_PAD.encode(&deflate_compress(config_b.as_bytes())));
+    let url_a = format!(
+        "{IMPORT_URL_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(deflate_compress(config_a.as_bytes()))
+    );
+    let url_b = format!(
+        "{IMPORT_URL_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(deflate_compress(config_b.as_bytes()))
+    );
 
     assert_ne!(url_a, url_b);
     assert_eq!(decode_import_url(&url_a).unwrap(), config_a);
@@ -324,9 +337,8 @@ fn e2e_different_clients_produce_different_qr_urls() {
 /// FrameCollector URL prefix constants must match server-side constants.
 #[test]
 fn e2e_frame_collector_prefix_matches_server() {
-    let collector_src = std::fs::read_to_string(
-        "prrr-android/app/src/main/kotlin/com/prrr/vpn/android/scanner/FrameCollector.kt"
-    ).expect("read FrameCollector.kt");
+    let collector_src = std::fs::read_to_string("prrr-android/app/src/main/kotlin/com/prrr/vpn/android/scanner/FrameCollector.kt")
+        .expect("read FrameCollector.kt");
 
     assert!(
         collector_src.contains("prrr://import?z="),
@@ -341,18 +353,11 @@ fn e2e_frame_collector_prefix_matches_server() {
 /// QRCodeAnalyzer uses ZXing (not ML Kit) for emulator compatibility.
 #[test]
 fn e2e_scanner_uses_zxing() {
-    let analyzer = std::fs::read_to_string(
-        "prrr-android/app/src/main/kotlin/com/prrr/vpn/android/scanner/QRCodeAnalyzer.kt"
-    ).expect("read QRCodeAnalyzer.kt");
+    let analyzer = std::fs::read_to_string("prrr-android/app/src/main/kotlin/com/prrr/vpn/android/scanner/QRCodeAnalyzer.kt")
+        .expect("read QRCodeAnalyzer.kt");
 
-    assert!(
-        analyzer.contains("com.google.zxing"),
-        "QRCodeAnalyzer must use ZXing"
-    );
-    assert!(
-        analyzer.contains("QR_CODE"),
-        "QRCodeAnalyzer must filter for QR_CODE format"
-    );
+    assert!(analyzer.contains("com.google.zxing"), "QRCodeAnalyzer must use ZXing");
+    assert!(analyzer.contains("QR_CODE"), "QRCodeAnalyzer must filter for QR_CODE format");
 }
 
 // ---------------------------------------------------------------------------
@@ -365,8 +370,7 @@ fn e2e_cli_import_from_compressed_url() {
     let ctx = test_server_context();
     let (_registry, record) = test_registry_and_record();
 
-    let config_toml = generate_client_config(&ctx, &record, Some(&test_private_key()))
-        .expect("generate config");
+    let config_toml = generate_client_config(&ctx, &record, Some(&test_private_key())).expect("generate config");
 
     // Compress the way the QR pipeline does
     let compressed = deflate_compress(config_toml.as_bytes());
@@ -388,8 +392,7 @@ fn e2e_cli_import_from_file() {
     let ctx = test_server_context();
     let (_registry, record) = test_registry_and_record();
 
-    let config_toml = generate_client_config(&ctx, &record, Some(&test_private_key()))
-        .expect("generate config");
+    let config_toml = generate_client_config(&ctx, &record, Some(&test_private_key())).expect("generate config");
 
     let dir = tempfile::tempdir().expect("tempdir");
     let source_path = dir.path().join("source.toml");
@@ -408,8 +411,7 @@ fn e2e_cli_add_with_qr_generates_svg() {
     let ctx = test_server_context();
     let (_registry, record) = test_registry_and_record();
 
-    let config_toml = generate_client_config(&ctx, &record, Some(&test_private_key()))
-        .expect("generate config");
+    let config_toml = generate_client_config(&ctx, &record, Some(&test_private_key())).expect("generate config");
 
     let svg = generate_qr_svg(&config_toml).expect("generate QR SVG");
     assert!(svg.contains("<svg"), "must produce valid SVG");
@@ -437,14 +439,18 @@ fn e2e_web_ui_patch_produces_same_config_as_direct_generation() {
     let private_key = test_private_key();
 
     // Server config (what the API returns) — has private_key_path
-    let server_config = generate_client_config(&ctx, &record, None)
-        .expect("generate server config");
-    assert!(server_config.contains("private_key_path"), "server config must have private_key_path");
+    let server_config = generate_client_config(&ctx, &record, None).expect("generate server config");
+    assert!(
+        server_config.contains("private_key_path"),
+        "server config must have private_key_path"
+    );
 
     // Direct mobile config — has inline private_key
-    let mobile_config = generate_client_config(&ctx, &record, Some(&private_key))
-        .expect("generate mobile config");
-    assert!(mobile_config.contains("private_key = \""), "mobile config must have inline private_key");
+    let mobile_config = generate_client_config(&ctx, &record, Some(&private_key)).expect("generate mobile config");
+    assert!(
+        mobile_config.contains("private_key = \""),
+        "mobile config must have inline private_key"
+    );
 
     // Simulate JS patchConfigForMobile: replace private_key_path line with private_key line
     // (JS split("\n").join("\n") preserves the trailing newline via the final empty element)
@@ -500,8 +506,7 @@ fn e2e_prrr_mobile_parses_server_generated_config() {
     let (_registry, record) = test_registry_and_record();
     let private_key = test_private_key();
 
-    let config_toml = generate_client_config(&ctx, &record, Some(&private_key))
-        .expect("generate config");
+    let config_toml = generate_client_config(&ctx, &record, Some(&private_key)).expect("generate config");
 
     // Compress the way the QR pipeline does
     let compressed = deflate_compress(config_toml.as_bytes());
@@ -530,8 +535,7 @@ fn e2e_prrr_mobile_parses_multiframe_reassembled_config() {
     let (_registry, record) = test_registry_and_record();
     let private_key = test_private_key();
 
-    let config_toml = generate_client_config(&ctx, &record, Some(&private_key))
-        .expect("generate config");
+    let config_toml = generate_client_config(&ctx, &record, Some(&private_key)).expect("generate config");
 
     let compressed = deflate_compress(config_toml.as_bytes());
     let payload = URL_SAFE_NO_PAD.encode(&compressed);
@@ -542,8 +546,7 @@ fn e2e_prrr_mobile_parses_multiframe_reassembled_config() {
     let reassembled = reassemble_multiframe(&frames);
 
     // Parse with actual prrr-mobile code
-    let vpn_config = prrr_mobile::parse_qr_config(reassembled)
-        .expect("prrr-mobile must parse reassembled multiframe config");
+    let vpn_config = prrr_mobile::parse_qr_config(reassembled).expect("prrr-mobile must parse reassembled multiframe config");
 
     assert_eq!(vpn_config.client_name, record.name);
     assert_eq!(vpn_config.server_endpoint, ctx.endpoint);

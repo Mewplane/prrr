@@ -15,8 +15,10 @@
 //! does not return an error — it returns a pseudorandom secret. Protocol
 //! layers above (F-004 Hybrid Handshake) detect this via MAC failure.
 
-use ml_kem::kem::{Decapsulate, Encapsulate};
-use ml_kem::{Ciphertext, EncodedSizeUser, KemCore, MlKem768};
+use ml_kem::{
+    Ciphertext, EncodedSizeUser, KemCore, MlKem768,
+    kem::{Decapsulate, Encapsulate},
+};
 use rand::rngs::OsRng;
 use zeroize::Zeroize;
 

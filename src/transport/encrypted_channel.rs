@@ -12,10 +12,11 @@
 
 use zeroize::Zeroize;
 
-use crate::crypto::aead::{self, KEY_LEN, NONCE_LEN, TAG_LEN};
-use crate::crypto::kdf;
-
 use super::TransportError;
+use crate::crypto::{
+    aead::{self, KEY_LEN, NONCE_LEN, TAG_LEN},
+    kdf,
+};
 
 /// Byte length of the nonce counter in the wire format.
 pub const NONCE_COUNTER_LEN: usize = 8;
@@ -71,7 +72,7 @@ impl ReplayWindow {
     /// `window_size` is clamped to a minimum of 1.
     fn new(window_size: u64) -> Self {
         let window_size = window_size.max(1);
-        let num_blocks = ((window_size + 63) / 64) as usize;
+        let num_blocks = window_size.div_ceil(64) as usize;
         Self {
             highest: 0,
             bitmap: vec![0u64; num_blocks],

@@ -11,11 +11,9 @@
 //! For dev/test, use [`generate_self_signed_cert`] to create a
 //! self-signed certificate with the required SANs.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
-use quinn::crypto::rustls::QuicClientConfig;
-use quinn::crypto::rustls::QuicServerConfig;
+use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 
 use super::TransportError;
 

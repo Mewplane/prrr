@@ -19,7 +19,8 @@ build:
 help:
 	@echo "Available targets:"
 	@echo "  build            - Build all binaries (release)"
-	@echo "  install          - Install binaries to ~/.cargo/bin"
+	@echo "  install          - Install binaries to ~/.cargo/bin (dev use only)"
+	@echo "  install-system   - Install binary + route hook to /usr/local/bin for the systemd service"
 	@echo "  test             - Run all tests"
 	@echo "  testv            - Run all tests (verbose)"
 	@echo "  lint             - Run clippy, fmt check, and audit"
@@ -42,10 +43,18 @@ help:
 	@echo "  docker-build     - Build Docker image"
 	@echo "  docker-test      - Build and run tests in Docker"
 
-# Install binaries
+# Install binaries to ~/.cargo/bin (dev convenience; the systemd service does
+# NOT use this path — see install-system)
 .PHONY: install
 install:
 	$(CARGO) install --path . --bin prrr
+
+# Install the client the way the systemd service actually runs it:
+# /usr/local/bin/prrr + /usr/local/bin/prrr-route via deploy/client/install-client.sh.
+# Existing /etc/prrr/client.toml is preserved (no config argument).
+.PHONY: install-system
+install-system: build
+	sudo $(CURDIR)/deploy/client/install-client.sh
 
 # Run all tests
 .PHONY: test
@@ -95,6 +104,8 @@ shellcheck:
 	shellcheck scripts/install-server.sh scripts/install-client.sh
 	@echo "Running shellcheck on E2E scripts..."
 	shellcheck deploy/client/entrypoint.sh deploy/client/run-podman.sh
+	@echo "Running shellcheck on client deployment scripts..."
+	shellcheck deploy/client/install-client.sh deploy/client/prrr-route
 	@echo "Shellcheck passed"
 
 # =============================================================================
@@ -175,6 +186,9 @@ android-native:
 	cp -f target/aarch64-linux-android/release/libprrr_mobile.so $(ANDROID_DIR)/app/src/main/jniLibs/arm64-v8a/libprrr_mobile.so
 	cp -f target/x86_64-linux-android/release/libprrr_mobile.so $(ANDROID_DIR)/app/src/main/jniLibs/x86_64/libprrr_mobile.so 2>/dev/null || true
 	cp -f target/prrr_mobile.aar $(ANDROID_DIR)/app/libs/prrr_mobile.aar
+	@echo "Copying regenerated Kotlin UniFFI bindings to Android project..."
+	mkdir -p $(ANDROID_DIR)/app/src/main/kotlin/uniffi/prrr_mobile
+	cp -f prrr-mobile/bindings/kotlin/uniffi/prrr_mobile/prrr_mobile.kt $(ANDROID_DIR)/app/src/main/kotlin/uniffi/prrr_mobile/prrr_mobile.kt
 	@echo "Native library build complete"
 
 ## android-debug: Build Android debug APK (native + Gradle)

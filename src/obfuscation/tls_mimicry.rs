@@ -14,13 +14,10 @@
 //! impossible with stock rustls. This module provides **approximate** mimicry
 //! by reordering the controllable fields (cipher suites and key exchange groups).
 
-use std::fmt;
-use std::str::FromStr;
-use std::sync::Arc;
+use std::{fmt, str::FromStr, sync::Arc};
 
 use md5::{Digest, Md5};
-use rustls::crypto::CryptoProvider;
-use rustls::crypto::ring as ring_provider;
+use rustls::crypto::{CryptoProvider, ring as ring_provider};
 
 use crate::transport::TransportError;
 

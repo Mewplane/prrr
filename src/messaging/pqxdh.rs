@@ -9,8 +9,10 @@
 
 use zeroize::Zeroize;
 
-use crate::crypto::{CryptoError, aead, hybrid_kex, kdf, x25519};
-use crate::messaging::keys::{IdentityKeyPair, OneTimePrekey, PqPrekey, PrekeyBundle, PrekeyError, SignedPrekey, X25519_PUB_LEN};
+use crate::{
+    crypto::{CryptoError, aead, hybrid_kex, kdf, x25519},
+    messaging::keys::{IdentityKeyPair, OneTimePrekey, PqPrekey, PrekeyBundle, PrekeyError, SignedPrekey, X25519_PUB_LEN},
+};
 
 /// HKDF info string for PQXDH shared secret derivation.
 const PQXDH_INFO: &[u8] = b"prrr-pqxdh-v1";

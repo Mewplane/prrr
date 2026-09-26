@@ -7,12 +7,12 @@
 //! Provides [`build_cert_verifier`] for client-side certificate verification,
 //! and [`load_pem_cert_and_key`] for server-side CA-signed certificate loading.
 
-use std::io::BufReader;
-use std::path::Path;
-use std::sync::Arc;
+use std::{io::BufReader, path::Path, sync::Arc};
 
-use rustls::client::danger::ServerCertVerifier;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::{
+    client::danger::ServerCertVerifier,
+    pki_types::{CertificateDer, PrivateKeyDer},
+};
 
 use super::TransportError;
 

@@ -7,9 +7,7 @@
 
 use std::sync::Arc;
 
-use axum::Router;
-use axum::extract::State;
-use axum::routing::get;
+use axum::{Router, extract::State, routing::get};
 use metrics_exporter_prometheus::PrometheusHandle;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
@@ -131,11 +129,13 @@ pub fn build_metrics_router(state: MetricsState) -> Router {
 mod tests {
     // FRD: specs/frds/FRD-P008.md
 
-    use super::*;
-
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
     use tower::ServiceExt;
+
+    use super::*;
 
     fn test_metrics_state() -> MetricsState {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();

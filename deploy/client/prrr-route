@@ -16,7 +16,8 @@
 
 set -euo pipefail
 
-ENV_FILE="/run/prrr/env"
+# PRRR_ENV_FILE lets black-box tests point the hook at a fixture env file.
+ENV_FILE="${PRRR_ENV_FILE:-/run/prrr/env}"
 
 # Source structured env from binary
 load_env() {
@@ -51,6 +52,10 @@ do_up() {
 
     wait_for_tun
 
+    # Routes pointing at a DOWN device are inert; an interrupted restart can
+    # leave the TUN administratively down. Idempotent bring-up.
+    ip link set "$PRRR_DEVICE" up
+
     if [[ "${PRRR_ALL_TRAFFIC}" == "true" ]]; then
         echo "Setting up full-tunnel routing (fwmark=$fwmark)..."
 
@@ -58,14 +63,20 @@ do_up() {
         # 1. Default route through TUN in a separate table
         ip -4 route add default dev "$PRRR_DEVICE" table "$route_table" 2>/dev/null || true
 
-        # 2. Unmarked packets use the VPN table; marked packets (SO_MARK) skip it
-        ip -4 rule add not fwmark "$fwmark" table "$route_table" priority 32765 2>/dev/null || true
-
-        # 3. Suppress default route in main table so local/LAN routes still work
-        ip -4 rule add table main suppress_prefixlength 0 priority 32764 2>/dev/null || true
     else
         echo "Setting up split-tunnel routing..."
         # Only the VPN subnet is routed through the tunnel (default from TUN setup)
+    fi
+
+    install_resource_routes
+
+    if [[ "${PRRR_ALL_TRAFFIC}" == "true" || -n "${PRRR_RESOURCE_IPS:-}" ]]; then
+        # Unmarked packets use the VPN table; marked packets (SO_MARK) skip it.
+        ip -4 rule add not fwmark "$fwmark" table "$route_table" priority 32765 2>/dev/null || true
+
+        # Suppress the host default route so resource routes win while other
+        # split-tunnel traffic still falls through to the host's main table.
+        ip -4 rule add table main suppress_prefixlength 0 priority 32764 2>/dev/null || true
     fi
 
     # Set up DNS
@@ -91,11 +102,31 @@ do_down() {
     ip -4 rule del not fwmark "$fwmark" table "$route_table" 2>/dev/null || true
     ip -4 rule del table main suppress_prefixlength 0 2>/dev/null || true
     ip -4 route del default dev "$device" table "$route_table" 2>/dev/null || true
+    remove_resource_routes
 
     # Reset DNS
     teardown_dns
 
     echo "prrr VPN routing is DOWN"
+}
+
+install_resource_routes() {
+    local resource_ip
+    # PRRR_RESOURCE_IPS is a space-separated list written by the binary;
+    # `read <<< "$var"` would consume it as ONE line (unquoted expansion
+    # splits on IFS words here instead).
+    # shellcheck disable=SC2086
+    for resource_ip in ${PRRR_RESOURCE_IPS:-}; do
+        ip -4 route replace "${resource_ip}/32" dev "$PRRR_DEVICE" table "${PRRR_FWMARK:-51820}"
+    done
+}
+
+remove_resource_routes() {
+    local resource_ip
+    # shellcheck disable=SC2086
+    for resource_ip in ${PRRR_RESOURCE_IPS:-}; do
+        ip -4 route del "${resource_ip}/32" dev "${PRRR_DEVICE:-prrr0}" table "${PRRR_FWMARK:-51820}" 2>/dev/null || true
+    done
 }
 
 setup_dns() {

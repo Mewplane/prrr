@@ -3,11 +3,14 @@
 //! Benchmarks for messaging: Double Ratchet encrypt/decrypt and PQXDH.
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-
-use prrr::crypto::x25519;
-use prrr::messaging::keys::{IdentityKeyPair, PqPrekey, SignedPrekey, generate_prekey_bundle};
-use prrr::messaging::pqxdh;
-use prrr::messaging::ratchet::{RatchetConfig, RatchetState};
+use prrr::{
+    crypto::x25519,
+    messaging::{
+        keys::{IdentityKeyPair, PqPrekey, SignedPrekey, generate_prekey_bundle},
+        pqxdh,
+        ratchet::{RatchetConfig, RatchetState},
+    },
+};
 
 const KEY_LEN: usize = 32;
 const SHARED_SECRET: [u8; KEY_LEN] = [0xAB; KEY_LEN];

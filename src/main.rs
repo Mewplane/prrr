@@ -4,10 +4,11 @@ use std::path::Path;
 
 use base64::Engine as _;
 use clap::Parser;
+use prrr::{
+    config::{Cli, Command, init_tracing},
+    transport::ServerTransport as _,
+};
 use tokio_util::sync::CancellationToken;
-
-use prrr::config::{Cli, Command, init_tracing};
-use prrr::transport::ServerTransport as _;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -163,8 +164,9 @@ async fn main() -> anyhow::Result<()> {
             let config_tokens = std::sync::Arc::new(prrr::distribution::ConfigTokenStore::new());
 
             // Cross-transport session eviction map shared between HARP and MASQUE.
-            let active_clients: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<uuid::Uuid, tokio_util::sync::CancellationToken>>> =
-                std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+            let active_clients: std::sync::Arc<
+                tokio::sync::Mutex<std::collections::HashMap<uuid::Uuid, tokio_util::sync::CancellationToken>>,
+            > = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
             // Start web admin if enabled
             let web_task = if config.web_admin.as_ref().and_then(|w| w.enabled).unwrap_or(false) {
@@ -404,6 +406,10 @@ async fn main() -> anyhow::Result<()> {
                     report.print_colored();
                     std::process::exit(report.exit_code());
                 }
+                Some(prrr::config::ClientSubcommand::Route(route_args)) => {
+                    let mut stdout = std::io::stdout();
+                    return prrr::cli::handle_client_route_action(args.config.as_deref(), &route_args.action, &mut stdout);
+                }
                 None => {}
             }
 
@@ -456,7 +462,8 @@ async fn main() -> anyhow::Result<()> {
 
             // Resolve client Noise IK keypair: inline key > key file > ephemeral
             let noise_keypair = if let Some(key_b64) = config.interface.as_ref().and_then(|i| i.private_key.as_deref()) {
-                let key_bytes = base64::engine::general_purpose::STANDARD.decode(key_b64)
+                let key_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(key_b64)
                     .map_err(|e| anyhow::anyhow!("invalid inline private_key base64: {e}"))?;
                 tracing::info!("using inline private_key from config");
                 prrr::handshake::noise_ik::KeyPair::from_private_key(&key_bytes)?
@@ -589,12 +596,31 @@ async fn main() -> anyhow::Result<()> {
                 .and_then(|r| r.allowed_ips.as_ref())
                 .cloned()
                 .unwrap_or_default();
-            let excluded_ips = config
+            let user_excluded_ips = config
                 .routing
                 .as_ref()
                 .and_then(|r| r.excluded_ips.as_ref())
                 .cloned()
                 .unwrap_or_default();
+            // Local-LAN auto-exclusion (split-tunnel courtesy, FRD-001): by
+            // default, exclude the active interface's RFC1918 subnet so a sibling
+            // on the same LAN stays reachable. `full_tunnel = true` opts back into
+            // strict full-tunnel capture of LAN traffic.
+            let full_tunnel = config.routing.as_ref().and_then(|r| r.full_tunnel).unwrap_or(false);
+            let tun_octets = gateway.octets();
+            let tun_subnet = format!("{}.{}.{}.0/24", tun_octets[0], tun_octets[1], tun_octets[2]);
+            let interfaces = prrr::routing::InterfaceEnumerator::enumerate(&prrr::routing::SystemInterfaceEnumerator);
+            let excluded_ips = prrr::routing::compute_excluded_ips(&user_excluded_ips, &interfaces, &[tun_subnet], full_tunnel);
+            let resources = config
+                .routing
+                .as_ref()
+                .and_then(|r| r.resources.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            let resource_ips = prrr::routing::resolve_resource_ips(&resources, &prrr::routing::SystemResourceResolver)?;
+            // Keep a copy for the ecosystem descriptor (route_params consumes the original).
+            let eco_excluded_ips = excluded_ips.clone();
+            tracing::info!(full_tunnel, ?excluded_ips, "computed tunnel exclusion set (LAN auto-exclusion)");
             let hook_script = config
                 .routing
                 .as_ref()
@@ -612,11 +638,52 @@ async fn main() -> anyhow::Result<()> {
                 dns_servers,
                 allowed_ips,
                 excluded_ips,
+                resource_ips,
                 fwmark,
             };
 
             let mut route_manager = prrr::routing::RouteManager::new(route_params, hook_script);
             tracing::info!(fwmark, "route manager ready");
+
+            // Ecosystem registry registration (SPEC §3, FRD-002): publish
+            // prrr's descriptor on tunnel up and update it on tunnel down.
+            // Best-effort via the file fallback ($XDG_RUNTIME_DIR/sy/ecosystem).
+            let eco_transport_kind = match transport_protocol {
+                "harp" => prrr::ecosystem::TransportKind::Harp,
+                _ => prrr::ecosystem::TransportKind::Masque,
+            };
+            let eco_port = server_addr.port();
+            let eco_pubkey = *noise_keypair.public_key();
+            // Reflect the Step 4 sharing toggle in the descriptor's
+            // client_to_client flag (best-effort read of the local state store).
+            let eco_sharing = prrr::sharing::SharingStore::new(prrr::sharing::default_state_path()).load();
+            let eco_client_to_client = eco_sharing.enabled;
+            // Step 5: publish the peer's mesh address ONLY after probing that the
+            // inter-client route is actually up (probe before publish, SPEC §7).
+            // The connected descriptor carries it; the down descriptor clears it.
+            let eco_mesh_addr = prrr::sharing::resolve_mesh_addr(
+                eco_sharing.enabled,
+                eco_sharing.peer_mesh_addr.as_deref(),
+                &prrr::sharing::TcpMeshProbe::default(),
+            );
+            let make_eco_state = |excluded: Vec<String>, mesh_peer_addr: Option<String>| prrr::ecosystem::DescriptorState {
+                pubkey: &eco_pubkey,
+                transport: eco_transport_kind,
+                port: eco_port,
+                iface: &tun_config.name,
+                server_endpoint: Some(server_name),
+                full_tunnel,
+                excluded_cidrs: excluded,
+                client_to_client: eco_client_to_client,
+                mesh_peer_addr,
+            };
+            let connected_descriptor = prrr::ecosystem::build_descriptor(make_eco_state(eco_excluded_ips.clone(), eco_mesh_addr));
+            let down_descriptor = prrr::ecosystem::build_descriptor(make_eco_state(Vec::new(), None));
+            let registrar = prrr::ecosystem::EcosystemRegistrar::new(
+                Box::new(prrr::ecosystem::FileRegistryTransport::new()),
+                connected_descriptor,
+                down_descriptor,
+            );
 
             // Run with automatic reconnection on transport failure
             let crypto_params = prrr::reconnect::ReconnectCryptoParams {
@@ -624,15 +691,25 @@ async fn main() -> anyhow::Result<()> {
                 server_noise_pub: &server_noise_pub,
                 server_kem_pub: &server_kem_pub,
             };
-            prrr::reconnect::run_with_reconnect(
+            let result = prrr::reconnect::run_with_reconnect(
                 transport.as_ref(),
                 &crypto_params,
                 tun,
                 &reconnect_config,
                 Some(&mut route_manager),
+                Some(&registrar),
                 cancel,
             )
-            .await
+            .await;
+            // On full command exit, remove prrr's descriptor (best-effort).
+            prrr::ecosystem::RegistryTransport::clear(&prrr::ecosystem::FileRegistryTransport::new());
+            result
+        }
+        Command::Sharing(args) => {
+            init_tracing("info", None);
+            let store = prrr::sharing::SharingStore::new(prrr::sharing::default_state_path());
+            let mut stdout = std::io::stdout();
+            prrr::cli::handle_sharing_action(&store, &args.action, &mut stdout)
         }
     }
 }

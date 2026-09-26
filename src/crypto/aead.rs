@@ -1,7 +1,9 @@
 // FRD: specs/frds/FRD-001.md
 
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+use chacha20poly1305::{
+    ChaCha20Poly1305, Nonce,
+    aead::{Aead, KeyInit, Payload},
+};
 
 use super::CryptoError;
 
@@ -43,8 +45,9 @@ pub fn decrypt(key: &[u8; KEY_LEN], nonce: &[u8; NONCE_LEN], ciphertext: &[u8], 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use hex_literal::hex;
+
+    use super::*;
 
     const TEST_KEY: [u8; KEY_LEN] = hex!("0000000000000000000000000000000000000000000000000000000000000001");
     const TEST_NONCE: [u8; NONCE_LEN] = hex!("000000000000000000000002");

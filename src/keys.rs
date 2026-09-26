@@ -17,11 +17,12 @@
 
 use std::path::{Path, PathBuf};
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
-use crate::crypto::hybrid_kex::{self, KEM_DECAPSULATION_KEY_LEN, KemKeyPair};
-use crate::handshake::noise_ik::{self, PUBLIC_KEY_LEN};
+use crate::{
+    crypto::hybrid_kex::{self, KEM_DECAPSULATION_KEY_LEN, KemKeyPair},
+    handshake::noise_ik::{self, PUBLIC_KEY_LEN},
+};
 
 /// File extension appended to key paths for the public key file.
 const PUBLIC_KEY_SUFFIX: &str = ".pub";
@@ -290,10 +291,11 @@ fn backup_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     // FRD: specs/frds/FRD-P002.md
-    use super::*;
     use std::fs;
+
     use tempfile::TempDir;
 
+    use super::*;
     use crate::crypto::hybrid_kex::KEM_ENCAPSULATION_KEY_LEN;
 
     /// Create a temporary directory for key storage tests.

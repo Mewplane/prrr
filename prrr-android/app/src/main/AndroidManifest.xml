@@ -3,6 +3,13 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- Ecosystem coordination: signature-protected so only co-signed sibling
+         apps (sy / cathouse) may read/observe the sharing toggle (SPEC §3/§9.3,
+         FRD-004). -->
+    <permission
+        android:name="com.prrr.vpn.android.permission.ECOSYSTEM_COORDINATE"
+        android:protectionLevel="signature" />
+
     <!-- Permissions -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.CAMERA" />
@@ -56,5 +63,16 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="vpn" />
         </service>
+
+        <!-- Sharing-toggle coordination surface (SPEC §3/§9.3, FRD-004).
+             Signature-protected: only co-signed ecosystem apps may read/observe
+             the sharing state. Thin wrapper over the Rust/UniFFI seam, which
+             holds the real state + enforcement. -->
+        <provider
+            android:name=".ecosystem.SharingProvider"
+            android:authorities="com.prrr.vpn.android.ecosystem.sharing"
+            android:exported="true"
+            android:readPermission="com.prrr.vpn.android.permission.ECOSYSTEM_COORDINATE"
+            android:writePermission="com.prrr.vpn.android.permission.ECOSYSTEM_COORDINATE" />
     </application>
 </manifest>

@@ -54,8 +54,9 @@ pub fn blake2s(data: &[u8]) -> [u8; BLAKE2S_DIGEST_LEN] {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use hex_literal::hex;
+
+    use super::*;
 
     // T-9: HKDF RFC 5869 test vector (Test Case 1)
     #[test]

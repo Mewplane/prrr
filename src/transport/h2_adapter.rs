@@ -14,8 +14,10 @@ use std::sync::Mutex;
 use bytes::Bytes;
 use tokio::sync::Mutex as TokioMutex;
 
-use super::TransportError;
-use super::harp::{HarpFrame, HarpFrameReader, HarpFrameType};
+use super::{
+    TransportError,
+    harp::{HarpFrame, HarpFrameReader, HarpFrameType},
+};
 use crate::tunnel::pipeline::{DatagramReceiver, DatagramSender};
 
 /// Sends HARP DATA frames over an HTTP/2 send stream.
@@ -112,9 +114,10 @@ impl DatagramReceiver for H2Receiver {
 
 #[cfg(test)]
 mod tests {
+    use hyper::{Request, Response};
+
     use super::*;
     use crate::transport::harp::HarpFrame;
-    use hyper::{Request, Response};
 
     /// Helper: creates a connected H2 client/server pair over an in-memory transport.
     ///

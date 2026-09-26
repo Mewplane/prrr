@@ -30,6 +30,10 @@ pub struct VpnConfig {
     pub preferred_binding: Option<String>,
     /// Transport protocol: "harp" or "masque" (None = masque)
     pub transport_protocol: Option<String>,
+    /// Strict full-tunnel: when `Some(true)`, capture the local LAN too (disable
+    /// the default RFC1918 local-LAN auto-exclusion). `None`/`Some(false)` keep
+    /// LAN auto-exclusion on so a sibling on the same LAN stays reachable.
+    pub full_tunnel: Option<bool>,
 }
 
 /// Validate VPN configuration
@@ -121,8 +125,9 @@ pub fn parse_qr_config(qr_data: String) -> Result<VpnConfig, MobileError> {
             reason: format!("base64 decode failed: {e}"),
         })?;
 
-    use flate2::read::DeflateDecoder;
     use std::io::Read;
+
+    use flate2::read::DeflateDecoder;
     let mut decoder = DeflateDecoder::new(&compressed[..]);
     let toml_str = {
         let mut s = String::new();
@@ -147,6 +152,12 @@ struct TomlConfig {
     client: Option<TomlClient>,
     server: Option<TomlServer>,
     interface: Option<TomlInterface>,
+    routing: Option<TomlRouting>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TomlRouting {
+    full_tunnel: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -233,6 +244,7 @@ fn convert_toml_to_vpn_config(config: TomlConfig) -> Result<VpnConfig, MobileErr
 
     let preferred_binding = interface.preferred_binding;
     let transport_protocol = interface.transport_protocol;
+    let full_tunnel = config.routing.and_then(|r| r.full_tunnel);
 
     Ok(VpnConfig {
         client_name,
@@ -245,6 +257,7 @@ fn convert_toml_to_vpn_config(config: TomlConfig) -> Result<VpnConfig, MobileErr
         mtu,
         preferred_binding,
         transport_protocol,
+        full_tunnel,
     })
 }
 
@@ -254,9 +267,9 @@ mod tests {
 
     /// Deflate-compress and base64url-encode, returning a `prrr://import?z=...` URL.
     fn compress_to_qr_url(toml: &str) -> String {
-        use flate2::Compression;
-        use flate2::write::DeflateEncoder;
         use std::io::Write;
+
+        use flate2::{write::DeflateEncoder, Compression};
 
         let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
         encoder.write_all(toml.as_bytes()).unwrap();
@@ -294,6 +307,35 @@ mtu = 1100
         assert_eq!(config.assigned_ip, "10.66.66.2/32");
         assert_eq!(config.dns_servers, vec!["1.1.1.1"]);
         assert_eq!(config.mtu, 1100);
+        // FRD-001: full_tunnel absent → None (LAN auto-exclusion on by default).
+        assert_eq!(config.full_tunnel, None);
+    }
+
+    // FRD-001: [routing].full_tunnel = true is parsed from the QR config.
+    #[test]
+    fn test_parse_qr_config_full_tunnel_true() {
+        let config_toml = format!(
+            r#"[client]
+name = "strict-client"
+
+[server]
+endpoint = "vpn.example.com:443"
+public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+pq_public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
+[interface]
+private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+address = "10.66.66.2/32"
+dns = ["1.1.1.1"]
+mtu = 1100
+
+[routing]
+full_tunnel = true
+"#
+        );
+        let qr_data = compress_to_qr_url(&config_toml);
+        let config = parse_qr_config(qr_data).expect("parse full_tunnel config");
+        assert_eq!(config.full_tunnel, Some(true));
     }
 
     #[test]
@@ -390,6 +432,7 @@ mtu = 1100
             mtu: 1100,
             preferred_binding: None,
             transport_protocol: None,
+            full_tunnel: None,
         };
 
         let result = validate_config(config);
@@ -413,6 +456,7 @@ mtu = 1100
             mtu: 1100,
             preferred_binding: None,
             transport_protocol: None,
+            full_tunnel: None,
         };
 
         let result = validate_config(config);
@@ -436,6 +480,7 @@ mtu = 1100
             mtu: 1100,
             preferred_binding: None,
             transport_protocol: None,
+            full_tunnel: None,
         };
 
         let result = validate_config(config);
@@ -459,6 +504,7 @@ mtu = 1100
             mtu: 1100,
             preferred_binding: None,
             transport_protocol: None,
+            full_tunnel: None,
         };
 
         let result = validate_config(config);
@@ -482,6 +528,7 @@ mtu = 1100
             mtu: 1100,
             preferred_binding: None,
             transport_protocol: None,
+            full_tunnel: None,
         };
 
         let result = validate_config(config);
@@ -505,6 +552,7 @@ mtu = 1100
             mtu: 9000, // Too large
             preferred_binding: None,
             transport_protocol: None,
+            full_tunnel: None,
         };
 
         let result = validate_config(config);
@@ -528,6 +576,7 @@ mtu = 1100
             mtu: 1100,
             preferred_binding: None,
             transport_protocol: None,
+            full_tunnel: None,
         };
 
         let result = validate_config(config);
@@ -547,6 +596,7 @@ mtu = 1100
             mtu,
             preferred_binding: None,
             transport_protocol: None,
+            full_tunnel: None,
         }
     }
 
@@ -644,11 +694,7 @@ mtu = 1100
 
         // Each frame should be small enough for easy QR scanning
         for frame in &frames {
-            assert!(
-                frame.len() < 400,
-                "frame too large for easy scanning: {} chars",
-                frame.len()
-            );
+            assert!(frame.len() < 400, "frame too large for easy scanning: {} chars", frame.len());
         }
 
         // Reassemble (simulating Kotlin collector)

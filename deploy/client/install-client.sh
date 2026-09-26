@@ -17,16 +17,20 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG_SRC="${1:-}"
-PRRR_BIN="$(command -v prrr 2>/dev/null || echo "")"
 
-# Find prrr binary
+# Find prrr binary. Prefer a fresh build from this repository: running this
+# installer from the repo means "deploy what I just built". A bare
+# `command -v prrr` under sudo resolves PATH via secure_path, which can pick
+# up a stale copy and even collide with the install target (same file).
+if [[ -x "$SCRIPT_DIR/../../target/release/prrr" ]]; then
+    PRRR_BIN="$SCRIPT_DIR/../../target/release/prrr"
+else
+    PRRR_BIN="$(command -v prrr 2>/dev/null || echo "")"
+fi
+
 if [[ -z "$PRRR_BIN" ]]; then
-    if [[ -x "$SCRIPT_DIR/../../target/release/prrr" ]]; then
-        PRRR_BIN="$SCRIPT_DIR/../../target/release/prrr"
-    else
-        echo "Error: prrr binary not found. Build with 'cargo build --release' first." >&2
-        exit 1
-    fi
+    echo "Error: prrr binary not found. Build with 'cargo build --release' first." >&2
+    exit 1
 fi
 
 echo "Installing prrr VPN client..."

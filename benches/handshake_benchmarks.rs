@@ -3,10 +3,13 @@
 //! Benchmarks for handshake operations: Noise IK and Hybrid (Noise IK + ML-KEM).
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-
-use prrr::crypto::hybrid_kex::KemKeyPair;
-use prrr::handshake::hybrid::{HybridInitiator, HybridResponder};
-use prrr::handshake::noise_ik::KeyPair;
+use prrr::{
+    crypto::hybrid_kex::KemKeyPair,
+    handshake::{
+        hybrid::{HybridInitiator, HybridResponder},
+        noise_ik::KeyPair,
+    },
+};
 
 fn bench_noise_ik_handshake(c: &mut Criterion) {
     let initiator_kp = KeyPair::generate().expect("initiator keypair");

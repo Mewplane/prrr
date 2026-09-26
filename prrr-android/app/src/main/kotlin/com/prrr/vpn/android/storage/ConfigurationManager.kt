@@ -25,6 +25,7 @@ private const val KEY_DNS_SERVERS = "dns_servers"
 private const val KEY_MTU = "mtu"
 private const val KEY_PREFERRED_BINDING = "preferred_binding"
 private const val KEY_TRANSPORT_PROTOCOL = "transport_protocol"
+private const val KEY_FULL_TUNNEL = "full_tunnel"
 
 /**
  * Manages secure persistent storage of VPN configuration.
@@ -64,6 +65,10 @@ object ConfigurationManager {
                 putInt(KEY_MTU, config.mtu.toInt())
                 putString(KEY_PREFERRED_BINDING, config.preferredBinding)
                 putString(KEY_TRANSPORT_PROTOCOL, config.transportProtocol)
+                // full_tunnel is a tri-state Option<bool>: null (default LAN
+                // auto-exclusion), false, or true (strict full tunnel). Persist
+                // as a string so absence is distinguishable from false.
+                putString(KEY_FULL_TUNNEL, config.fullTunnel?.toString())
                 apply()
             }
 
@@ -107,7 +112,8 @@ object ConfigurationManager {
                 dnsServers = prefs.getString(KEY_DNS_SERVERS, null)?.split(",") ?: return null,
                 mtu = prefs.getInt(KEY_MTU, 1100).toUShort(),
                 preferredBinding = prefs.getString(KEY_PREFERRED_BINDING, null),
-                transportProtocol = prefs.getString(KEY_TRANSPORT_PROTOCOL, null)
+                transportProtocol = prefs.getString(KEY_TRANSPORT_PROTOCOL, null),
+                fullTunnel = prefs.getString(KEY_FULL_TUNNEL, null)?.toBooleanStrictOrNull()
             )
 
             // Validate loaded configuration

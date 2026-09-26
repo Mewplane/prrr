@@ -10,28 +10,39 @@
 //!
 //! Both paths share the same `TunnelPipeline` — only the transport adapters differ.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    net::SocketAddr,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL;
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD as BASE64_URL},
+};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::handshake::hybrid::{HybridInitiator, InitiatorResult};
-use crate::handshake::noise_ik::KeyPair;
-use crate::transport::TransportError;
-use crate::transport::encrypted_channel::{EncryptedChannel, NONCE_COUNTER_LEN};
-use crate::transport::h2_adapter::{H2Receiver, H2Sender};
-use crate::transport::harp::{HarpFrame, HarpFrameReader, HarpFrameType};
-use crate::transport::masque::{MasqueClient, build_masque_client_config};
-use crate::tunnel::TunnelError;
-use crate::tunnel::pipeline::{DatagramReceiver, DatagramSender};
-use crate::tunnel::tun_device::TunDevice;
-use crate::web::harp::{HarpSessionRequest, HarpSessionResponse};
+use crate::{
+    handshake::{
+        hybrid::{HybridInitiator, InitiatorResult},
+        noise_ik::KeyPair,
+    },
+    transport::{
+        TransportError,
+        encrypted_channel::{EncryptedChannel, NONCE_COUNTER_LEN},
+        h2_adapter::{H2Receiver, H2Sender},
+        harp::{HarpFrame, HarpFrameReader, HarpFrameType},
+        masque::{MasqueClient, build_masque_client_config},
+    },
+    tunnel::{
+        TunnelError,
+        pipeline::{DatagramReceiver, DatagramSender},
+        tun_device::TunDevice,
+    },
+    web::harp::{HarpSessionRequest, HarpSessionResponse},
+};
 
 /// Per-packet overhead added by the encrypted channel and MASQUE framing.
 ///
@@ -2081,12 +2092,16 @@ mod tests {
 
     // -- Helper: create test AppState (mirrors web::harp::tests pattern) --
     fn harp_test_app_state() -> crate::web::state::AppState {
-        use crate::config::DEFAULT_SESSION_TIMEOUT;
-        use crate::crypto::hybrid_kex::KemKeyPair;
-        use crate::distribution::{ConfigTokenStore, ServerContext};
-        use crate::registry::ClientRegistry;
-        use crate::web::handlers::{ServerConfigResponse, TransportInfoResponse};
-        use crate::web::harp::HarpSessionStore;
+        use crate::{
+            config::DEFAULT_SESSION_TIMEOUT,
+            crypto::hybrid_kex::KemKeyPair,
+            distribution::{ConfigTokenStore, ServerContext},
+            registry::ClientRegistry,
+            web::{
+                handlers::{ServerConfigResponse, TransportInfoResponse},
+                harp::HarpSessionStore,
+            },
+        };
 
         let noise_keypair = KeyPair::generate().expect("noise keypair");
         let kem_keypair = KemKeyPair::generate();
@@ -2383,13 +2398,16 @@ mod tests {
     /// AC-3: MasqueClientTransport::connect() returns working TransportConnection.
     #[tokio::test]
     async fn masque_client_transport_connect_integration() {
-        use crate::crypto::hybrid_kex::KemKeyPair;
-        use crate::registry::ClientRegistry;
-        use crate::server::{MultiServerParams, bind_ephemeral_server, run_multi_server_on_endpoint};
-        use crate::tunnel::MockTunFactory;
-        use crate::tunnel::tun_device::DEFAULT_TUNNEL_MTU;
         use std::sync::atomic::AtomicU32;
+
         use tokio::sync::Mutex;
+
+        use crate::{
+            crypto::hybrid_kex::KemKeyPair,
+            registry::ClientRegistry,
+            server::{MultiServerParams, bind_ephemeral_server, run_multi_server_on_endpoint},
+            tunnel::{MockTunFactory, tun_device::DEFAULT_TUNNEL_MTU},
+        };
 
         let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -2688,8 +2706,7 @@ mod tests {
     /// TUNNEL_OVERHEAD_BYTES must equal the sum of its crypto components.
     #[test]
     fn tunnel_overhead_equals_components() {
-        use crate::transport::encrypted_channel::NONCE_COUNTER_LEN;
-        use crate::crypto::aead::TAG_LEN;
+        use crate::{crypto::aead::TAG_LEN, transport::encrypted_channel::NONCE_COUNTER_LEN};
         assert_eq!(
             TUNNEL_OVERHEAD_BYTES,
             NONCE_COUNTER_LEN + TAG_LEN + 2,
@@ -2701,9 +2718,7 @@ mod tests {
     /// This is the single most important MTU invariant.
     #[test]
     fn default_mtu_fits_quic_datagram_budget() {
-        let needed = usize::from(crate::config::DEFAULT_MTU)
-            + TUNNEL_OVERHEAD_BYTES
-            + MASQUE_FRAMING_OVERHEAD;
+        let needed = usize::from(crate::config::DEFAULT_MTU) + TUNNEL_OVERHEAD_BYTES + MASQUE_FRAMING_OVERHEAD;
         assert!(
             needed <= MIN_QUIC_DATAGRAM_PAYLOAD,
             "DEFAULT_MTU {} + overhead {} = {needed}, exceeds QUIC budget {MIN_QUIC_DATAGRAM_PAYLOAD}",
@@ -2715,9 +2730,7 @@ mod tests {
     /// check_mtu_budget returns Ok for the default MTU.
     #[test]
     fn budget_check_accepts_default_mtu() {
-        assert!(
-            check_mtu_budget(crate::config::DEFAULT_MTU, MIN_QUIC_DATAGRAM_PAYLOAD).is_ok()
-        );
+        assert!(check_mtu_budget(crate::config::DEFAULT_MTU, MIN_QUIC_DATAGRAM_PAYLOAD).is_ok());
     }
 
     /// check_mtu_budget rejects MTU that would exceed the budget.
@@ -2730,8 +2743,7 @@ mod tests {
     /// verify the wire size fits in a QUIC datagram.
     #[test]
     fn max_mtu_packet_through_real_encrypt_and_frame() {
-        use crate::transport::encrypted_channel::EncryptedChannel;
-        use crate::transport::masque::frame_datagram;
+        use crate::transport::{encrypted_channel::EncryptedChannel, masque::frame_datagram};
 
         let tx_key = [0x42u8; 32];
         let rx_key = [0x43u8; 32];

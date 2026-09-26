@@ -15,6 +15,49 @@ traits. Currently two transports exist:
 Both transports coexist as first-class options behind a pluggable transport
 abstraction layer (see [Transport Abstraction Layer](#transport-abstraction-layer) below).
 
+## Routing & local-LAN auto-exclusion
+
+When the tunnel comes up, prrr decides which destination prefixes to route into
+the tunnel and which to leave on the local link. By **default** it excludes the
+active interface's RFC1918 local-LAN subnet (split-tunnel courtesy), so a device
+on the same LAN stays reachable instead of being swallowed by the full tunnel.
+
+The prefix computation lives in the vendor-neutral core (`prrr::routing`) as the
+single source of truth for both platforms:
+
+- `InterfaceEnumerator` — trait wrapping interface discovery; `SystemInterfaceEnumerator`
+  is the production implementation (`if-addrs`), and tests inject fixtures.
+- `lan_prefixes_to_exclude(interfaces, skip)` — pure, IO-free function returning
+  the RFC1918 network prefixes to exclude (IPv6/malformed/non-RFC1918 skipped,
+  deduplicated, tunnel subnet honored via `skip`).
+- `compute_excluded_ips(user_excluded, interfaces, skip, full_tunnel)` — merges the
+  user's `excluded_ips` with the auto-detected LAN prefixes unless `full_tunnel`.
+
+**Linux:** `main.rs` feeds the computed set into `RouteParams.excluded_ips`, written
+to `/run/prrr/env` as `PRRR_EXCLUDED_IPS` for the routing hook, so no tunnel route
+is installed for the LAN prefix.
+
+**Android:** `prrr-mobile::lan_excluded_cidrs(full_tunnel)` is exported over UniFFI;
+`PrrrVpnService` calls it and applies `VpnService.Builder.excludeRoute()` for each
+returned CIDR, so the route set omits the LAN prefix.
+
+Set `[routing].full_tunnel = true` to restore strict full-tunnel capture of the
+LAN (see [Configuration](configuration.md#routing)).
+
+### Selected resource routes
+
+When `[routing].resources` is non-empty, the Linux client resolves each
+hostname before the tunnel route is activated. It writes the deduplicated IPv4
+answers to `PRRR_RESOURCE_IPS` in `/run/prrr/env`. The routing hook installs
+those addresses as exact `/32` routes in the fwmark policy table and removes
+them during teardown. In resource-only mode the same policy rule is used
+without a default route, so non-resource traffic continues through the host's
+normal route.
+
+Resolution is intentionally fail-closed: a hostname that cannot resolve to an
+IPv4 address prevents client startup. DNS changes require a client restart.
+IPv6 is outside this feature until the client TUN supports IPv6.
+
 ## Modules
 
 ### `tunnel::tun_device` — TUN Device Abstraction

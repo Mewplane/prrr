@@ -24,11 +24,14 @@
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::crypto::hybrid_kex::{self, KEM_CIPHERTEXT_LEN, KemKeyPair};
-use crate::crypto::kdf;
-
-use super::HandshakeError;
-use super::noise_ik::{self, Initiator, KeyPair, PUBLIC_KEY_LEN, Responder, Transport};
+use super::{
+    HandshakeError,
+    noise_ik::{self, Initiator, KeyPair, PUBLIC_KEY_LEN, Responder, Transport},
+};
+use crate::crypto::{
+    hybrid_kex::{self, KEM_CIPHERTEXT_LEN, KemKeyPair},
+    kdf,
+};
 
 /// HKDF info prefix for session key derivation per SPEC.md.
 const SESSION_KEY_INFO_PREFIX: &[u8] = b"PhantomVPN v1";

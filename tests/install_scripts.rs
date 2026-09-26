@@ -4,8 +4,7 @@
 //! Validates that the server and client installation scripts exist,
 //! are executable, and contain all required sections per SPEC.md §1 and §2.1.
 
-use std::fs;
-use std::path::Path;
+use std::{fs, path::Path};
 
 /// Path to the server installation script.
 const SERVER_SCRIPT: &str = "scripts/install-server.sh";

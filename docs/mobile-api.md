@@ -230,6 +230,43 @@ Get connection statistics. Returns `None`/`nil` when not connected.
 
 **Note:** Feature 1.5 implements async connection simulation. Real VPN tunneling (QUIC/MASQUE transport, hybrid handshake) will be integrated in future features when the core `src/client.rs` connection logic is wired in.
 
+## Client-to-Client Sharing Toggle (FRD-004)
+
+The sharing toggle's state and enforcement live in the vendor-neutral Rust core;
+the mobile layer exposes a thin UniFFI seam so the Android signature
+`ContentProvider` (see `docs/mobile-build.md`) can read and flip it. The provider
+holds no truth of its own — both phone and laptop honor one source of truth.
+
+### Type
+
+#### `SharingStateDto`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `enabled` | `Boolean` | Whether the client has opted into inter-client routing. |
+| `peer_mesh_addr` | `String?` | Authorized peer's mesh address; `null` until Step 5. |
+
+### Functions
+
+#### `sharing_get_state(state_path: String) -> SharingStateDto`
+
+Read the current sharing state from the app-owned state file. Fail-closed: a
+missing or corrupt file yields the disabled default, so the toggle never shows
+"on" without a real on-disk opt-in. `state_path` is the absolute path of the
+app-private state file (e.g. `<filesDir>/sharing.json`).
+
+#### `sharing_set_enabled(state_path: String, enabled: Boolean) throws -> SharingStateDto`
+
+Flip the toggle and persist it atomically; returns the resulting state.
+`enabled = true` opts into inter-client routing, `false` opts out (and drops any
+learned peer mesh address). Throws `MobileError.TunnelFailed` if the state file
+cannot be written.
+
+**Enforcement note:** this seam flips the *local* toggle only. An authorized
+remote enable (relayed from `sy`/cathouse) still goes through the Rust core's
+`authorize_remote_enable`, which requires the server-side pair authorization and
+a verifying per-use biometric signature. prrr remains the enforcement point.
+
 ## Building and Integration
 
 ### Generate Bindings

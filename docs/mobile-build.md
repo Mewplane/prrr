@@ -252,6 +252,32 @@ cargo clean -p prrr-mobile
 
 **Solution**: This is normal for the initial implementation. Binary size optimization will be addressed in later features. Debug builds are even larger (includes debug symbols).
 
+## Sharing-Toggle Coordination Surface (FRD-004)
+
+The "Enable sharing" toggle is coordinated through a signature-protected
+`ContentProvider` (SPEC §3/§9.3, decision §9.4):
+
+- **Kotlin** — `com.prrr.vpn.android.ecosystem.SharingProvider` is a *thin*
+  `ContentProvider`. `query()` returns a one-row cursor with `enabled` (0/1) and
+  `peer_mesh_addr` (null until Step 5); `update()` reads an `enabled` (0/1)
+  `ContentValues` and flips the toggle. It holds no state of its own — it
+  marshals to the Rust core.
+- **Rust/UniFFI seam** — the provider calls `sharingGetState(statePath)` and
+  `sharingSetEnabled(statePath, enabled)` (exported from `prrr-mobile`; see
+  `docs/mobile-api.md`). The Rust core (`prrr::sharing`) is the single source of
+  truth and the enforcement point, so the phone and laptop honor one consistent
+  state. `statePath` is `<filesDir>/sharing.json`.
+- **Signature protection** — the manifest declares a `signature`-`protectionLevel`
+  permission `com.prrr.vpn.android.permission.ECOSYSTEM_COORDINATE`, set as the
+  provider's `readPermission`/`writePermission`. Only apps co-signed with the
+  same developer key (the `sy`/cathouse siblings) may read or flip the toggle;
+  no user setup is required.
+
+The enforcement logic (server-side pair auth + per-use biometric signature for an
+authorized remote enable) stays in testable Rust — the Kotlin provider never
+authorizes a remote enable on its own. The Rust seam is covered by
+`prrr-mobile/src/sharing.rs::mobile_seam_toggle_drives_state`.
+
 ## Development Workflow
 
 For local development (without cross-compilation):

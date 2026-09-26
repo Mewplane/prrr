@@ -369,6 +369,31 @@ all_traffic = true
 
 Then restart: `sudo systemctl restart prrr-client`
 
+To route only selected services through the VPN, add their hostnames instead:
+
+```bash
+sudo $(which prrr) client --config /etc/prrr/client.toml route add chatgpt.com
+sudo $(which prrr) client --config /etc/prrr/client.toml route add claude.ai
+sudo $(which prrr) client --config /etc/prrr/client.toml route add youtube.com
+sudo $(which prrr) client --config /etc/prrr/client.toml route add telegram.org
+sudo systemctl restart prrr-client
+```
+
+Add any additional hostnames used by a service (for example, an API or media
+host). See [Client routing configuration](configuration.md#selected-resource-routing)
+for the IPv4 and DNS-resolution limits.
+
+> **The service runs `/usr/local/bin/prrr`, not `~/.cargo/bin/prrr`.**
+> `cargo install` / `make install` will **not** update the binary or the routing
+> hook that `prrr-client.service` executes, so new config options such as
+> `[routing].resources` are silently ignored. After changing the code, deploy it
+> the way the service sees it:
+>
+> ```bash
+> make install-system   # builds, then sudo-installs binary + prrr-route to /usr/local/bin
+> sudo systemctl restart prrr-client
+> ```
+
 To start the VPN automatically on boot:
 
 ```bash
@@ -552,6 +577,33 @@ The client could not determine where to connect. Ensure either:
 - Or pass `--server <ADDR>` on the command line
 
 If you exported the config from a server where `server_name` was set to `localhost` or `0.0.0.0`, the endpoint in the export will be wrong. Fix the server config's `[server].server_name` to the public IP or domain, then re-export.
+
+### Resource route does not activate (you still see your local exit IP)
+
+Work through these checks in order:
+
+1. **Is the running service actually resource-aware?** Run
+   `grep PRRR_RESOURCE_IPS /run/prrr/env` while the tunnel is up. If the key is
+   missing, the service is executing a stale `/usr/local/bin/prrr` (the
+   `prrr-client.service` unit only ever runs that path). Fix with
+   `make install-system && sudo systemctl restart prrr-client`.
+2. **Are the routes and rules present?** `ip route show table 51820` must list
+   one `/32` per resolved resource address, and `ip rule` must contain the
+   `not fwmark 51820 table 51820` rule. Missing entries usually mean the
+   `/usr/local/bin/prrr-route` hook is also stale — the same
+   `make install-system` step updates it.
+3. **Is the tunnel link up?** `ip link show prrr0` must not be `DOWN`; routes
+   into a DOWN device are inert. The current hook brings it up on `up`; a
+   persistent DOWN state after restart indicates a TUN creation failure in the
+   service logs (`journalctl -u prrr-client`).
+4. **Does the destination match a route?** `ip route get <resource-ip>` must
+   show `dev prrr0`. Resource routing is IPv4-only: a browser that reaches the
+   service over IPv6 bypasses the tunnel entirely — disable IPv6 on the host or
+   route everything with `all_traffic = true`.
+
+Resource routing resolves hostnames when the client starts, so DNS changes
+require a client restart. URLs, wildcards, CIDRs, and IPv6-only hostnames are
+not valid resource entries.
 
 ### "Unauthorized client" error
 

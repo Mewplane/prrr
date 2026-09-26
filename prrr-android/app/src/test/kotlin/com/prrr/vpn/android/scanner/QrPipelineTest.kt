@@ -129,7 +129,8 @@ class QrPipelineTest {
                     dnsServers = extractList("dns"),
                     mtu = extractInt("mtu").toUShort(),
                     preferredBinding = null,
-                    transportProtocol = extract("transport_protocol").ifEmpty { null }
+                    transportProtocol = extract("transport_protocol").ifEmpty { null },
+                    fullTunnel = null
                 )
             }
         }

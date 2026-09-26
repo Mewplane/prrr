@@ -16,12 +16,13 @@
 //!    HMAC integrity (constant-time), and nonce uniqueness.
 //! 4. On failure, the server returns a static decoy HTTP response.
 
-use std::collections::HashMap;
-use std::net::IpAddr;
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    net::IpAddr,
+    time::{Duration, Instant},
+};
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use subtle::ConstantTimeEq;
 
 // ---------------------------------------------------------------------------

@@ -21,11 +21,9 @@
 //! download tokens. Each token maps to a TOML config string and expires
 //! after [`TOKEN_TTL_SECS`] seconds.
 
-use std::collections::HashMap;
-use std::fmt::Write as _;
+use std::{collections::HashMap, fmt::Write as _};
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use tokio::sync::Mutex;
 
 use crate::registry::ClientRecord;
@@ -123,11 +121,7 @@ const DEFAULT_PRIVATE_KEY_PATH: &str = "~/.config/prrr/private.key";
 /// If `private_key` is `Some`, the key is embedded inline as base64 (for
 /// mobile QR import). If `None`, a `private_key_path` pointing to the
 /// default location is emitted instead (for CLI clients).
-pub fn generate_client_config(
-    ctx: &ServerContext,
-    record: &ClientRecord,
-    private_key: Option<&[u8]>,
-) -> Result<String, DistributionError> {
+pub fn generate_client_config(ctx: &ServerContext, record: &ClientRecord, private_key: Option<&[u8]>) -> Result<String, DistributionError> {
     let noise_b64 = base64::engine::general_purpose::STANDARD.encode(ctx.noise_public_key);
     let kem_b64 = base64::engine::general_purpose::STANDARD.encode(&ctx.kem_public_key);
     let ip_with_prefix = format!("{}{CLIENT_CIDR_PREFIX}", record.ip_address);
@@ -183,9 +177,9 @@ pub fn generate_client_config(
 /// modules) down to version 25-30 (~117-137 modules), which is much easier for
 /// mobile camera scanners to detect.
 pub fn generate_qr_svg(config_toml: &str) -> Result<String, DistributionError> {
-    use flate2::Compression;
-    use flate2::write::DeflateEncoder;
     use std::io::Write;
+
+    use flate2::{Compression, write::DeflateEncoder};
 
     let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
     encoder
@@ -221,8 +215,9 @@ pub fn decode_import_url(url: &str) -> Result<String, DistributionError> {
         .decode(encoded)
         .map_err(|e| DistributionError::Serialization(format!("base64 decode failed: {e}")))?;
 
-    use flate2::read::DeflateDecoder;
     use std::io::Read;
+
+    use flate2::read::DeflateDecoder;
     let mut decoder = DeflateDecoder::new(&compressed[..]);
     let mut decompressed = String::new();
     decoder
@@ -345,10 +340,12 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     // FRD: specs/frds/FRD-P009.md
 
+    use std::net::Ipv4Addr;
+
+    use uuid::Uuid;
+
     use super::*;
     use crate::registry::{ClientRecord, ClientStatus};
-    use std::net::Ipv4Addr;
-    use uuid::Uuid;
 
     // --- Test constants ---
 
@@ -363,9 +360,9 @@ mod tests {
 
     /// Deflate-compress and base64url-encode, returning a `prrr://import?z=...` URL.
     fn compress_to_import_url(toml: &str) -> String {
-        use flate2::Compression;
-        use flate2::write::DeflateEncoder;
         use std::io::Write;
+
+        use flate2::{Compression, write::DeflateEncoder};
 
         let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
         encoder.write_all(toml.as_bytes()).unwrap();

@@ -6,16 +6,13 @@
 //! [`ServerConfig`] for server TOML configuration, and [`ClientConfigFile`]
 //! for client TOML configuration.
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::{net::SocketAddr, path::PathBuf};
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
 
-use crate::crypto::hybrid_kex::KEM_ENCAPSULATION_KEY_LEN;
-use crate::handshake::noise_ik::PUBLIC_KEY_LEN;
+use crate::{crypto::hybrid_kex::KEM_ENCAPSULATION_KEY_LEN, handshake::noise_ik::PUBLIC_KEY_LEN};
 
 // ---------------------------------------------------------------------------
 // Default constants — server
@@ -135,6 +132,27 @@ pub enum Command {
     Server(ServerArgs),
     /// Connect to VPN server or import configuration.
     Client(ClientArgs),
+    /// Manage client-to-client sharing (opt into inter-client routing).
+    Sharing(SharingArgs),
+}
+
+/// Arguments for the `prrr sharing` subcommand.
+#[derive(clap::Args, Debug)]
+pub struct SharingArgs {
+    /// Sharing action.
+    #[command(subcommand)]
+    pub action: SharingAction,
+}
+
+/// Client-to-client sharing actions (FRD-004).
+#[derive(Subcommand, Debug)]
+pub enum SharingAction {
+    /// Opt this client into inter-client routing.
+    Enable,
+    /// Opt this client out of inter-client routing.
+    Disable,
+    /// Show the current sharing state and the peer mesh address (when set).
+    Status,
 }
 
 /// Arguments for the `prrr server` subcommand.
@@ -262,6 +280,33 @@ pub enum ClientSubcommand {
     },
     /// Run client diagnostic checks.
     Doctor,
+    /// Manage hostname resources routed through the VPN.
+    Route(ClientRouteArgs),
+}
+
+/// Arguments for `prrr client route`.
+#[derive(clap::Args, Debug)]
+pub struct ClientRouteArgs {
+    /// Resource routing action.
+    #[command(subcommand)]
+    pub action: ClientRouteAction,
+}
+
+/// Resource routing actions.
+#[derive(Subcommand, Debug)]
+pub enum ClientRouteAction {
+    /// Add a hostname or IPv4 literal to the VPN resource set.
+    Add {
+        /// Hostname or IPv4 literal to route through the VPN.
+        resource: String,
+    },
+    /// Remove a hostname or IPv4 literal from the VPN resource set.
+    Remove {
+        /// Hostname or IPv4 literal to remove.
+        resource: String,
+    },
+    /// List configured VPN resources.
+    List,
 }
 
 /// Error message when --server is required but not provided.
@@ -533,10 +578,16 @@ pub struct InterfaceSection {
 pub struct RoutingSection {
     /// Route all traffic through VPN.
     pub all_traffic: Option<bool>,
+    /// Strict full-tunnel: when `true`, capture the local LAN too (disable the
+    /// default RFC1918 local-LAN auto-exclusion). Defaults to `false` (LAN
+    /// auto-exclusion on) so a sibling on the same LAN stays reachable.
+    pub full_tunnel: Option<bool>,
     /// Allowed destination CIDRs.
     pub allowed_ips: Option<Vec<String>>,
     /// Excluded destination CIDRs.
     pub excluded_ips: Option<Vec<String>>,
+    /// Hostnames or IPv4 literals routed through the VPN.
+    pub resources: Option<Vec<String>>,
     /// Firewall mark for VPN transport sockets (default: 51820).
     pub fwmark: Option<u32>,
     /// Path to routing hook script (default: `/usr/local/bin/prrr-route`).
@@ -809,9 +860,11 @@ pub fn init_tracing(level: &str, log_file: Option<&str>) {
 #[cfg(test)]
 mod tests {
     // FRD: specs/frds/FRD-P001.md, specs/frds/FRD-P009B.md
-    use super::*;
-    use clap::Parser;
     use std::path::Path;
+
+    use clap::Parser;
+
+    use super::*;
 
     // -----------------------------------------------------------------------
     // CLI tests (P-009B: nested subcommands)
@@ -829,7 +882,24 @@ mod tests {
                 assert!(args.config.is_none());
                 assert!(args.subcommand.is_none(), "no subcommand = start server");
             }
-            Command::Client(_) => panic!("expected Server command"),
+            _ => panic!("expected Server command"),
+        }
+    }
+
+    // FRD-004: CLI parses the `sharing enable|disable|status` subcommand.
+    #[test]
+    fn cli_parses_sharing_actions() {
+        match Cli::parse_from(["prrr", "sharing", "enable"]).command {
+            Command::Sharing(args) => assert!(matches!(args.action, SharingAction::Enable)),
+            _ => panic!("expected Sharing command"),
+        }
+        match Cli::parse_from(["prrr", "sharing", "disable"]).command {
+            Command::Sharing(args) => assert!(matches!(args.action, SharingAction::Disable)),
+            _ => panic!("expected Sharing command"),
+        }
+        match Cli::parse_from(["prrr", "sharing", "status"]).command {
+            Command::Sharing(args) => assert!(matches!(args.action, SharingAction::Status)),
+            _ => panic!("expected Sharing command"),
         }
     }
 
@@ -848,7 +918,7 @@ mod tests {
                 assert!(args.server_pq_public_key.is_none());
                 assert!(args.subcommand.is_none(), "no subcommand = connect mode");
             }
-            Command::Server(_) => panic!("expected Client command"),
+            _ => panic!("expected Client command"),
         }
     }
 
@@ -872,7 +942,7 @@ mod tests {
                 assert_eq!(args.server_public_key.as_deref(), Some(noise_b64));
                 assert_eq!(args.server_pq_public_key.as_deref(), Some(kem_b64));
             }
-            Command::Server(_) => panic!("expected Client command"),
+            _ => panic!("expected Client command"),
         }
     }
 
@@ -885,7 +955,7 @@ mod tests {
                 assert!(args.server.is_none(), "--server is optional at parse time");
                 assert!(args.subcommand.is_none());
             }
-            Command::Server(_) => panic!("expected Client command"),
+            _ => panic!("expected Client command"),
         }
     }
 
@@ -897,7 +967,7 @@ mod tests {
             Command::Client(args) => {
                 assert!(!args.insecure, "--insecure should default to false");
             }
-            Command::Server(_) => panic!("expected Client command"),
+            _ => panic!("expected Client command"),
         }
     }
 
@@ -909,7 +979,7 @@ mod tests {
             Command::Client(args) => {
                 assert!(args.insecure, "--insecure should be true when passed");
             }
-            Command::Server(_) => panic!("expected Client command"),
+            _ => panic!("expected Client command"),
         }
     }
 
@@ -1001,7 +1071,7 @@ protocol = "masque"
             Command::Client(args) => {
                 assert!(args.server_name.is_none(), "server_name should be None when not provided");
             }
-            Command::Server(_) => panic!("expected Client command"),
+            _ => panic!("expected Client command"),
         }
     }
 
@@ -1013,7 +1083,7 @@ protocol = "masque"
             Command::Client(args) => {
                 assert_eq!(args.server_name.as_deref(), Some("vpn.example.com"));
             }
-            Command::Server(_) => panic!("expected Client command"),
+            _ => panic!("expected Client command"),
         }
     }
 
@@ -1025,7 +1095,7 @@ protocol = "masque"
             Command::Server(args) => {
                 assert_eq!(args.server_name, "localhost");
             }
-            Command::Client(_) => panic!("expected Server command"),
+            _ => panic!("expected Server command"),
         }
     }
 
@@ -1052,7 +1122,7 @@ protocol = "masque"
                 assert_eq!(args.server_name, "vpn.example.com");
                 assert_eq!(args.config, Some(PathBuf::from("/etc/prrr.toml")));
             }
-            Command::Client(_) => panic!("expected Server command"),
+            _ => panic!("expected Server command"),
         }
     }
 
@@ -1178,6 +1248,25 @@ protocol = "masque"
                 _ => panic!("expected Import subcommand"),
             },
             _ => panic!("expected Client command"),
+        }
+    }
+
+    // FRD: specs/frds/FRD-resource-routing.md
+    #[test]
+    fn cli_client_route_add_parses() {
+        let cli = Cli::parse_from(["prrr", "client", "--config", "/tmp/client.toml", "route", "add", "chatgpt.com"]);
+        match cli.command {
+            Command::Client(args) => {
+                assert_eq!(args.config, Some(PathBuf::from("/tmp/client.toml")));
+                match args.subcommand {
+                    Some(ClientSubcommand::Route(route)) => match route.action {
+                        ClientRouteAction::Add { resource } => assert_eq!(resource, "chatgpt.com"),
+                        _ => panic!("expected route add"),
+                    },
+                    _ => panic!("expected route subcommand"),
+                }
+            }
+            _ => panic!("expected client command"),
         }
     }
 
@@ -1477,8 +1566,10 @@ mtu = 1100
 
 [routing]
 all_traffic = true
+full_tunnel = false
 allowed_ips = ["0.0.0.0/0", "::/0"]
 excluded_ips = ["192.168.0.0/16", "10.0.0.0/8"]
+resources = ["chatgpt.com", "claude.ai", "youtube.com", "telegram.org"]
 
 [transport]
 protocol = "masque"
@@ -1510,8 +1601,18 @@ enabled = true
 
         let routing = config.routing.expect("routing section");
         assert_eq!(routing.all_traffic, Some(true));
+        assert_eq!(routing.full_tunnel, Some(false));
         assert!(routing.allowed_ips.is_some());
         assert!(routing.excluded_ips.is_some());
+        assert_eq!(
+            routing.resources,
+            Some(vec![
+                "chatgpt.com".to_string(),
+                "claude.ai".to_string(),
+                "youtube.com".to_string(),
+                "telegram.org".to_string()
+            ])
+        );
 
         let transport = config.transport.expect("transport section");
         assert_eq!(transport.protocol.as_deref(), Some(DEFAULT_TRANSPORT_PROTOCOL));
@@ -1536,6 +1637,29 @@ endpoint = "10.0.0.1:443"
         let srv = config.server.expect("server section");
         assert_eq!(srv.endpoint.as_deref(), Some("10.0.0.1:443"));
         assert!(config.interface.is_none());
+    }
+
+    // FRD-001: full_tunnel is omitted by default (default-off → LAN auto-exclusion on).
+    #[test]
+    fn routing_full_tunnel_defaults_off_when_omitted() {
+        let toml_str = r#"
+[routing]
+all_traffic = true
+"#;
+        let config: ClientConfigFile = toml::from_str(toml_str).expect("parse routing");
+        let routing = config.routing.expect("routing section");
+        assert_eq!(routing.full_tunnel, None, "omitted full_tunnel must be None (LAN exclusion on)");
+    }
+
+    // FRD-001: full_tunnel = true parses (strict full-tunnel escape hatch).
+    #[test]
+    fn routing_full_tunnel_parses_true() {
+        let toml_str = r#"
+[routing]
+full_tunnel = true
+"#;
+        let config: ClientConfigFile = toml::from_str(toml_str).expect("parse routing");
+        assert_eq!(config.routing.expect("routing").full_tunnel, Some(true));
     }
 
     // AC-7c: Client config with unknown fields

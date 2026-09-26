@@ -180,8 +180,58 @@ Traffic routing rules.
 | Field | Type | Description |
 |-------|------|-------------|
 | `all_traffic` | bool | Route all traffic through the VPN |
+| `full_tunnel` | bool | Strict full-tunnel. When `true`, capture the local LAN too (disable the default RFC1918 local-LAN auto-exclusion). Defaults to `false`. |
 | `allowed_ips` | Array of String | Allowed destination CIDRs (e.g., `["0.0.0.0/0"]`) |
 | `excluded_ips` | Array of String | Excluded destination CIDRs (e.g., `["192.168.0.0/16"]`) |
+| `resources` | Array of String | Hostnames or IPv4 literals routed through the VPN (e.g., `["chatgpt.com", "claude.ai"]`) |
+
+#### Selected resource routing
+
+`resources` provides selective split tunneling. Each entry is a hostname or
+IPv4 literal. The client resolves hostnames when it starts and installs an
+exact IPv4 `/32` route for every returned address in the VPN policy table.
+Resources are therefore re-resolved by restarting the client after DNS changes.
+Wildcards, URLs, CIDRs, and IPv6-only resources are rejected. The current
+client TUN is IPv4-only; an IPv6 connection to a service is not covered by
+this setting.
+
+```toml
+[routing]
+resources = [
+  "chatgpt.com",
+  "api.openai.com",
+  "claude.ai",
+  "youtube.com",
+  "googlevideo.com",
+  "telegram.org",
+  "t.me",
+]
+```
+
+Use one entry for each hostname a service needs. Resource routes are active
+only while the tunnel is up and do not change the existing LAN auto-exclusion
+or full-tunnel settings.
+
+#### Local-LAN auto-exclusion (default)
+
+By default prrr keeps your active interface's RFC1918 local-LAN subnet
+(`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) **out of the tunnel**, so
+traffic to a device on the same LAN stays on the local link instead of being
+swallowed by the full tunnel. This is a zero-config courtesy that lets companion
+apps on the same Wi-Fi keep working while prrr is active. The detected LAN
+prefixes are merged with any `excluded_ips` you set; the tunnel's own subnet is
+never excluded.
+
+Set `full_tunnel = true` to opt out and route the LAN through the tunnel too:
+
+```toml
+[routing]
+full_tunnel = true   # capture the local LAN as well (strict full tunnel)
+```
+
+The `full_tunnel` flag and the computed `excluded_ips` set are also published to
+the ecosystem registry so sibling apps on the same laptop can coexist with prrr.
+See [ecosystem registry registration](ecosystem.md).
 
 ### `[transport]`
 

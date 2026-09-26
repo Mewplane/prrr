@@ -732,6 +732,12 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -747,7 +753,13 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 // when the library is loaded.
 internal interface IntegrityCheckingUniffiLib : Library {
     // Integrity check functions only
-    fun uniffi_prrr_mobile_checksum_func_parse_qr_config(
+    fun uniffi_prrr_mobile_checksum_func_lan_excluded_cidrs(
+): Short
+fun uniffi_prrr_mobile_checksum_func_parse_qr_config(
+): Short
+fun uniffi_prrr_mobile_checksum_func_sharing_get_state(
+): Short
+fun uniffi_prrr_mobile_checksum_func_sharing_set_enabled(
 ): Short
 fun uniffi_prrr_mobile_checksum_func_validate_config(
 ): Short
@@ -832,7 +844,13 @@ fun uniffi_prrr_mobile_fn_method_vpnconnection_stats(`ptr`: Pointer,uniffi_out_e
 ): RustBuffer.ByValue
 fun uniffi_prrr_mobile_fn_method_vpnconnection_status(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_prrr_mobile_fn_func_lan_excluded_cidrs(`fullTunnel`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 fun uniffi_prrr_mobile_fn_func_parse_qr_config(`qrData`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_prrr_mobile_fn_func_sharing_get_state(`statePath`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_prrr_mobile_fn_func_sharing_set_enabled(`statePath`: RustBuffer.ByValue,`enabled`: Byte,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_prrr_mobile_fn_func_validate_config(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -962,7 +980,16 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 }
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
-    if (lib.uniffi_prrr_mobile_checksum_func_parse_qr_config() != 21985.toShort()) {
+    if (lib.uniffi_prrr_mobile_checksum_func_lan_excluded_cidrs() != 49570.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_prrr_mobile_checksum_func_parse_qr_config() != 58806.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_prrr_mobile_checksum_func_sharing_get_state() != 21544.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_prrr_mobile_checksum_func_sharing_set_enabled() != 7116.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_prrr_mobile_checksum_func_validate_config() != 30339.toShort()) {
@@ -1221,6 +1248,29 @@ public object FfiConverterULong: FfiConverter<ULong, Long> {
 
     override fun write(value: ULong, buf: ByteBuffer) {
         buf.putLong(value.toLong())
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterBoolean: FfiConverter<Boolean, Byte> {
+    override fun lift(value: Byte): Boolean {
+        return value.toInt() != 0
+    }
+
+    override fun read(buf: ByteBuffer): Boolean {
+        return lift(buf.get())
+    }
+
+    override fun lower(value: Boolean): Byte {
+        return if (value) 1.toByte() else 0.toByte()
+    }
+
+    override fun allocationSize(value: Boolean) = 1UL
+
+    override fun write(value: Boolean, buf: ByteBuffer) {
+        buf.put(lower(value))
     }
 }
 
@@ -1730,6 +1780,50 @@ public object FfiConverterTypeConnectionStats: FfiConverterRustBuffer<Connection
 
 
 /**
+ * Sharing state surfaced to the Android toggle (mirrors [`SharingState`]).
+ *
+ * `peer_mesh_addr` is `None` in Step 4; Step 5 populates it once the
+ * inter-client route is confirmed up.
+ */
+data class SharingStateDto (
+    /**
+     * Whether the client has opted into inter-client routing.
+     */
+    var `enabled`: kotlin.Boolean, 
+    /**
+     * Authorized peer's reachable mesh address (`None` until Step 5).
+     */
+    var `peerMeshAddr`: kotlin.String?
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeSharingStateDto: FfiConverterRustBuffer<SharingStateDto> {
+    override fun read(buf: ByteBuffer): SharingStateDto {
+        return SharingStateDto(
+            FfiConverterBoolean.read(buf),
+            FfiConverterOptionalString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: SharingStateDto) = (
+            FfiConverterBoolean.allocationSize(value.`enabled`) +
+            FfiConverterOptionalString.allocationSize(value.`peerMeshAddr`)
+    )
+
+    override fun write(value: SharingStateDto, buf: ByteBuffer) {
+            FfiConverterBoolean.write(value.`enabled`, buf)
+            FfiConverterOptionalString.write(value.`peerMeshAddr`, buf)
+    }
+}
+
+
+
+/**
  * VPN configuration for mobile clients
  */
 data class VpnConfig (
@@ -1770,9 +1864,15 @@ data class VpnConfig (
      */
     var `preferredBinding`: kotlin.String?, 
     /**
-     * Transport protocol: "harp" or "masque" (None = harp)
+     * Transport protocol: "harp" or "masque" (None = masque)
      */
-    var `transportProtocol`: kotlin.String?
+    var `transportProtocol`: kotlin.String?, 
+    /**
+     * Strict full-tunnel: when `Some(true)`, capture the local LAN too (disable
+     * the default RFC1918 local-LAN auto-exclusion). `None`/`Some(false)` keep
+     * LAN auto-exclusion on so a sibling on the same LAN stays reachable.
+     */
+    var `fullTunnel`: kotlin.Boolean?
 ) {
     
     companion object
@@ -1794,6 +1894,7 @@ public object FfiConverterTypeVpnConfig: FfiConverterRustBuffer<VpnConfig> {
             FfiConverterUShort.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalBoolean.read(buf),
         )
     }
 
@@ -1807,7 +1908,8 @@ public object FfiConverterTypeVpnConfig: FfiConverterRustBuffer<VpnConfig> {
             FfiConverterSequenceString.allocationSize(value.`dnsServers`) +
             FfiConverterUShort.allocationSize(value.`mtu`) +
             FfiConverterOptionalString.allocationSize(value.`preferredBinding`) +
-            FfiConverterOptionalString.allocationSize(value.`transportProtocol`)
+            FfiConverterOptionalString.allocationSize(value.`transportProtocol`) +
+            FfiConverterOptionalBoolean.allocationSize(value.`fullTunnel`)
     )
 
     override fun write(value: VpnConfig, buf: ByteBuffer) {
@@ -1821,6 +1923,7 @@ public object FfiConverterTypeVpnConfig: FfiConverterRustBuffer<VpnConfig> {
             FfiConverterUShort.write(value.`mtu`, buf)
             FfiConverterOptionalString.write(value.`preferredBinding`, buf)
             FfiConverterOptionalString.write(value.`transportProtocol`, buf)
+            FfiConverterOptionalBoolean.write(value.`fullTunnel`, buf)
     }
 }
 
@@ -2039,6 +2142,38 @@ public object FfiConverterTypeMobileError : FfiConverterRustBuffer<MobileExcepti
 /**
  * @suppress
  */
+public object FfiConverterOptionalBoolean: FfiConverterRustBuffer<kotlin.Boolean?> {
+    override fun read(buf: ByteBuffer): kotlin.Boolean? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterBoolean.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.Boolean?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterBoolean.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.Boolean?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterBoolean.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?> {
     override fun read(buf: ByteBuffer): kotlin.String? {
         if (buf.get().toInt() == 0) {
@@ -2125,15 +2260,68 @@ public object FfiConverterSequenceString: FfiConverterRustBuffer<List<kotlin.Str
     }
 }
         /**
+         * Compute the RFC1918 local-LAN CIDRs the Android `VpnService` should exclude.
+         *
+         * Enumerates the device's active interfaces and returns their RFC1918 network
+         * prefixes (the LAN), excluding the tunnel's own subnet. When `full_tunnel` is
+         * `true`, returns an empty list so the tunnel captures LAN traffic too (strict
+         * full-tunnel escape hatch).
+         */ fun `lanExcludedCidrs`(`fullTunnel`: kotlin.Boolean): List<kotlin.String> {
+            return FfiConverterSequenceString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_prrr_mobile_fn_func_lan_excluded_cidrs(
+        FfiConverterBoolean.lower(`fullTunnel`),_status)
+}
+    )
+    }
+    
+
+        /**
          * Parse VPN configuration from QR code data
          *
-         * Decodes a `prrr://import?config=<base64>` URL and parses the TOML config.
+         * Decodes a `prrr://import?z=<base64>` URL (deflate-compressed TOML) and
+         * parses the config.
          */
     @Throws(MobileException::class) fun `parseQrConfig`(`qrData`: kotlin.String): VpnConfig {
             return FfiConverterTypeVpnConfig.lift(
     uniffiRustCallWithError(MobileException) { _status ->
     UniffiLib.INSTANCE.uniffi_prrr_mobile_fn_func_parse_qr_config(
         FfiConverterString.lower(`qrData`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Read the current sharing state from the app-owned state file (fail-closed).
+         *
+         * A missing or corrupt file yields the disabled default, so the Android toggle
+         * never shows "on" without a real on-disk opt-in.
+         */ fun `sharingGetState`(`statePath`: kotlin.String): SharingStateDto {
+            return FfiConverterTypeSharingStateDto.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_prrr_mobile_fn_func_sharing_get_state(
+        FfiConverterString.lower(`statePath`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Flip the sharing toggle and persist it; returns the resulting state.
+         *
+         * `enabled == true` opts into inter-client routing; `false` opts out (and drops
+         * any learned peer mesh address). Persisted atomically by the core store.
+         *
+         * # Errors
+         *
+         * Returns the I/O error string if the state file cannot be written.
+         */
+    @Throws(MobileException::class) fun `sharingSetEnabled`(`statePath`: kotlin.String, `enabled`: kotlin.Boolean): SharingStateDto {
+            return FfiConverterTypeSharingStateDto.lift(
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.INSTANCE.uniffi_prrr_mobile_fn_func_sharing_set_enabled(
+        FfiConverterString.lower(`statePath`),FfiConverterBoolean.lower(`enabled`),_status)
 }
     )
     }

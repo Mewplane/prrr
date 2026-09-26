@@ -7,17 +7,22 @@
 
 //! Shared application state for web API handlers.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::{
+    collections::HashMap,
+    sync::{Arc, atomic::AtomicU32},
+};
 
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::distribution::{ConfigTokenStore, ServerContext};
-use crate::registry::ClientRegistry;
-use crate::web::handlers::{ServerConfigResponse, TransportInfoResponse};
-use crate::web::harp::{HarpSessionStore, HarpTunnelSpawner};
+use crate::{
+    distribution::{ConfigTokenStore, ServerContext},
+    registry::ClientRegistry,
+    web::{
+        handlers::{ServerConfigResponse, TransportInfoResponse},
+        harp::{HarpSessionStore, HarpTunnelSpawner},
+    },
+};
 
 /// Shared state accessible to all web API handlers.
 ///
