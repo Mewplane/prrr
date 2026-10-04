@@ -79,7 +79,7 @@ lint:
 	@echo "Checking formatting..."
 	$(CARGO) fmt --all --check
 	@echo "Running cargo audit..."
-	$(CARGO) audit || true
+	$(CARGO) audit --deny warnings
 	@echo "Linting complete"
 
 # Format code
@@ -105,7 +105,7 @@ shellcheck:
 	@echo "Running shellcheck on E2E scripts..."
 	shellcheck deploy/client/entrypoint.sh deploy/client/run-podman.sh
 	@echo "Running shellcheck on client deployment scripts..."
-	shellcheck deploy/client/install-client.sh deploy/client/prrr-route
+	shellcheck deploy/client/install-client.sh deploy/client/prrr-route deploy/client/nm-unmanaged.sh
 	@echo "Shellcheck passed"
 
 # =============================================================================

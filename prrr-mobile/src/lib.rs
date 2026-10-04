@@ -36,7 +36,7 @@ pub(crate) fn init_logging() {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        #[cfg(feature = "android-logging")]
+        #[cfg(all(target_os = "android", feature = "android-logging"))]
         {
             use tracing_subscriber::{layer::SubscriberExt, EnvFilter};
             let filter = EnvFilter::new("prrr=debug,prrr_mobile=debug,info");
@@ -44,7 +44,7 @@ pub(crate) fn init_logging() {
             let subscriber = tracing_subscriber::registry().with(filter).with(android_layer);
             let _ = tracing::subscriber::set_global_default(subscriber);
         }
-        #[cfg(not(feature = "android-logging"))]
+        #[cfg(not(all(target_os = "android", feature = "android-logging")))]
         {
             let _ = tracing_subscriber::fmt()
                 .with_env_filter("prrr=debug,prrr_mobile=debug,info")

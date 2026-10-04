@@ -89,6 +89,70 @@ pub struct ReconnectConfig {
     pub backoff_initial_ms: u64,
     /// Maximum backoff delay in milliseconds.
     pub backoff_max_ms: u64,
+    /// Interval between resource hostname re-resolution rounds while the
+    /// tunnel is up. Also applied once before every route setup (each
+    /// connect/reconnect). See BUG-resource-ip-staleness.
+    pub resource_refresh: std::time::Duration,
+    /// Interval between data-plane liveness checks while the pipeline runs.
+    /// See [`DEFAULT_DEAD_TUNNEL_CHECK`].
+    pub dead_tunnel_check: std::time::Duration,
+    /// Consecutive checks that must show outbound progress with zero inbound
+    /// progress before the tunnel is declared black-holed.
+    pub dead_tunnel_strikes: u32,
+    /// Interval between liveness probes of the DNS servers this tunnel
+    /// advertises to the host. See [`DEFAULT_DNS_CHECK`].
+    pub dns_check: std::time::Duration,
+    /// How long one DNS probe waits for an answer. See [`DEFAULT_DNS_PROBE_TIMEOUT`].
+    pub dns_probe_timeout: std::time::Duration,
+    /// UDP port the DNS probe questions. Production keeps 53; black-box tests
+    /// point it at a fixture responder, because port 53 needs privileges.
+    pub dns_probe_port: u16,
+}
+
+/// Default interval for resource hostname re-resolution (1 minute).
+pub const DEFAULT_RESOURCE_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Default interval between data-plane liveness checks (5 seconds).
+pub const DEFAULT_DEAD_TUNNEL_CHECK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Default number of silent liveness checks before a sending tunnel is
+/// declared dead (3 × 5 s = 15 s of one-way traffic).
+pub const DEFAULT_DEAD_TUNNEL_STRIKES: u32 = 3;
+
+/// Default interval between tunnel-resolver liveness probes (15 seconds).
+///
+/// Long enough that a healthy tunnel pays one extra datagram per interval,
+/// short enough that a tunnel whose resolver died stops starving host
+/// resolution within a human-noticeable window.
+pub const DEFAULT_DNS_CHECK: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Default wait for a DNS probe answer (2 seconds).
+pub const DEFAULT_DNS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Default DNS port the probe questions.
+pub const DEFAULT_DNS_PROBE_PORT: u16 = crate::dns_probe::DNS_PORT;
+
+impl Default for ReconnectConfig {
+    fn default() -> Self {
+        Self {
+            backoff_initial_ms: DEFAULT_BACKOFF_INITIAL_MS,
+            backoff_max_ms: DEFAULT_BACKOFF_MAX_MS,
+            resource_refresh: DEFAULT_RESOURCE_REFRESH,
+            dead_tunnel_check: DEFAULT_DEAD_TUNNEL_CHECK,
+            dead_tunnel_strikes: DEFAULT_DEAD_TUNNEL_STRIKES,
+            dns_check: DEFAULT_DNS_CHECK,
+            dns_probe_timeout: DEFAULT_DNS_PROBE_TIMEOUT,
+            dns_probe_port: DEFAULT_DNS_PROBE_PORT,
+        }
+    }
+}
+
+impl ReconnectConfig {
+    /// Wall-clock window of sending-without-receiving that condemns the tunnel
+    /// (`dead_tunnel_check` × `dead_tunnel_strikes`).
+    pub fn dead_tunnel_deadline(&self) -> std::time::Duration {
+        self.dead_tunnel_check * self.dead_tunnel_strikes
+    }
 }
 
 /// Cryptographic material needed for each reconnection handshake.
@@ -99,6 +163,131 @@ pub struct ReconnectCryptoParams<'a> {
     pub server_noise_pub: &'a [u8; 32],
     /// Server's ML-KEM-768 encapsulation key.
     pub server_kem_pub: &'a [u8],
+}
+
+/// Detects a one-way (black-holed) tunnel from traffic-counter progress.
+///
+/// A tunnel whose TUN address was flushed, or whose peer relay died while QUIC
+/// keeps answering, still *accepts* our packets: `bytes_sent` advances while
+/// `bytes_received` never moves, and no transport error is ever raised. The
+/// detector turns that signature into a verdict so the reconnect loop can tear
+/// routing down (traffic falls back to the host default route) and re-establish
+/// the session. An idle tunnel — no progress in either direction — proves
+/// nothing and never trips.
+/// BUG: specs/bugs/BUG-network-manager-tun-address-loss.md
+#[derive(Debug)]
+pub(crate) struct BlackHoleDetector {
+    /// Consecutive one-way checks required before declaring the tunnel dead.
+    strikes_max: u32,
+    /// Last observed `bytes_sent`, to spot outbound progress.
+    last_sent: u64,
+    /// Last observed `bytes_received`, to spot inbound progress.
+    last_received: u64,
+    /// Consecutive one-way checks so far.
+    strikes: u32,
+}
+
+impl BlackHoleDetector {
+    /// Create a detector tripping after `strikes_max` one-way checks.
+    pub(crate) fn new(strikes_max: u32) -> Self {
+        Self {
+            strikes_max,
+            last_sent: 0,
+            last_received: 0,
+            strikes: 0,
+        }
+    }
+
+    /// Record one observation of the shared counters; `true` means the tunnel
+    /// is black-holing. Any inbound progress clears the strike count.
+    pub(crate) fn observe(&mut self, stats: &TrafficStats) -> bool {
+        let order = std::sync::atomic::Ordering::Relaxed;
+        let sent = stats.bytes_sent.load(order);
+        let received = stats.bytes_received.load(order);
+        let sent_advanced = sent > self.last_sent;
+        let received_advanced = received > self.last_received;
+        self.last_sent = sent;
+        self.last_received = received;
+
+        if received_advanced {
+            self.strikes = 0;
+            return false;
+        }
+        if sent_advanced {
+            self.strikes += 1;
+            return self.strikes >= self.strikes_max;
+        }
+        false
+    }
+}
+
+/// Per-session prober for the DNS servers the tunnel advertises.
+///
+/// The configured resolvers are pinned through the TUN and handed to the system
+/// resolver, so a resolver that stops answering hangs every lookup on the host
+/// — worse than the uncensored-but-working resolver it replaced. One
+/// well-formed question per round tells a live responder from a black hole; the
+/// verdict travels on a [`tokio::sync::watch`] channel because only the newest
+/// answer matters.
+/// BUG: specs/bugs/BUG-network-manager-tun-address-loss.md
+struct DnsProber {
+    cancel: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl DnsProber {
+    /// Stop publishing verdicts and drop the task. The in-flight blocking
+    /// probe finishes on its own within the probe timeout.
+    fn stop(self) {
+        self.cancel.cancel();
+        self.task.abort();
+    }
+}
+
+/// Spawn a [`DnsProber`] that questions `target` immediately and then every
+/// `config.dns_check`, waiting at most `config.dns_probe_timeout` per round.
+///
+/// The question leaves on a plain UDP socket (no `SO_MARK`) from the blocking
+/// pool, so the kernel picks the path exactly as it does for an application
+/// lookup — which is the path being gated, thanks to the `/32` pin the hook
+/// keeps installed in both gate states. It must not run on the pipeline's task:
+/// a dead resolver would otherwise stall the tunnel for one timeout per round.
+fn spawn_dns_prober(
+    target: std::net::Ipv4Addr,
+    config: &ReconnectConfig,
+    health: tokio::sync::watch::Sender<bool>,
+    parent: &CancellationToken,
+) -> DnsProber {
+    let cancel = parent.child_token();
+    let (interval, timeout, port) = (config.dns_check, config.dns_probe_timeout, config.dns_probe_port);
+    let task = tokio::spawn({
+        let cancel = cancel.clone();
+        async move {
+            let mut ticker = tokio::time::interval_at(tokio::time::Instant::now(), interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    _ = ticker.tick() => {}
+                }
+                let probe = tokio::task::spawn_blocking(move || {
+                    let addr = std::net::SocketAddr::new(std::net::IpAddr::V4(target), port);
+                    crate::dns_probe::responds_at_addr(addr, timeout)
+                })
+                .await;
+                match probe {
+                    // A closed receiver means the tunnel loop has moved on.
+                    Ok(alive) => {
+                        if health.send(alive).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "DNS liveness probe task failed; keeping the current DNS gate"),
+                }
+            }
+        }
+    });
+    DnsProber { cancel, task }
 }
 
 /// Run the VPN client with automatic reconnection on transport failure.
@@ -163,8 +352,10 @@ pub async fn run_with_reconnect<T: TunDevice + Clone>(
             }
         };
 
-        // Set up routes after transport connects
+        // Set up routes after transport connects, folding one fresh DNS
+        // answer round into the resource set first (rotating CDN answers).
         if let Some(ref mut rm) = route_manager {
+            refresh_resource_routes(rm).await;
             rm.up();
         }
         // Register with the ecosystem registry on tunnel up (best-effort).
@@ -174,10 +365,78 @@ pub async fn run_with_reconnect<T: TunDevice + Clone>(
 
         let channel = EncryptedChannel::new(conn.session_keys.tx_key, conn.session_keys.rx_key);
         let stats = std::sync::Arc::new(TrafficStats::new());
+        let watchdog_stats = std::sync::Arc::clone(&stats);
         let pipeline = crate::tunnel::TunnelPipeline::new(tun.clone(), channel, conn.sender, conn.receiver, stats);
 
         tracing::info!("tunnel pipeline running");
-        match pipeline.run(cancel.clone()).await {
+        // Drive the pipeline alongside two independent timers:
+        //   * resource refresh — re-resolve hostname resources so rotating CDN
+        //     answers keep the policy-table /32 routes effective;
+        //   * black-hole watchdog — catch a tunnel that keeps swallowing our
+        //     packets while nothing ever comes back (no transport error is
+        //     raised in that state, so the loop would otherwise run forever).
+        let pipeline_fut = std::pin::pin!(pipeline.run(cancel.clone()));
+        let mut pipeline_fut = pipeline_fut;
+        let refresh_enabled = route_manager.as_deref().is_some_and(|rm| rm.resource_refresh_inputs().is_some());
+        // The tunnel's resolvers are pinned through this device and handed to
+        // the system resolver, so their liveness is probed off-loop and fed to
+        // the route manager, which re-runs the hook on a change. Until the
+        // first verdict lands the gate stays as the hook last left it.
+        let (dns_health_tx, mut dns_health_rx) = tokio::sync::watch::channel(true);
+        let dns_prober = route_manager
+            .as_deref()
+            .and_then(|rm| rm.dns_probe_target())
+            .map(|target| spawn_dns_prober(target, config, dns_health_tx, &cancel));
+        // Without a prober the sender was dropped with the mapping closure, so
+        // the branch must stay disabled — a closed watch channel would resolve
+        // instantly and spin the pipeline loop.
+        let mut dns_verdicts = dns_prober.is_some();
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + config.resource_refresh, config.resource_refresh);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut watchdog = tokio::time::interval_at(tokio::time::Instant::now() + config.dead_tunnel_check, config.dead_tunnel_check);
+        watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut detector = BlackHoleDetector::new(config.dead_tunnel_strikes);
+        let outcome = loop {
+            tokio::select! {
+                result = &mut pipeline_fut => break result,
+                _ = watchdog.tick() => {
+                    if detector.observe(&watchdog_stats) {
+                        tracing::error!(
+                            transport = transport.name(),
+                            deadline_secs = config.dead_tunnel_deadline().as_secs(),
+                            bytes_sent = watchdog_stats.bytes_sent.load(std::sync::atomic::Ordering::Relaxed),
+                            "tunnel is black-holing — outbound traffic with no inbound answer, reconnecting"
+                        );
+                        break Err(TunnelError::BlackHoled {
+                            deadline_secs: config.dead_tunnel_deadline().as_secs(),
+                        });
+                    }
+                }
+                _ = ticker.tick(), if refresh_enabled => {
+                    if let Some(rm) = route_manager.as_deref_mut() {
+                        refresh_resource_routes(rm).await;
+                    }
+                }
+                alive = dns_health_rx.changed(), if dns_verdicts => {
+                    match alive {
+                        Ok(()) => {
+                            if let Some(rm) = route_manager.as_deref_mut() {
+                                rm.observe_dns_health(*dns_health_rx.borrow_and_update());
+                            }
+                        }
+                        // The prober is gone (cancelled or panicked) and no
+                        // verdict can ever arrive again: stop listening.
+                        Err(_) => dns_verdicts = false,
+                    }
+                }
+            }
+        };
+        // Stop probing before the routes come down: the tunnel it measured is
+        // over, and a late verdict must not re-shuffle the host's resolvers.
+        if let Some(prober) = dns_prober {
+            prober.stop();
+        }
+        match outcome {
             Ok(()) => {
                 // Tear down routes on clean exit
                 if let Some(ref mut rm) = route_manager {
@@ -228,6 +487,20 @@ pub async fn run_with_reconnect<T: TunDevice + Clone>(
                 }
             }
         }
+    }
+}
+
+/// Re-resolve configured resource hostnames and apply the answer to the
+/// route manager. Failures keep the previous route set: the tunnel must
+/// survive DNS hiccups (fail-closed remains a start-time contract).
+async fn refresh_resource_routes(rm: &mut crate::routing::RouteManager) {
+    let Some((hosts, resolver)) = rm.resource_refresh_inputs() else {
+        return;
+    };
+    match tokio::task::spawn_blocking(move || crate::routing::resolve_resource_ips(&hosts, resolver.as_ref())).await {
+        Ok(Ok(ips)) => rm.apply_resource_ips(ips),
+        Ok(Err(e)) => tracing::warn!(error = %e, "resource refresh failed; keeping previous resource routes"),
+        Err(e) => tracing::warn!(error = %e, "resource refresh task failed; keeping previous resource routes"),
     }
 }
 
@@ -497,6 +770,131 @@ mod tests {
         }
     }
 
+    // BUG: specs/bugs/BUG-resource-ip-staleness.md
+    /// Resolver whose answer changes on every call, mimicking CDN rotation.
+    struct ScriptedResolver {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedResolver {
+        fn answers(&self) -> Vec<std::net::IpAddr> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 10 + n as u8))]
+        }
+    }
+
+    impl crate::routing::ResourceResolver for ScriptedResolver {
+        fn resolve(&self, _host: &str) -> std::io::Result<Vec<std::net::IpAddr>> {
+            Ok(self.answers())
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_refreshes_resource_routes_before_up_and_while_running() {
+        use std::sync::Arc;
+
+        use crate::tunnel::{mock_tun::MockTun, tun_device::DEFAULT_TUNNEL_MTU};
+
+        let dir = Arc::new(tempfile::tempdir().expect("tempdir"));
+        let log = dir.path().join("hook.log");
+        let hook = dir.path().join("hook.sh");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/bash\nif [ \"$1\" = up ]; then grep PRRR_RESOURCE_IPS \"$PRRR_ENV_FILE\" >> '{}' 2>/dev/null || true; fi\n",
+                log.display()
+            ),
+        )
+        .expect("write hook");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("chmod hook");
+        }
+
+        let params = crate::routing::RouteParams {
+            tun_device: "prrr0".to_string(),
+            client_ip: std::net::Ipv4Addr::new(10, 66, 66, 2),
+            gateway_ip: std::net::Ipv4Addr::new(10, 66, 66, 1),
+            server_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)),
+            server_endpoint: "vpn.example".to_string(),
+            all_traffic: false,
+            dns_servers: vec![],
+            allowed_ips: vec![],
+            excluded_ips: vec![],
+            resources: vec!["chatgpt.test".to_string()],
+            resource_ips: vec![std::net::Ipv4Addr::new(203, 0, 113, 1)],
+            fwmark: crate::routing::DEFAULT_FWMARK,
+        };
+        let resolver = Arc::new(ScriptedResolver {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut route_manager = crate::routing::RouteManager::new(params, hook.display().to_string())
+            .with_resolver(resolver)
+            .with_env_file(dir.path().join("env"));
+
+        let connect_count = Arc::new(AtomicU32::new(0));
+        let transport = FailNTransport::new(0, Arc::clone(&connect_count));
+        let crypto = TestCryptoMaterial::new();
+        let (tun, _handle) = MockTun::new(DEFAULT_TUNNEL_MTU);
+        let tun = Arc::new(tun);
+        let cancel = CancellationToken::new();
+
+        let config = ReconnectConfig {
+            backoff_initial_ms: 1,
+            backoff_max_ms: 10,
+            // Load-independent budgets: a starved spawn_blocking round must
+            // not flake the observation window.
+            resource_refresh: Duration::from_millis(200),
+            ..Default::default()
+        };
+
+        // Watch for the hook being re-run with a rotated answer while the
+        // pipeline runs (proves both the pre-up refresh and the live tick).
+        let cancel_watcher = cancel.clone();
+        let log_path = log.clone();
+        let rotator = tokio::spawn(async move {
+            let budget = tokio::time::sleep(Duration::from_secs(30));
+            tokio::pin!(budget);
+            loop {
+                tokio::select! {
+                    () = &mut budget => {
+                        return std::fs::read_to_string(&log_path).unwrap_or_default();
+                    }
+                    () = tokio::time::sleep(Duration::from_millis(50)) => {
+                        if let Ok(text) = std::fs::read_to_string(&log_path) {
+                            if text.contains("203.0.113.12") {
+                                cancel_watcher.cancel();
+                                return text;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let result = run_with_reconnect(
+            &transport,
+            &crypto.as_params(),
+            tun,
+            &config,
+            Some(&mut route_manager),
+            None,
+            cancel,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let text = rotator.await.expect("watcher task");
+        assert!(
+            text.contains("PRRR_RESOURCE_IPS=\"203.0.113.10 203.0.113.1\""),
+            "pre-up refresh must install the resolver answer: {text}"
+        );
+        assert!(
+            text.contains("203.0.113.12"),
+            "live refresh tick must fold rotated answers into the route set: {text}"
+        );
+    }
+
     #[tokio::test]
     async fn reconnect_retries_on_connect_error() {
         use crate::tunnel::{mock_tun::MockTun, tun_device::DEFAULT_TUNNEL_MTU};
@@ -512,6 +910,8 @@ mod tests {
         let config = ReconnectConfig {
             backoff_initial_ms: 1, // 1ms for fast test
             backoff_max_ms: 10,
+            resource_refresh: Duration::from_secs(300),
+            ..Default::default()
         };
 
         // Cancel after transport succeeds and pipeline blocks
@@ -547,6 +947,8 @@ mod tests {
         let config = ReconnectConfig {
             backoff_initial_ms: 1,
             backoff_max_ms: 10,
+            resource_refresh: Duration::from_secs(300),
+            ..Default::default()
         };
 
         // Cancel immediately after first connect
@@ -583,6 +985,8 @@ mod tests {
         let config = ReconnectConfig {
             backoff_initial_ms: 1,
             backoff_max_ms: 10,
+            resource_refresh: Duration::from_secs(300),
+            ..Default::default()
         };
 
         // Cancel after a few reconnect attempts
@@ -603,5 +1007,467 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(connect_count.load(Ordering::Relaxed) >= min_connect_attempts);
+    }
+
+    // -----------------------------------------------------------------------
+    // Black-holed tunnel detection (BUG-network-manager-tun-address-loss)
+    //
+    // A TUN that lost its address (NetworkManager flush) keeps swallowing our
+    // packets while the server's relay never answers. No transport error is
+    // ever raised, so only data-plane liveness can catch it.
+    // -----------------------------------------------------------------------
+
+    fn stats_with(sent: u64, received: u64) -> TrafficStats {
+        let stats = TrafficStats::new();
+        stats.bytes_sent.store(sent, Ordering::Relaxed);
+        stats.bytes_received.store(received, Ordering::Relaxed);
+        stats
+    }
+
+    #[test]
+    fn detector_trips_after_consecutive_one_way_checks() {
+        let stats = TrafficStats::new();
+        let mut detector = BlackHoleDetector::new(3);
+
+        stats.bytes_sent.store(100, Ordering::Relaxed);
+        assert!(!detector.observe(&stats), "first one-way check must not trip");
+        stats.bytes_sent.store(200, Ordering::Relaxed);
+        assert!(!detector.observe(&stats), "second one-way check must not trip");
+        stats.bytes_sent.store(300, Ordering::Relaxed);
+        assert!(detector.observe(&stats), "third consecutive one-way check trips");
+    }
+
+    #[test]
+    fn detector_clears_strikes_when_the_tunnel_answers() {
+        let mut detector = BlackHoleDetector::new(2);
+
+        assert!(!detector.observe(&stats_with(100, 0)), "one strike");
+        assert!(!detector.observe(&stats_with(200, 50)), "inbound answer clears the strikes");
+        assert!(!detector.observe(&stats_with(300, 50)), "one strike again after the reset");
+        assert!(detector.observe(&stats_with(400, 50)), "two consecutive silent checks trip");
+    }
+
+    #[test]
+    fn detector_never_trips_on_an_idle_tunnel() {
+        let stats = stats_with(4096, 2048);
+        let mut detector = BlackHoleDetector::new(1);
+        for round in 0..5 {
+            assert!(!detector.observe(&stats), "idle round {round} proves nothing");
+        }
+    }
+
+    #[test]
+    fn detector_ignores_inbound_only_progress() {
+        let mut detector = BlackHoleDetector::new(1);
+        assert!(!detector.observe(&stats_with(0, 0)), "nothing yet");
+        assert!(!detector.observe(&stats_with(0, 64)), "inbound-only progress is healthy");
+    }
+
+    #[test]
+    fn reconnect_deadline_is_check_times_strikes() {
+        let tuned = ReconnectConfig {
+            dead_tunnel_check: Duration::from_millis(500),
+            dead_tunnel_strikes: 4,
+            ..Default::default()
+        };
+        assert_eq!(tuned.dead_tunnel_deadline(), Duration::from_secs(2));
+        assert_eq!(
+            ReconnectConfig::default().dead_tunnel_deadline(),
+            Duration::from_secs(15),
+            "shipped default is 3 checks x 5s"
+        );
+    }
+
+    #[tokio::test]
+    async fn black_holed_tunnel_tears_down_routes_and_reconnects() {
+        use std::sync::Arc;
+
+        use crate::tunnel::{mock_tun::MockTun, tun_device::DEFAULT_TUNNEL_MTU};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("hook.log");
+        let hook = dir.path().join("hook.sh");
+        std::fs::write(&hook, format!("#!/bin/bash\necho \"$1\" >> '{}'\n", log.display())).expect("write hook");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("chmod hook");
+        }
+
+        let params = crate::routing::RouteParams {
+            tun_device: "prrr0".to_string(),
+            client_ip: std::net::Ipv4Addr::new(10, 66, 66, 2),
+            gateway_ip: std::net::Ipv4Addr::new(10, 66, 66, 1),
+            server_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 79)),
+            server_endpoint: "vpn.example".to_string(),
+            all_traffic: false,
+            dns_servers: vec![],
+            allowed_ips: vec![],
+            excluded_ips: vec![],
+            resources: vec![],
+            resource_ips: vec![std::net::Ipv4Addr::new(203, 0, 113, 10)],
+            fwmark: crate::routing::DEFAULT_FWMARK,
+        };
+        let mut route_manager = crate::routing::RouteManager::new(params, hook.display().to_string()).with_env_file(dir.path().join("env"));
+
+        let connect_count = Arc::new(AtomicU32::new(0));
+        let transport = FailNTransport::new(0, Arc::clone(&connect_count));
+        let crypto = TestCryptoMaterial::new();
+        let (tun, handle) = MockTun::new(DEFAULT_TUNNEL_MTU);
+        let tun = Arc::new(tun);
+        let cancel = CancellationToken::new();
+
+        let config = ReconnectConfig {
+            backoff_initial_ms: 1,
+            backoff_max_ms: 10,
+            resource_refresh: Duration::from_secs(300),
+            dead_tunnel_check: Duration::from_millis(20),
+            dead_tunnel_strikes: 2,
+            ..Default::default()
+        };
+
+        // Host keeps sending: outbound progress with a receiver that never
+        // answers is precisely the one-way signature under test.
+        let feeder = tokio::spawn(async move {
+            let packet = vec![0x45u8; 60];
+            loop {
+                if handle.inject_packet(&packet).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        // Stop once the watchdog has forced a second connect.
+        let cancel_watcher = {
+            let cancel = cancel.clone();
+            let count = Arc::clone(&connect_count);
+            tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    if count.load(Ordering::Relaxed) >= 2 {
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                cancel.cancel();
+            })
+        };
+
+        let result = run_with_reconnect(
+            &transport,
+            &crypto.as_params(),
+            tun,
+            &config,
+            Some(&mut route_manager),
+            None,
+            cancel,
+        )
+        .await;
+
+        cancel_watcher.await.expect("watcher");
+        feeder.abort();
+        assert!(result.is_ok(), "run must exit cleanly after cancel: {result:?}");
+
+        assert!(
+            connect_count.load(Ordering::Relaxed) >= 2,
+            "a one-way tunnel must trigger a reconnect, connects={}",
+            connect_count.load(Ordering::Relaxed)
+        );
+        let text = std::fs::read_to_string(&log).expect("read hook log");
+        let calls: Vec<&str> = text.lines().collect();
+        let first_up = calls.iter().position(|c| *c == "up").expect("hook up call");
+        let down_after_up = calls[first_up + 1..].contains(&"down");
+        assert!(down_after_up, "routes must come down when the tunnel black-holes: {calls:?}");
+    }
+
+    // BUG: specs/bugs/BUG-network-manager-tun-address-loss.md
+    /// Read the `(action, gate)` pairs a hook log recorded, in order.
+    fn gate_history(text: &str) -> Vec<(&str, &str)> {
+        let mut history = Vec::new();
+        let mut action = "";
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("action=") {
+                action = rest;
+            } else if let Some(gate) = line.strip_prefix("PRRR_DNS_GATE=") {
+                history.push((action, gate));
+            }
+        }
+        history
+    }
+
+    /// RouteManager whose hook records every action plus the DNS gate line the
+    /// binary published, so a test can read the gate's whole history.
+    fn dns_gate_route_manager(
+        dir: &std::path::Path,
+        dns_server: String,
+        resource_ips: Vec<std::net::Ipv4Addr>,
+    ) -> crate::routing::RouteManager {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let log = dir.join("hook.log");
+        let hook = dir.join("hook.sh");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/bash\necho \"action=$1\" >> '{log}'\nwhile IFS= read -r line; do case \"$line\" in PRRR_DNS_GATE=*) echo \"$line\" >> '{log}';; esac; done < \"$PRRR_ENV_FILE\"\n",
+                log = log.display()
+            ),
+        )
+        .expect("write hook");
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("chmod hook");
+
+        let params = crate::routing::RouteParams {
+            tun_device: "prrr0".to_string(),
+            client_ip: std::net::Ipv4Addr::new(10, 66, 66, 2),
+            gateway_ip: std::net::Ipv4Addr::new(10, 66, 66, 1),
+            server_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 79)),
+            server_endpoint: "vpn.example".to_string(),
+            all_traffic: false,
+            dns_servers: vec![dns_server],
+            allowed_ips: vec![],
+            excluded_ips: vec![],
+            resources: vec![],
+            resource_ips,
+            fwmark: crate::routing::DEFAULT_FWMARK,
+        };
+        crate::routing::RouteManager::new(params, hook.display().to_string()).with_env_file(dir.join("env"))
+    }
+
+    /// Loopback DNS responder for the gate tests. It answers every question
+    /// with the `QR` bit set and stops on a `stop` datagram, so the test controls
+    /// liveness without touching the system resolver.
+    struct FixtureResolver {
+        socket: Arc<std::net::UdpSocket>,
+        addr: std::net::SocketAddr,
+        done: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    }
+
+    impl FixtureResolver {
+        fn start() -> Self {
+            let socket = Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").expect("bind resolver fixture"));
+            let addr = socket.local_addr().expect("fixture addr");
+            let reader = Arc::clone(&socket);
+            let done = std::thread::spawn(move || {
+                let mut buffer = [0u8; 512];
+                while let Ok((read, peer)) = reader.recv_from(&mut buffer) {
+                    if &buffer[..read] == b"stop" {
+                        break;
+                    }
+                    let mut answer = buffer[..read].to_vec();
+                    answer[2] |= 0x80; // set QR: this is a response
+                    if reader.send_to(&answer, peer).is_err() {
+                        break;
+                    }
+                }
+            });
+            Self {
+                socket,
+                addr,
+                done: std::sync::Mutex::new(Some(done)),
+            }
+        }
+
+        /// Port the fixture answers on, for the prober's `dns_probe_port`.
+        fn port(&self) -> u16 {
+            self.addr.port()
+        }
+    }
+
+    impl Drop for FixtureResolver {
+        fn drop(&mut self) {
+            // A datagram to its own port wakes the reader and ends the thread.
+            let _ = self.socket.send_to(b"stop", self.addr);
+            if let Some(handle) = self.done.lock().expect("lock").take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dead_tunnel_resolver_closes_the_dns_gate_and_reruns_the_hook() {
+        use crate::tunnel::{mock_tun::MockTun, tun_device::DEFAULT_TUNNEL_MTU};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("hook.log");
+        // Bind then release a port: nothing listens there afterwards, so the
+        // probe is answered with ICMP port-unreachable — a dead resolver.
+        let dead_port = {
+            let scratch = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind scratch");
+            scratch.local_addr().expect("scratch addr").port()
+        };
+        let mut route_manager = dns_gate_route_manager(dir.path(), "127.0.0.1".to_string(), vec![std::net::Ipv4Addr::new(203, 0, 113, 10)]);
+
+        let connect_count = Arc::new(AtomicU32::new(0));
+        let transport = FailNTransport::new(0, Arc::clone(&connect_count));
+        let crypto = TestCryptoMaterial::new();
+        let (tun, _handle) = MockTun::new(DEFAULT_TUNNEL_MTU);
+        let tun = Arc::new(tun);
+        let cancel = CancellationToken::new();
+
+        let config = ReconnectConfig {
+            backoff_initial_ms: 1,
+            backoff_max_ms: 10,
+            resource_refresh: Duration::from_secs(300),
+            dns_check: Duration::from_millis(20),
+            dns_probe_timeout: Duration::from_millis(200),
+            dns_probe_port: dead_port,
+            ..Default::default()
+        };
+
+        let watcher = {
+            let cancel = cancel.clone();
+            let log = log.clone();
+            tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    if std::fs::read_to_string(&log).unwrap_or_default().contains("PRRR_DNS_GATE=off") {
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                cancel.cancel();
+            })
+        };
+
+        let result = run_with_reconnect(
+            &transport,
+            &crypto.as_params(),
+            tun,
+            &config,
+            Some(&mut route_manager),
+            None,
+            cancel,
+        )
+        .await;
+        watcher.await.expect("watcher");
+        assert!(result.is_ok(), "run must exit cleanly after cancel: {result:?}");
+
+        let text = std::fs::read_to_string(&log).expect("hook log");
+        let gate_history = gate_history(&text);
+        assert_eq!(
+            gate_history,
+            vec![("up", "on"), ("up", "off"), ("down", "off")],
+            "advertise at start, withdraw once the probe fails, stay withdrawn on teardown: {text}"
+        );
+        assert_eq!(
+            connect_count.load(Ordering::Relaxed),
+            1,
+            "a dead resolver is a DNS problem, not a reason to drop the tunnel"
+        );
+    }
+
+    #[tokio::test]
+    async fn healthy_tunnel_resolver_keeps_dns_in_the_tunnel_without_hook_churn() {
+        use crate::tunnel::{mock_tun::MockTun, tun_device::DEFAULT_TUNNEL_MTU};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("hook.log");
+        let resolver = FixtureResolver::start();
+        let mut route_manager = dns_gate_route_manager(dir.path(), "127.0.0.1".to_string(), vec![std::net::Ipv4Addr::new(203, 0, 113, 10)]);
+
+        let connect_count = Arc::new(AtomicU32::new(0));
+        let transport = FailNTransport::new(0, Arc::clone(&connect_count));
+        let crypto = TestCryptoMaterial::new();
+        let (tun, _handle) = MockTun::new(DEFAULT_TUNNEL_MTU);
+        let tun = Arc::new(tun);
+        let cancel = CancellationToken::new();
+
+        let config = ReconnectConfig {
+            backoff_initial_ms: 1,
+            backoff_max_ms: 10,
+            resource_refresh: Duration::from_secs(300),
+            dns_check: Duration::from_millis(20),
+            dns_probe_timeout: Duration::from_millis(200),
+            dns_probe_port: resolver.port(),
+            ..Default::default()
+        };
+
+        // Several probe rounds must pass with the gate untouched.
+        let watcher = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                cancel.cancel();
+            })
+        };
+
+        let result = run_with_reconnect(
+            &transport,
+            &crypto.as_params(),
+            tun,
+            &config,
+            Some(&mut route_manager),
+            None,
+            cancel,
+        )
+        .await;
+        watcher.await.expect("watcher");
+        assert!(result.is_ok(), "run must exit cleanly after cancel: {result:?}");
+
+        let text = std::fs::read_to_string(&log).expect("hook log");
+        assert!(text.contains("PRRR_DNS_GATE=on"), "DNS stays in the tunnel: {text}");
+        assert!(
+            !text.contains("PRRR_DNS_GATE=off"),
+            "a live resolver must not close the gate: {text}"
+        );
+        assert_eq!(
+            text.matches("action=up").count(),
+            1,
+            "healthy probes must never re-run the hook: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn split_tunnel_without_resources_probes_no_dns_and_never_closes_the_gate() {
+        use crate::tunnel::{mock_tun::MockTun, tun_device::DEFAULT_TUNNEL_MTU};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("hook.log");
+        // No resource IPs and no full tunnel: nothing reaches the tunnel, so the
+        // hook never touches the resolver and there is nothing to probe.
+        let mut route_manager = dns_gate_route_manager(dir.path(), "127.0.0.1".to_string(), vec![]);
+
+        let transport = FailNTransport::new(0, Arc::new(AtomicU32::new(0)));
+        let crypto = TestCryptoMaterial::new();
+        let (tun, _handle) = MockTun::new(DEFAULT_TUNNEL_MTU);
+        let tun = Arc::new(tun);
+        let cancel = CancellationToken::new();
+
+        let config = ReconnectConfig {
+            backoff_initial_ms: 1,
+            backoff_max_ms: 10,
+            resource_refresh: Duration::from_secs(300),
+            dns_check: Duration::from_millis(20),
+            dns_probe_timeout: Duration::from_millis(200),
+            dns_probe_port: 1,
+            ..Default::default()
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_with_reconnect(
+                &transport,
+                &crypto.as_params(),
+                tun,
+                &config,
+                Some(&mut route_manager),
+                None,
+                cancel.clone(),
+            ),
+        )
+        .await;
+        assert!(result.is_err(), "the pipeline must still be running (nothing probed it out of it)");
+        cancel.cancel();
+        result.unwrap_err();
+
+        let text = std::fs::read_to_string(&log).expect("hook log");
+        assert_eq!(text.matches("action=up").count(), 1, "bare split mode runs one hook: {text}");
+        assert!(!text.contains("PRRR_DNS_GATE=off"), "nothing to probe, so nothing to close: {text}");
     }
 }

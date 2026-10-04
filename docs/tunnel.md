@@ -55,8 +55,62 @@ without a default route, so non-resource traffic continues through the host's
 normal route.
 
 Resolution is intentionally fail-closed: a hostname that cannot resolve to an
-IPv4 address prevents client startup. DNS changes require a client restart.
+IPv4 address prevents client startup. Answers refresh every 60 seconds; old
+addresses are retained for eight refresh rounds, bounded to 256 addresses.
+Failed refreshes leave existing routes in place. Exact hostname entries do not
+include subdomains or service datacenter IPs. For a primary IPv4 connection,
+use `all_traffic = true` with `resources = []`.
 IPv6 is outside this feature until the client TUN supports IPv6.
+
+### Tunnel addressing and NetworkManager coexistence
+
+The client owns its TUN end to end. `deploy/client/prrr-route` re-asserts
+`PRRR_CLIENT_IP/32` on the device on **every** `up` — including the resource
+refresh cycle — so an address removed by anything external self-heals within one
+cycle. The hook also asks NetworkManager to stop managing the device
+(`nmcli device set <dev> managed no`), and the client installer writes
+`/etc/NetworkManager/conf.d/99-prrr-unmanaged.conf`:
+
+```ini
+[keyfile]
+unmanaged-devices+=interface-name:prrr*
+```
+
+so NetworkManager never adopts a prrr tunnel in the first place. The match is
+scoped to `prrr*`: every other interface — an OpenVPN `tun0`, the LAN, Wi-Fi —
+keeps its normal NetworkManager treatment. `deploy/client/nm-unmanaged.sh`
+writes that drop-in and reports its path (`PRRR_NM_CONF_DIR` relocates it for
+tests).
+
+This ownership is not cosmetic. A NetworkManager-managed TUN can have its
+address flushed while the client still owns the device fd; the kernel then
+sources injected packets from a LAN address, the server's masquerade rule
+(scoped to the tunnel subnet) stops matching them, and no reply ever comes back
+— a one-way black hole while the routing hook keeps reporting `UP`
+(specs/bugs/BUG-network-manager-tun-address-loss.md).
+
+### Data-plane liveness and the DNS gate
+
+A QUIC session that ACKs but never relays produces no transport error, so two
+independent watchdogs watch a tunnel that reports itself healthy:
+
+- **Black-hole watchdog** (`reconnect::BlackHoleDetector`). Outbound byte
+  counters advancing while inbound counters stand still is the signature of a
+  swallowed tunnel. After `dead_tunnel_check` × `dead_tunnel_strikes`
+  (defaults 5 s × 3 = 15 s) of it, `TunnelError::BlackHoled` tears routing down
+  — traffic falls back to the host's default route — and the client reconnects.
+  An idle tunnel proves nothing and never trips; any inbound progress clears the
+  strike count.
+- **DNS liveness gate** (`dns_probe` + `RouteManager`). The `[interface].dns`
+  servers are pinned through the tunnel and handed to the system resolver, so if
+  that path dies, every lookup on the host hangs with it. The client asks the
+  pinned server one question per `dns_check` (default 15 s, 2 s timeout) from the
+  blocking pool. A failure publishes `PRRR_DNS_GATE=off`, and the hook reverts
+  the system resolver to the host's own while keeping the `/32` pins: those pins
+  define the path being measured, so dropping them would let the probe answer
+  from the host's egress and the gate would oscillate. The next successful probe
+  re-advertises the tunnel resolvers, so recovery needs no operator action, and
+  the hook only re-runs on a gate *change*, not on every probe.
 
 ## Modules
 
@@ -98,8 +152,8 @@ let config = TunConfig::new(Ipv4Addr::new(10, 0, 0, 1))
 - `TunDevice` — Async trait for reading/writing IP packets.
 
 **Constants:**
-- `DEFAULT_TUNNEL_MTU = 1280` — Safe default (IPv6 minimum, works everywhere).
-- `MIN_TUNNEL_MTU = 1280` — Minimum allowed MTU.
+- `DEFAULT_TUNNEL_MTU = 1100` — Inner packets fit the minimum QUIC datagram budget after encryption and framing.
+- `MIN_TUNNEL_MTU = 576` — Minimum allowed inner IPv4 MTU.
 - `MAX_TUNNEL_MTU = 1420` — Maximum allowed MTU (Ethernet - VPN overhead).
 - `DEFAULT_TUN_NAME = "prrr0"` — Default device name.
 
@@ -363,6 +417,13 @@ When a transport connection drops, the client re-establishes a new session
 - **Reset on success**: Backoff resets to initial after a successful connect.
 - **Cancellation-aware**: The loop exits cleanly when the cancellation
   token is triggered, whether during connect, pipeline run, or backoff wait.
+- **Black-hole detection**: outbound progress with no inbound answer for
+  `dead_tunnel_check` × `dead_tunnel_strikes` (default 15 s) ends the session,
+  so a silently one-way tunnel reconnects instead of hanging forever — see
+  [Data-plane liveness and the DNS gate](#data-plane-liveness-and-the-dns-gate).
+- **DNS liveness gate**: the tunnel's advertised resolvers are probed every
+  `dns_check` (default 15 s); the system resolver is handed back to the host
+  while they do not answer.
 
 **Configuration** (in client `[transport]` section):
 ```toml

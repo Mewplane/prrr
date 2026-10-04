@@ -9,6 +9,7 @@ pub mod config;
 
 /// Diagnostic checks for `prrr server doctor` and `prrr client doctor`.
 pub mod diagnostics;
+pub mod dns_probe;
 
 /// Cryptographic primitives for the PRRR protocol.
 pub mod crypto;

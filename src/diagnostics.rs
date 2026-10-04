@@ -44,9 +44,11 @@ const EXIT_CODE_WARN: i32 = 1;
 const EXIT_CODE_FAIL: i32 = 2;
 
 /// Disk usage percentage threshold for warnings.
+#[cfg(target_os = "linux")]
 const DISK_WARN_PERCENT: u64 = 80;
 
 /// Disk usage percentage threshold for failures.
+#[cfg(target_os = "linux")]
 const DISK_FAIL_PERCENT: u64 = 95;
 
 /// Memory threshold (bytes) below which a failure is reported.

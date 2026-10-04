@@ -11,7 +11,7 @@ use std::{io::BufReader, path::Path, sync::Arc};
 
 use rustls::{
     client::danger::ServerCertVerifier,
-    pki_types::{CertificateDer, PrivateKeyDer},
+    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
 };
 
 use super::TransportError;
@@ -101,7 +101,7 @@ pub(crate) fn load_pem_cert_and_key(
     let cert_file = std::fs::File::open(cert_path)
         .map_err(|e| TransportError::TlsConfig(format!("failed to open cert file {}: {e}", cert_path.display())))?;
     let mut cert_reader = BufReader::new(cert_file);
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(&mut cert_reader)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| TransportError::TlsConfig(format!("failed to parse PEM certs from {}: {e}", cert_path.display())))?;
 
@@ -116,7 +116,9 @@ pub(crate) fn load_pem_cert_and_key(
     let key_file = std::fs::File::open(key_path)
         .map_err(|e| TransportError::TlsConfig(format!("failed to open key file {}: {e}", key_path.display())))?;
     let mut key_reader = BufReader::new(key_file);
-    let key = rustls_pemfile::private_key(&mut key_reader)
+    let key = PrivateKeyDer::pem_reader_iter(&mut key_reader)
+        .next()
+        .transpose()
         .map_err(|e| TransportError::TlsConfig(format!("failed to parse PEM key from {}: {e}", key_path.display())))?
         .ok_or_else(|| TransportError::TlsConfig(format!("no private key found in {}", key_path.display())))?;
 

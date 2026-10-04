@@ -314,8 +314,7 @@ mtu = 1100
     // FRD-001: [routing].full_tunnel = true is parsed from the QR config.
     #[test]
     fn test_parse_qr_config_full_tunnel_true() {
-        let config_toml = format!(
-            r#"[client]
+        let config_toml = r#"[client]
 name = "strict-client"
 
 [server]
@@ -332,7 +331,7 @@ mtu = 1100
 [routing]
 full_tunnel = true
 "#
-        );
+        .to_string();
         let qr_data = compress_to_qr_url(&config_toml);
         let config = parse_qr_config(qr_data).expect("parse full_tunnel config");
         assert_eq!(config.full_tunnel, Some(true));

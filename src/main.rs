@@ -582,6 +582,20 @@ async fn main() -> anyhow::Result<()> {
                     .as_ref()
                     .and_then(|t| t.reconnect_max_backoff_ms)
                     .unwrap_or(prrr::reconnect::DEFAULT_BACKOFF_MAX_MS),
+                resource_refresh: prrr::reconnect::DEFAULT_RESOURCE_REFRESH,
+                // Data-plane liveness: 15 s of outbound traffic with zero
+                // inbound answers means the tunnel went one-way (flushed TUN
+                // address, dead peer relay) — tear routing down and reconnect
+                // instead of black-holing forever.
+                dead_tunnel_check: prrr::reconnect::DEFAULT_DEAD_TUNNEL_CHECK,
+                dead_tunnel_strikes: prrr::reconnect::DEFAULT_DEAD_TUNNEL_STRIKES,
+                // DNS liveness: the configured resolvers are pinned through the
+                // tunnel and handed to the system resolver, so a resolver that
+                // stops answering must have its advertisement withdrawn within
+                // one probe round instead of hanging every lookup on the host.
+                dns_check: prrr::reconnect::DEFAULT_DNS_CHECK,
+                dns_probe_timeout: prrr::reconnect::DEFAULT_DNS_PROBE_TIMEOUT,
+                dns_probe_port: prrr::reconnect::DEFAULT_DNS_PROBE_PORT,
             };
 
             // Wrap TUN in Arc for persistence across reconnections
@@ -638,6 +652,7 @@ async fn main() -> anyhow::Result<()> {
                 dns_servers,
                 allowed_ips,
                 excluded_ips,
+                resources,
                 resource_ips,
                 fwmark,
             };
