@@ -407,6 +407,25 @@ impl RouteManager {
         self.pinned_ipv4_dns()
     }
 
+    /// Resource hostnames the tunnel resolver should be scoped to.
+    ///
+    /// In split mode the tunnel only carries these names' traffic, so only
+    /// these names should be resolved through it: every other name leaves over
+    /// the host's own path anyway, and asking the tunnel to arbitrate it turns a
+    /// degraded tunnel into a host-wide resolution outage. Literal addresses
+    /// need no name-based routing and are left out.
+    /// BUG: specs/bugs/BUG-split-mode-dns-catchall-hijacks-host-resolver.md
+    #[must_use]
+    pub fn dns_resource_domains(&self) -> Vec<String> {
+        self.params
+            .resources
+            .iter()
+            .map(|resource| resource.trim())
+            .filter(|resource| !resource.is_empty() && !resource.contains('/') && resource.parse::<IpAddr>().is_err())
+            .map(str::to_string)
+            .collect()
+    }
+
     /// The configured DNS servers that the hook pins through the tunnel, i.e.
     /// the addresses a probe can actually judge. Names and IPv6 servers are
     /// advertised but never measured, so they are never withdrawn.
@@ -595,6 +614,7 @@ PRRR_SERVER_ENDPOINT={server_endpoint}
 PRRR_ALL_TRAFFIC={all_traffic}
 PRRR_DNS_SERVERS=\"{dns}\"
 PRRR_DNS_ADVERTISE_SERVERS=\"{advertise}\"
+PRRR_RESOURCE_DOMAINS=\"{resource_domains}\"
 PRRR_ALLOWED_IPS=\"{allowed}\"
 PRRR_EXCLUDED_IPS=\"{excluded}\"
 PRRR_RESOURCE_IPS=\"{resource_ips}\"
@@ -610,6 +630,7 @@ PRRR_FWMARK={fwmark}
             all_traffic = self.params.all_traffic,
             dns = dns,
             advertise = self.dns_advertise.join(" "),
+            resource_domains = self.dns_resource_domains().join(" "),
             allowed = allowed,
             excluded = excluded,
             resource_ips = resource_ips,
@@ -1231,6 +1252,44 @@ mod tests {
         assert!(
             mgr.render_env().contains("PRRR_DNS_ADVERTISE_SERVERS=\"1.1.1.1 8.8.8.8\""),
             "an advertised server returns as soon as it answers again"
+        );
+    }
+
+    #[test]
+    fn resource_domains_are_only_the_names_the_tunnel_carries() {
+        // BUG: specs/bugs/BUG-split-mode-dns-catchall-hijacks-host-resolver.md
+        let params = RouteParams {
+            resources: vec![
+                "chatgpt.com".to_string(),
+                " t.me ".to_string(),
+                "203.0.113.9".to_string(),
+                "198.51.100.0/24".to_string(),
+                String::new(),
+            ],
+            ..gate_params(false, vec!["1.1.1.1".to_string()], vec![])
+        };
+        let mgr = RouteManager::new(params, "/nonexistent/script".to_string());
+
+        assert_eq!(
+            mgr.dns_resource_domains(),
+            vec!["chatgpt.com".to_string(), "t.me".to_string()],
+            "literal addresses and blanks are not names to route by"
+        );
+    }
+
+    #[test]
+    fn env_publishes_resource_domains_so_the_hook_can_scope_dns() {
+        // BUG: specs/bugs/BUG-split-mode-dns-catchall-hijacks-host-resolver.md
+        let params = RouteParams {
+            resources: vec!["chatgpt.com".to_string(), "t.me".to_string()],
+            ..gate_params(false, vec!["1.1.1.1".to_string()], vec![])
+        };
+        let mgr = RouteManager::new(params, "/nonexistent/script".to_string());
+
+        assert!(
+            mgr.render_env().contains("PRRR_RESOURCE_DOMAINS=\"chatgpt.com t.me\""),
+            "the hook cannot scope what the binary does not publish: {}",
+            mgr.render_env()
         );
     }
 

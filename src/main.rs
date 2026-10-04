@@ -583,6 +583,11 @@ async fn main() -> anyhow::Result<()> {
                     .and_then(|t| t.reconnect_max_backoff_ms)
                     .unwrap_or(prrr::reconnect::DEFAULT_BACKOFF_MAX_MS),
                 resource_refresh: prrr::reconnect::DEFAULT_RESOURCE_REFRESH,
+                // A resolution round that cannot answer inside this budget is
+                // abandoned rather than awaited: a DNS lookup must never hold the
+                // packet pump or the watchdogs. A gate, not a duration forecast.
+                // BUG: specs/bugs/BUG-pipeline-refresh-starves-packet-pump.md
+                resource_refresh_budget: prrr::reconnect::DEFAULT_RESOURCE_REFRESH_BUDGET,
                 // Data-plane liveness: 15 s of outbound traffic with zero
                 // inbound answers means the tunnel went one-way (flushed TUN
                 // address, dead peer relay) — tear routing down and reconnect
@@ -596,6 +601,11 @@ async fn main() -> anyhow::Result<()> {
                 dns_check: prrr::reconnect::DEFAULT_DNS_CHECK,
                 dns_probe_timeout: prrr::reconnect::DEFAULT_DNS_PROBE_TIMEOUT,
                 dns_probe_port: prrr::reconnect::DEFAULT_DNS_PROBE_PORT,
+                // Withdraw the tunnel resolver if no liveness verdict arrives within
+                // three probe intervals: a prober that stopped reporting must not
+                // leave the host trusting a stale verdict forever.
+                // BUG: specs/bugs/BUG-pipeline-refresh-starves-packet-pump.md
+                dns_verdict_lease: prrr::reconnect::DEFAULT_DNS_VERDICT_LEASE,
             };
 
             // Wrap TUN in Arc for persistence across reconnections

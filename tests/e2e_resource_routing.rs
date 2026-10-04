@@ -122,6 +122,7 @@ impl HookSandbox {
                  PRRR_SERVER_ENDPOINT=vpn.example\n\
                  PRRR_ALL_TRAFFIC={all_traffic}\n\
                  PRRR_DNS_SERVERS=\"1.1.1.1\"\n\
+                 PRRR_RESOURCE_DOMAINS=\"\"\n\
                  PRRR_ALLOWED_IPS=\"\"\n\
                  PRRR_EXCLUDED_IPS=\"\"\n\
                  PRRR_RESOURCE_IPS=\"{}\"\n\
@@ -172,6 +173,24 @@ impl HookSandbox {
         );
         assert!(replaced != raw, "the fixture's DNS line was not found");
         fs::write(&self.env_file, replaced).expect("rewrite servers");
+    }
+
+    /// Publish the resource hostnames the binary wants DNS scoped to.
+    /// BUG: specs/bugs/BUG-split-mode-dns-catchall-hijacks-host-resolver.md
+    fn set_resource_domains(&self, domains: &[&str]) {
+        let raw = fs::read_to_string(&self.env_file).expect("env");
+        let want = format!("PRRR_RESOURCE_DOMAINS=\"{}\"", domains.join(" "));
+        let rewritten: Vec<&str> = raw
+            .lines()
+            .map(|line| {
+                if line.starts_with("PRRR_RESOURCE_DOMAINS=") {
+                    want.as_str()
+                } else {
+                    line
+                }
+            })
+            .collect();
+        fs::write(&self.env_file, rewritten.join("\n") + "\n").expect("rewrite domains");
     }
 
     /// Publish the binary's verdict about which responders actually answered.
@@ -616,6 +635,43 @@ fn route_hook_advertises_only_the_dns_responders_that_answered() {
         &calls,
         "ip -4 route replace 8.8.8.8/32 dev prrr0 table 51820",
         "up: responsive server pinned",
+    );
+}
+
+#[test]
+fn route_hook_scopes_the_tunnel_resolver_to_resource_names_in_split_mode() {
+    // BUG: specs/bugs/BUG-split-mode-dns-catchall-hijacks-host-resolver.md
+    let sandbox = HookSandbox::new(false, &RESOURCE_IPS);
+    sandbox.set_resource_domains(&["chatgpt.com", "t.me"]);
+    sandbox.run("up");
+    let calls = sandbox.calls();
+
+    assert_contains(
+        &calls,
+        "resolvectl domain prrr0 ~chatgpt.com ~t.me",
+        "split mode: only the names the tunnel carries are resolved through it",
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.starts_with("resolvectl domain") && call.ends_with("~.")),
+        "split mode must not hand every name on the host to the tunnel: {}",
+        calls.join("\n")
+    );
+}
+
+#[test]
+fn route_hook_keeps_the_catch_all_resolver_when_the_tunnel_carries_everything() {
+    // BUG: specs/bugs/BUG-split-mode-dns-catchall-hijacks-host-resolver.md
+    let sandbox = HookSandbox::new(true, &[]);
+    sandbox.set_resource_domains(&["chatgpt.com", "t.me"]);
+    sandbox.run("up");
+    let calls = sandbox.calls();
+
+    assert_contains(
+        &calls,
+        "resolvectl domain prrr0 ~.",
+        "full tunnel: it carries every name, so it resolves every name",
     );
 }
 

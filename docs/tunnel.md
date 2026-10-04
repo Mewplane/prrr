@@ -115,6 +115,29 @@ independent watchdogs watch a tunnel that reports itself healthy:
   advertised but never judged. The next successful probe re-advertises, so
   recovery needs no operator action, and the hook only re-runs on a *change*, not
   on every probe (specs/bugs/BUG-tunnel-dns-single-probe-target.md).
+- **DNS verdict lease** (`reconnect::DnsVerdictLease`). A verdict is only as good
+  as the prober that produced it. If no verdict arrives within
+  `dns_verdict_lease` (default 45 s, three probe intervals), or the prober dies
+  while the tunnel is still up, the tunnel resolver is withdrawn and the host's
+  own resolver takes over — once per stale verdict, so the hook is not re-run on
+  every tick. Trusting the last-known-good verdict forever is what left a host
+  unable to resolve anything for minutes (specs/bugs/BUG-pipeline-refresh-starves-packet-pump.md).
+
+**What the tunnel resolver is allowed to cover.** In split mode the hook scopes
+it to the resource names the tunnel actually carries — `resolvectl domain prrr0
+~chatgpt.com ~t.me …`, published by the client as `PRRR_RESOURCE_DOMAINS` — so
+names whose traffic leaves over the LAN keep resolving through the host's
+resolver even while the tunnel is unhealthy. A full tunnel (`all_traffic = true`)
+keeps the `~.` catch-all, because there the tunnel really does carry every name
+(specs/bugs/BUG-split-mode-dns-catchall-hijacks-host-resolver.md).
+
+**Watchdogs are never waiting on a lookup.** Resource re-resolution runs on its
+own task (`reconnect::spawn_resource_refresher`) and reports fresh answers back
+through a channel. It used to be `await`ed inside the same `select!` that polls
+the packet pump, which is how one stalled resolver managed to freeze the data
+plane, the black-hole watchdog and the DNS gate simultaneously. A round that
+exceeds `resource_refresh_budget` (default 20 s) is abandoned rather than
+awaited; the installed routes keep working and the next tick retries.
 
 ## Modules
 

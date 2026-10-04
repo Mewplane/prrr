@@ -107,6 +107,12 @@ pub struct ReconnectConfig {
     /// UDP port the DNS probe questions. Production keeps 53; black-box tests
     /// point it at a fixture responder, because port 53 needs privileges.
     pub dns_probe_port: u16,
+    /// Wall-clock budget for one resource-resolution round before it is
+    /// abandoned and the next tick retries. See [`DEFAULT_RESOURCE_REFRESH_BUDGET`].
+    pub resource_refresh_budget: Duration,
+    /// How long a DNS liveness verdict may go unrefreshed before the tunnel
+    /// resolver is withdrawn. See [`DEFAULT_DNS_VERDICT_LEASE`].
+    pub dns_verdict_lease: Duration,
 }
 
 /// Default interval for resource hostname re-resolution (1 minute).
@@ -132,6 +138,22 @@ pub const DEFAULT_DNS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::
 /// Default DNS port the probe questions.
 pub const DEFAULT_DNS_PROBE_PORT: u16 = crate::dns_probe::DNS_PORT;
 
+/// Default budget for one resource-resolution round (20 seconds).
+///
+/// A round that cannot answer its own hostnames inside this window is dropped
+/// rather than awaited: the previous routes keep working, and the data plane
+/// keeps moving packets. It is a pass/fail gate on the lookup path, not a
+/// forecast of how long a round takes.
+pub const DEFAULT_RESOURCE_REFRESH_BUDGET: Duration = Duration::from_secs(20);
+
+/// Default age a DNS liveness verdict may reach before the tunnel resolver is
+/// withdrawn (45 seconds, three probe intervals).
+///
+/// Three intervals so a couple of lost probe datagrams on a lossy path do not
+/// make the host's resolver flap, while a prober that stopped reporting at all
+/// cannot keep the host pinned to a dead resolver indefinitely.
+pub const DEFAULT_DNS_VERDICT_LEASE: Duration = Duration::from_secs(45);
+
 impl Default for ReconnectConfig {
     fn default() -> Self {
         Self {
@@ -143,6 +165,8 @@ impl Default for ReconnectConfig {
             dns_check: DEFAULT_DNS_CHECK,
             dns_probe_timeout: DEFAULT_DNS_PROBE_TIMEOUT,
             dns_probe_port: DEFAULT_DNS_PROBE_PORT,
+            resource_refresh_budget: DEFAULT_RESOURCE_REFRESH_BUDGET,
+            dns_verdict_lease: DEFAULT_DNS_VERDICT_LEASE,
         }
     }
 }
@@ -366,10 +390,12 @@ pub async fn run_with_reconnect<T: TunDevice + Clone>(
             }
         };
 
-        // Set up routes after transport connects, folding one fresh DNS
-        // answer round into the resource set first (rotating CDN answers).
+        // Set up routes after transport connects. The first re-resolution round
+        // comes from the refresher task instead of being awaited here: the
+        // lookup path is precisely what stalls when DNS is unhealthy, and
+        // `up()` already installs the answers captured at startup.
+        // BUG: specs/bugs/BUG-pipeline-refresh-starves-packet-pump.md
         if let Some(ref mut rm) = route_manager {
-            refresh_resource_routes(rm).await;
             rm.up();
         }
         // Register with the ecosystem registry on tunnel up (best-effort).
@@ -391,7 +417,19 @@ pub async fn run_with_reconnect<T: TunDevice + Clone>(
         //     raised in that state, so the loop would otherwise run forever).
         let pipeline_fut = std::pin::pin!(pipeline.run(cancel.clone()));
         let mut pipeline_fut = pipeline_fut;
-        let refresh_enabled = route_manager.as_deref().is_some_and(|rm| rm.resource_refresh_inputs().is_some());
+        // Resource re-resolution lives on its own task and reports through this
+        // channel. It is never awaited in this loop, because this loop is the
+        // only thing polling the packet pump, the black-hole watchdog and the
+        // DNS gate — a round awaited here stops all three while it waits.
+        // BUG: specs/bugs/BUG-pipeline-refresh-starves-packet-pump.md
+        let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::unbounded_channel();
+        let refresh_enabled = match route_manager.as_deref().and_then(|rm| rm.resource_refresh_inputs()) {
+            Some((resources, resolver)) => {
+                spawn_resource_refresher(resources, resolver, config, &cancel, refresh_tx);
+                true
+            }
+            None => false,
+        };
         // The tunnel's resolvers are pinned through this device and handed to
         // the system resolver, so their liveness is probed off-loop and fed to
         // the route manager, which re-runs the hook on a change. Until the
@@ -406,8 +444,8 @@ pub async fn run_with_reconnect<T: TunDevice + Clone>(
         // the branch must stay disabled — a closed watch channel would resolve
         // instantly and spin the pipeline loop.
         let mut dns_verdicts = dns_prober.is_some();
-        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + config.resource_refresh, config.resource_refresh);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut refresh_open = refresh_enabled;
+        let mut dns_lease = DnsVerdictLease::new(config.dns_verdict_lease, tokio::time::Instant::now());
         let mut watchdog = tokio::time::interval_at(tokio::time::Instant::now() + config.dead_tunnel_check, config.dead_tunnel_check);
         watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut detector = BlackHoleDetector::new(config.dead_tunnel_strikes);
@@ -415,6 +453,15 @@ pub async fn run_with_reconnect<T: TunDevice + Clone>(
             tokio::select! {
                 result = &mut pipeline_fut => break result,
                 _ = watchdog.tick() => {
+                    if dns_verdicts && dns_lease.expire_if_stale(tokio::time::Instant::now()) {
+                        tracing::warn!(
+                            lease_secs = config.dns_verdict_lease.as_secs(),
+                            "no DNS liveness verdict within its lease; withdrawing the tunnel resolver rather than trusting a stale verdict"
+                        );
+                        if let Some(rm) = route_manager.as_deref_mut() {
+                            rm.observe_dns_health(&[]);
+                        }
+                    }
                     if detector.observe(&watchdog_stats) {
                         tracing::error!(
                             transport = transport.name(),
@@ -427,22 +474,43 @@ pub async fn run_with_reconnect<T: TunDevice + Clone>(
                         });
                     }
                 }
-                _ = ticker.tick(), if refresh_enabled => {
-                    if let Some(rm) = route_manager.as_deref_mut() {
-                        refresh_resource_routes(rm).await;
+                round = refresh_rx.recv(), if refresh_open => {
+                    match round {
+                        Some(ips) => {
+                            if let Some(rm) = route_manager.as_deref_mut() {
+                                rm.apply_resource_ips(ips);
+                            }
+                        }
+                        // The refresher exited (cancelled or dropped its
+                        // sender): stop polling a channel that cannot deliver.
+                        None => refresh_open = false,
                     }
                 }
                 alive = dns_health_rx.changed(), if dns_verdicts => {
                     match alive {
                         Ok(()) => {
                             let responders = dns_health_rx.borrow_and_update().clone();
+                            dns_lease.note_verdict(tokio::time::Instant::now());
                             if let Some(rm) = route_manager.as_deref_mut() {
                                 rm.observe_dns_health(&responders);
                             }
                         }
                         // The prober is gone (cancelled or panicked) and no
-                        // verdict can ever arrive again: stop listening.
-                        Err(_) => dns_verdicts = false,
+                        // verdict can ever arrive again. Stop listening *and*
+                        // withdraw the advertisement: a verdict that can never
+                        // be refreshed must not leave the host pointed at a
+                        // resolver nobody is checking anymore.
+                        Err(_) => {
+                            dns_verdicts = false;
+                            // Only a prober that died on its own is an emergency:
+                            // during shutdown `down()` reverts the link anyway, and
+                            // withdrawing here would re-run the hook for nothing.
+                            if !cancel.is_cancelled() {
+                                if let Some(rm) = route_manager.as_deref_mut() {
+                                    rm.observe_dns_health(&[]);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -509,14 +577,105 @@ pub async fn run_with_reconnect<T: TunDevice + Clone>(
 /// Re-resolve configured resource hostnames and apply the answer to the
 /// route manager. Failures keep the previous route set: the tunnel must
 /// survive DNS hiccups (fail-closed remains a start-time contract).
-async fn refresh_resource_routes(rm: &mut crate::routing::RouteManager) {
-    let Some((hosts, resolver)) = rm.resource_refresh_inputs() else {
-        return;
-    };
-    match tokio::task::spawn_blocking(move || crate::routing::resolve_resource_ips(&hosts, resolver.as_ref())).await {
-        Ok(Ok(ips)) => rm.apply_resource_ips(ips),
-        Ok(Err(e)) => tracing::warn!(error = %e, "resource refresh failed; keeping previous resource routes"),
-        Err(e) => tracing::warn!(error = %e, "resource refresh task failed; keeping previous resource routes"),
+/// Drive resource re-resolution off the pipeline loop.
+///
+/// Each round re-resolves the configured hostname resources on the blocking
+/// pool and hands the fresh answers to the pipeline loop through `out`, which
+/// folds them into the routed set. It runs on its own task with its own
+/// interval on purpose: resolution goes through the host's resolver, which can
+/// stall for minutes when DNS is unhealthy, and the pipeline loop is the only
+/// thing polling the packet pump, the black-hole watchdog and the DNS gate.
+/// A round awaited inline therefore freezes the tunnel for the duration of the
+/// lookup — and a frozen tunnel makes those very lookups less likely to
+/// answer, which is a deadlock by starvation rather than a slow path.
+///
+/// A round that overruns `budget` is abandoned, not awaited: the routes already
+/// installed keep working and the next tick retries. The detached blocking
+/// lookup cannot be cancelled (it is `getaddrinfo`), but it can no longer hold
+/// the data plane hostage.
+///
+/// BUG: specs/bugs/BUG-pipeline-refresh-starves-packet-pump.md
+fn spawn_resource_refresher(
+    resources: Vec<String>,
+    resolver: std::sync::Arc<dyn crate::routing::ResourceResolver + Send + Sync>,
+    config: &ReconnectConfig,
+    parent: &CancellationToken,
+    out: tokio::sync::mpsc::UnboundedSender<Vec<std::net::Ipv4Addr>>,
+) {
+    let cancel = parent.child_token();
+    let (interval, budget) = (config.resource_refresh, config.resource_refresh_budget);
+    tokio::spawn(async move {
+        // Immediate first round: the answers captured at startup start rotating
+        // as soon as the tunnel is up rather than a full interval later.
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now(), interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                _ = ticker.tick() => {}
+            }
+            let (resources, resolver) = (resources.clone(), std::sync::Arc::clone(&resolver));
+            let round = tokio::task::spawn_blocking(move || crate::routing::resolve_resource_ips(&resources, resolver.as_ref()));
+            match tokio::time::timeout(budget, round).await {
+                Ok(Ok(Ok(ips))) => {
+                    if out.send(ips).is_err() {
+                        // The pipeline loop has moved on to another session.
+                        break;
+                    }
+                }
+                Ok(Ok(Err(e))) => {
+                    tracing::warn!(error = %e, "resource refresh failed; keeping previous resource routes");
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "resource refresh task failed; keeping previous resource routes");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        budget_secs = budget.as_secs(),
+                        "resource refresh exceeded its budget; abandoning the round so the packet pump keeps running"
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// Age of the newest DNS liveness verdict, as enforced by the pipeline loop.
+///
+/// The host's resolver is pointed at the tunnel's resolver only while a probe
+/// says that resolver answers. A prober that stops reporting — cancelled,
+/// panicked, or starved by the loop meant to consume its verdicts — must not
+/// leave the host trusting the last verdict forever. The lease withdraws the
+/// tunnel resolver when no verdict arrives in time, handing lookups back to the
+/// host's own resolver.
+///
+/// BUG: specs/bugs/BUG-pipeline-refresh-starves-packet-pump.md
+#[derive(Debug, Clone)]
+pub struct DnsVerdictLease {
+    lease: Duration,
+    seen: tokio::time::Instant,
+}
+
+impl DnsVerdictLease {
+    /// Start a lease whose most recent verdict was seen at `now`.
+    #[must_use]
+    pub fn new(lease: Duration, now: tokio::time::Instant) -> Self {
+        Self { lease, seen: now }
+    }
+
+    /// Record a fresh verdict, restarting the lease.
+    pub fn note_verdict(&mut self, now: tokio::time::Instant) {
+        self.seen = now;
+    }
+
+    /// Report whether the lease ran out, resetting the clock so one stale
+    /// verdict costs exactly one withdrawal instead of one per tick.
+    pub fn expire_if_stale(&mut self, now: tokio::time::Instant) -> bool {
+        if now.duration_since(self.seen) > self.lease {
+            self.seen = now;
+            return true;
+        }
+        false
     }
 }
 
@@ -806,7 +965,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconnect_refreshes_resource_routes_before_up_and_while_running() {
+    async fn reconnect_refreshes_resource_routes_from_its_own_task_while_running() {
         use std::sync::Arc;
 
         use crate::tunnel::{mock_tun::MockTun, tun_device::DEFAULT_TUNNEL_MTU};
@@ -865,7 +1024,8 @@ mod tests {
         };
 
         // Watch for the hook being re-run with a rotated answer while the
-        // pipeline runs (proves both the pre-up refresh and the live tick).
+        // pipeline runs (proves the refresher's immediate first round and its
+        // later ticks both reach the route manager without blocking the pump).
         let cancel_watcher = cancel.clone();
         let log_path = log.clone();
         let rotator = tokio::spawn(async move {
@@ -1573,5 +1733,48 @@ mod tests {
         let text = std::fs::read_to_string(&log).expect("hook log");
         assert_eq!(text.matches("action=up").count(), 1, "bare split mode runs one hook: {text}");
         assert!(!text.contains("PRRR_DNS_GATE=off"), "nothing to probe, so nothing to close: {text}");
+    }
+
+    // -- AC: a DNS verdict nobody refreshes cannot outlive its lease ---------
+    // BUG: specs/bugs/BUG-pipeline-refresh-starves-packet-pump.md
+
+    #[test]
+    fn a_fresh_dns_verdict_is_within_its_lease() {
+        let now = tokio::time::Instant::now();
+        let mut lease = DnsVerdictLease::new(Duration::from_millis(50), now);
+
+        assert!(!lease.expire_if_stale(now), "a verdict seen this instant must not be judged stale");
+    }
+
+    #[test]
+    fn a_dns_verdict_past_its_lease_withdraws_once_and_not_again() {
+        let now = tokio::time::Instant::now();
+        let mut lease = DnsVerdictLease::new(Duration::from_millis(50), now);
+        let past_lease = now + Duration::from_millis(51);
+
+        assert!(
+            lease.expire_if_stale(past_lease),
+            "a verdict older than the lease means nobody is probing: withdraw"
+        );
+        assert!(
+            !lease.expire_if_stale(past_lease),
+            "one stale verdict must not re-run the hook on every watchdog tick"
+        );
+    }
+
+    #[test]
+    fn a_new_dns_verdict_restarts_the_lease() {
+        let now = tokio::time::Instant::now();
+        let mut lease = DnsVerdictLease::new(Duration::from_millis(50), now);
+        lease.note_verdict(now + Duration::from_millis(40));
+
+        assert!(
+            !lease.expire_if_stale(now + Duration::from_millis(80)),
+            "the lease runs from the newest verdict, not the first one"
+        );
+        assert!(
+            lease.expire_if_stale(now + Duration::from_millis(91)),
+            "and it does expire 50 ms after that newest verdict"
+        );
     }
 }

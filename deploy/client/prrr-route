@@ -242,12 +242,26 @@ setup_dns() {
         return
     fi
 
+    # Scope the tunnel resolver to the names the tunnel actually carries.
+    # In split mode every other name leaves over the host's own path anyway, so
+    # owning their resolution only risks it when the tunnel path dips; a full
+    # tunnel really does carry everything and must own the whole view. An older
+    # binary publishes no resource names, and the catch-all keeps that case
+    # exactly as it was.
+    # BUG: specs/bugs/BUG-split-mode-dns-catchall-hijacks-host-resolver.md
+    local domains="~."
+    if [[ "${PRRR_ALL_TRAFFIC:-false}" != "true" && -n "${PRRR_RESOURCE_DOMAINS:-}" ]]; then
+        # shellcheck disable=SC2086
+        domains=$(printf '~%s ' ${PRRR_RESOURCE_DOMAINS})
+    fi
+
     if command -v resolvectl &>/dev/null; then
         # systemd-resolved (Fedora, Ubuntu 18.04+)
         # shellcheck disable=SC2086
         resolvectl dns "$PRRR_DEVICE" $dns_servers 2>/dev/null || true
-        resolvectl domain "$PRRR_DEVICE" "~." 2>/dev/null || true
-        echo "DNS set via resolvectl: $dns_servers"
+        # shellcheck disable=SC2086
+        resolvectl domain "$PRRR_DEVICE" $domains 2>/dev/null || true
+        echo "DNS set via resolvectl: $dns_servers (domains: $domains)"
     elif command -v resolvconf &>/dev/null; then
         # openresolv (Debian, Arch, Alpine)
         # shellcheck disable=SC2086

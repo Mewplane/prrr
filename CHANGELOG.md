@@ -6,7 +6,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Split mode no longer asks the tunnel to resolve every name on the host**
+  (specs/bugs/BUG-split-mode-dns-catchall-hijacks-host-resolver.md). The hook
+  advertised the tunnel resolver with `resolvectl domain prrr0 "~."`, so while a
+  degraded tunnel held the gate open, unrelated names (`github.com`, `apt`, SSH)
+  hung on a resolver whose path did not carry their traffic either. Split mode
+  now advertises only the resource domains (`~chatgpt.com ~t.me …`) published as
+  `PRRR_RESOURCE_DOMAINS`, and a full tunnel keeps `~.` because it really does
+  carry everything. Binaries that do not publish the variable keep the old
+  catch-all behaviour.
+
 ### Fixed
+
+- **A slow DNS round froze the whole tunnel**
+  (specs/bugs/BUG-pipeline-refresh-starves-packet-pump.md). The reconnect loop
+  `await`ed resource re-resolution — a blocking `getaddrinfo` over every
+  hostname resource — inside the same `select!` that polls the packet pump, the
+  black-hole watchdog and the DNS gate, so a stalled resolver stopped all three.
+  Observed as `prrr0` counting zero packets across 300 successful sends, a
+  3-minute gap on a 60-second refresh ticker, a dead tunnel that never logged
+  `black-holing` because its detector could not run, and a DNS verdict frozen
+  for minutes. Resolution now runs on its own task behind a 20-second budget and
+  reports through a channel; a verdict nobody refreshes expires on a 45-second
+  lease and hands resolution back to the host's resolver.
 
 - **Resource routing had no effect on systemd-service clients**
   (specs/bugs/BUG-resource-routing-not-effective.md). Three stacked defects:
