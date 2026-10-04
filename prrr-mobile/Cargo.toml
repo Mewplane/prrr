@@ -22,10 +22,12 @@ libc = "0.2"
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-android = { version = "0.2", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 flate2 = "1.1"
 prrr = { path = "..", default-features = false }
+
+[target.'cfg(target_os = "android")'.dependencies]
+tracing-android = { version = "0.2", optional = true }
 
 [features]
 default = ["android-logging"]
