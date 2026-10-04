@@ -53,6 +53,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`unmanaged-devices+=interface-name:prrr*`) so NetworkManager never adopts a
   prrr TUN; `deploy/client/install-client.sh` installs it and reloads NetworkManager
   config. Scoped to `prrr*`, so unrelated tunnels are untouched.
+- **One silent resolver address closed tunnel DNS for the whole client**
+  (specs/bugs/BUG-tunnel-dns-single-probe-target.md). The liveness gate asked
+  only the first `[interface].dns` address. On the operator's host `1.1.1.1`
+  never answered UDP/53 through the tunnel (TCP/53 did, and `8.8.8.8` answered
+  both), so the gate stayed shut, the host fell back to its uncensored LAN
+  resolver, resource refreshes failed with `Temporary failure in name
+  resolution`, and pushes failed with `Could not resolve host`. The gate now
+  opens on any responder that answers and advertises only those; addresses the
+  IPv4-only probe cannot measure (IPv6, names) are never withdrawn.
 - `prrr::dns_probe`: single-question DNS liveness probe (RFC 1035 query, any
   RCODE counts as an answer) used to gate tunnel DNS.
 - `PRRR_DNS_GATE=on|off` in the routing env file, plus `deploy/client/prrr-route`

@@ -232,7 +232,12 @@ remove_resource_routes() {
 }
 
 setup_dns() {
-    local dns_servers="${PRRR_DNS_SERVERS:-}"
+    # The binary probes every pinned resolver and publishes the ones that
+    # actually answered; handing the system resolver an address that never
+    # replies costs the whole host a lookup timeout. Older binaries do not
+    # publish the verdict, so fall back to the whole configured list.
+    # BUG: specs/bugs/BUG-tunnel-dns-single-probe-target.md
+    local dns_servers="${PRRR_DNS_ADVERTISE_SERVERS:-${PRRR_DNS_SERVERS:-}}"
     if [[ -z "$dns_servers" ]]; then
         return
     fi

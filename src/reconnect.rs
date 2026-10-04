@@ -244,22 +244,29 @@ impl DnsProber {
     }
 }
 
-/// Spawn a [`DnsProber`] that questions `target` immediately and then every
-/// `config.dns_check`, waiting at most `config.dns_probe_timeout` per round.
+/// Spawn a [`DnsProber`] that questions every pinned `targets` address
+/// immediately and then every `config.dns_check`, waiting at most
+/// `config.dns_probe_timeout` per server.
 ///
 /// The question leaves on a plain UDP socket (no `SO_MARK`) from the blocking
 /// pool, so the kernel picks the path exactly as it does for an application
 /// lookup — which is the path being gated, thanks to the `/32` pin the hook
 /// keeps installed in both gate states. It must not run on the pipeline's task:
 /// a dead resolver would otherwise stall the tunnel for one timeout per round.
+///
+/// Each round reports the responders that answered, not a single yes/no: the
+/// first configured address may be unreachable for this peer while a later one
+/// answers, and that tunnel still has working DNS.
+/// BUG: specs/bugs/BUG-tunnel-dns-single-probe-target.md
 fn spawn_dns_prober(
-    target: std::net::Ipv4Addr,
+    targets: Vec<std::net::Ipv4Addr>,
     config: &ReconnectConfig,
-    health: tokio::sync::watch::Sender<bool>,
+    health: tokio::sync::watch::Sender<Vec<std::net::Ipv4Addr>>,
     parent: &CancellationToken,
 ) -> DnsProber {
     let cancel = parent.child_token();
     let (interval, timeout, port) = (config.dns_check, config.dns_probe_timeout, config.dns_probe_port);
+    let targets = std::sync::Arc::new(targets);
     let task = tokio::spawn({
         let cancel = cancel.clone();
         async move {
@@ -270,9 +277,16 @@ fn spawn_dns_prober(
                     () = cancel.cancelled() => break,
                     _ = ticker.tick() => {}
                 }
+                let targets = std::sync::Arc::clone(&targets);
                 let probe = tokio::task::spawn_blocking(move || {
-                    let addr = std::net::SocketAddr::new(std::net::IpAddr::V4(target), port);
-                    crate::dns_probe::responds_at_addr(addr, timeout)
+                    targets
+                        .iter()
+                        .copied()
+                        .filter(|target| {
+                            let addr = std::net::SocketAddr::new(std::net::IpAddr::V4(*target), port);
+                            crate::dns_probe::responds_at_addr(addr, timeout)
+                        })
+                        .collect::<Vec<_>>()
                 })
                 .await;
                 match probe {
@@ -382,11 +396,12 @@ pub async fn run_with_reconnect<T: TunDevice + Clone>(
         // the system resolver, so their liveness is probed off-loop and fed to
         // the route manager, which re-runs the hook on a change. Until the
         // first verdict lands the gate stays as the hook last left it.
-        let (dns_health_tx, mut dns_health_rx) = tokio::sync::watch::channel(true);
+        let (dns_health_tx, mut dns_health_rx) = tokio::sync::watch::channel(Vec::new());
         let dns_prober = route_manager
             .as_deref()
-            .and_then(|rm| rm.dns_probe_target())
-            .map(|target| spawn_dns_prober(target, config, dns_health_tx, &cancel));
+            .map(|rm| rm.dns_probe_targets())
+            .filter(|targets| !targets.is_empty())
+            .map(|targets| spawn_dns_prober(targets, config, dns_health_tx, &cancel));
         // Without a prober the sender was dropped with the mapping closure, so
         // the branch must stay disabled — a closed watch channel would resolve
         // instantly and spin the pipeline loop.
@@ -420,8 +435,9 @@ pub async fn run_with_reconnect<T: TunDevice + Clone>(
                 alive = dns_health_rx.changed(), if dns_verdicts => {
                     match alive {
                         Ok(()) => {
+                            let responders = dns_health_rx.borrow_and_update().clone();
                             if let Some(rm) = route_manager.as_deref_mut() {
-                                rm.observe_dns_health(*dns_health_rx.borrow_and_update());
+                                rm.observe_dns_health(&responders);
                             }
                         }
                         // The prober is gone (cancelled or panicked) and no
@@ -1202,7 +1218,7 @@ mod tests {
     /// binary published, so a test can read the gate's whole history.
     fn dns_gate_route_manager(
         dir: &std::path::Path,
-        dns_server: String,
+        dns_servers: Vec<String>,
         resource_ips: Vec<std::net::Ipv4Addr>,
     ) -> crate::routing::RouteManager {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1212,7 +1228,7 @@ mod tests {
         std::fs::write(
             &hook,
             format!(
-                "#!/bin/bash\necho \"action=$1\" >> '{log}'\nwhile IFS= read -r line; do case \"$line\" in PRRR_DNS_GATE=*) echo \"$line\" >> '{log}';; esac; done < \"$PRRR_ENV_FILE\"\n",
+                "#!/bin/bash\necho \"action=$1\" >> '{log}'\nwhile IFS= read -r line; do case \"$line\" in PRRR_DNS_GATE=*|PRRR_DNS_ADVERTISE_SERVERS=*) echo \"$line\" >> '{log}';; esac; done < \"$PRRR_ENV_FILE\"\n",
                 log = log.display()
             ),
         )
@@ -1226,7 +1242,7 @@ mod tests {
             server_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 79)),
             server_endpoint: "vpn.example".to_string(),
             all_traffic: false,
-            dns_servers: vec![dns_server],
+            dns_servers,
             allowed_ips: vec![],
             excluded_ips: vec![],
             resources: vec![],
@@ -1298,7 +1314,11 @@ mod tests {
             let scratch = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind scratch");
             scratch.local_addr().expect("scratch addr").port()
         };
-        let mut route_manager = dns_gate_route_manager(dir.path(), "127.0.0.1".to_string(), vec![std::net::Ipv4Addr::new(203, 0, 113, 10)]);
+        let mut route_manager = dns_gate_route_manager(
+            dir.path(),
+            vec!["127.0.0.1".to_string()],
+            vec![std::net::Ipv4Addr::new(203, 0, 113, 10)],
+        );
 
         let connect_count = Arc::new(AtomicU32::new(0));
         let transport = FailNTransport::new(0, Arc::clone(&connect_count));
@@ -1362,6 +1382,86 @@ mod tests {
         );
     }
 
+    /// A deployment whose *first* configured resolver never answers but whose
+    /// second one does must keep DNS inside the tunnel. Probing only the first
+    /// address closed the gate forever and left the host on its uncensored LAN
+    /// resolver. BUG: specs/bugs/BUG-tunnel-dns-single-probe-target.md
+    #[tokio::test]
+    async fn dns_gate_opens_for_a_later_configured_responder_and_advertises_only_the_live_one() {
+        use crate::tunnel::{mock_tun::MockTun, tun_device::DEFAULT_TUNNEL_MTU};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("hook.log");
+        let resolver = FixtureResolver::start();
+        // 127.0.0.2 has no listener: the probe gets ICMP port-unreachable there,
+        // while 127.0.0.1 is the fixture that answers on the probe port.
+        let mut route_manager = dns_gate_route_manager(
+            dir.path(),
+            vec!["127.0.0.2".to_string(), "127.0.0.1".to_string()],
+            vec![std::net::Ipv4Addr::new(203, 0, 113, 10)],
+        );
+
+        let connect_count = Arc::new(AtomicU32::new(0));
+        let transport = FailNTransport::new(0, Arc::clone(&connect_count));
+        let crypto = TestCryptoMaterial::new();
+        let (tun, _handle) = MockTun::new(DEFAULT_TUNNEL_MTU);
+        let tun = Arc::new(tun);
+        let cancel = CancellationToken::new();
+
+        let config = ReconnectConfig {
+            backoff_initial_ms: 1,
+            backoff_max_ms: 10,
+            resource_refresh: Duration::from_secs(300),
+            dns_check: Duration::from_millis(20),
+            dns_probe_timeout: Duration::from_millis(200),
+            dns_probe_port: resolver.port(),
+            ..Default::default()
+        };
+
+        let watcher = {
+            let cancel = cancel.clone();
+            let log = log.clone();
+            tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    let text = std::fs::read_to_string(&log).unwrap_or_default();
+                    if text.contains("PRRR_DNS_ADVERTISE_SERVERS=\"127.0.0.1\"") {
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                cancel.cancel();
+            })
+        };
+
+        let result = run_with_reconnect(
+            &transport,
+            &crypto.as_params(),
+            tun,
+            &config,
+            Some(&mut route_manager),
+            None,
+            cancel,
+        )
+        .await;
+        watcher.await.expect("watcher");
+        assert!(result.is_ok(), "run must exit cleanly after cancel: {result:?}");
+
+        let text = std::fs::read_to_string(&log).expect("hook log");
+        assert!(
+            !text.contains("PRRR_DNS_GATE=off"),
+            "a responder that answers further down the list keeps the gate open: {text}"
+        );
+        assert!(text.contains("PRRR_DNS_GATE=on"), "DNS stays in the tunnel: {text}");
+        assert!(
+            text.contains("PRRR_DNS_ADVERTISE_SERVERS=\"127.0.0.1\""),
+            "the dead server is dropped from the system resolver, not advertised: {text}"
+        );
+    }
+
     #[tokio::test]
     async fn healthy_tunnel_resolver_keeps_dns_in_the_tunnel_without_hook_churn() {
         use crate::tunnel::{mock_tun::MockTun, tun_device::DEFAULT_TUNNEL_MTU};
@@ -1369,7 +1469,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = dir.path().join("hook.log");
         let resolver = FixtureResolver::start();
-        let mut route_manager = dns_gate_route_manager(dir.path(), "127.0.0.1".to_string(), vec![std::net::Ipv4Addr::new(203, 0, 113, 10)]);
+        let mut route_manager = dns_gate_route_manager(
+            dir.path(),
+            vec!["127.0.0.1".to_string()],
+            vec![std::net::Ipv4Addr::new(203, 0, 113, 10)],
+        );
 
         let connect_count = Arc::new(AtomicU32::new(0));
         let transport = FailNTransport::new(0, Arc::clone(&connect_count));
@@ -1431,7 +1535,7 @@ mod tests {
         let log = dir.path().join("hook.log");
         // No resource IPs and no full tunnel: nothing reaches the tunnel, so the
         // hook never touches the resolver and there is nothing to probe.
-        let mut route_manager = dns_gate_route_manager(dir.path(), "127.0.0.1".to_string(), vec![]);
+        let mut route_manager = dns_gate_route_manager(dir.path(), vec!["127.0.0.1".to_string()], vec![]);
 
         let transport = FailNTransport::new(0, Arc::new(AtomicU32::new(0)));
         let crypto = TestCryptoMaterial::new();

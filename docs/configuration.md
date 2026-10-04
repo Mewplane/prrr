@@ -182,12 +182,19 @@ policy table and hands the addresses to the system resolver. While
 (or `allowed_ips`) actually puts traffic into the tunnel — otherwise prrr leaves
 the host's own resolver alone.
 
-The advertisement is guarded by a liveness probe: every 15 s the client asks the
-pinned server one DNS question. If it stops answering, the client withdraws the
-advertisement (the system resolver goes back to the host's own servers) while
-keeping the `/32` pins, and re-advertises as soon as the server answers again.
-A broken tunnel can therefore never hang name resolution on your machine
-(specs/bugs/BUG-network-manager-tun-address-loss.md).
+The advertisement is guarded by a liveness probe: every 15 s the client asks
+each pinned server one DNS question. A server that does not answer is dropped
+from the advertisement, so it cannot cost the host a lookup timeout, and the
+advertisement is withdrawn completely (the system resolver goes back to the
+host's own servers) only when no configured server answers. The `/32` pins stay
+in both states, and a server recovers its advertisement as soon as it answers
+again. A broken tunnel can therefore never hang name resolution on your machine
+(specs/bugs/BUG-network-manager-tun-address-loss.md,
+specs/bugs/BUG-tunnel-dns-single-probe-target.md).
+
+List more than one `[interface].dns` server: an anycast address can be silent for
+a particular peer while the next one works, and the probe now judges each of them
+separately.
 
 On systemd systems the resolver is configured with `resolvectl` (or
 `resolvconf`) for the tunnel link only, and `resolvectl revert` restores it on

@@ -326,6 +326,13 @@ pub struct RouteManager {
     /// installed either way — they define the path the probe measures.
     /// BUG: specs/bugs/BUG-network-manager-tun-address-loss.md
     dns_gate_open: bool,
+    /// The subset of `[interface].dns` currently handed to the system resolver.
+    /// Starts as the whole configured list and narrows to the responders that
+    /// actually answered through the tunnel, so one unreachable address (or a
+    /// server the probe cannot measure being the only one left) cannot make the
+    /// host inherit a resolver that never replies.
+    /// BUG: specs/bugs/BUG-tunnel-dns-single-probe-target.md
+    dns_advertise: Vec<String>,
 }
 
 impl RouteManager {
@@ -333,8 +340,10 @@ impl RouteManager {
     pub fn new(params: RouteParams, hook_script: String) -> Self {
         let mut tracker = ResourceTracker::default();
         tracker.observe(&params.resource_ips);
+        let dns_advertise = params.dns_servers.clone();
         Self {
             params,
+            dns_advertise,
             hook_script,
             is_up: false,
             tracker,
@@ -380,15 +389,28 @@ impl RouteManager {
         Some((self.params.resources.clone(), self.resolver.clone()))
     }
 
-    /// Which resolver address (if any) the caller should probe to decide the
-    /// DNS gate. `Some` exactly when this configuration makes the hook pin DNS
-    /// servers through the tunnel: an IPv4 server plus a mode that installs
-    /// tunnel routes. IPv6 servers are never pinned (the TUN is IPv4-only).
+    /// Which resolver addresses the caller must probe to decide the DNS gate.
+    /// Non-empty exactly when this configuration makes the hook pin DNS servers
+    /// through the tunnel: an IPv4 server plus a mode that installs tunnel
+    /// routes. IPv6 servers are never pinned (the TUN is IPv4-only).
+    ///
+    /// Every configured server is a target, not just the first: a deployment
+    /// whose first address is unreachable for this peer (anycast policy, the
+    /// upstream filtering UDP/53 to it) must not be judged dead while a later
+    /// configured responder still answers through the tunnel.
+    /// BUG: specs/bugs/BUG-tunnel-dns-single-probe-target.md
     #[must_use]
-    pub fn dns_probe_target(&self) -> Option<Ipv4Addr> {
+    pub fn dns_probe_targets(&self) -> Vec<Ipv4Addr> {
         if !self.params.all_traffic && self.params.resource_ips.is_empty() {
-            return None;
+            return Vec::new();
         }
+        self.pinned_ipv4_dns()
+    }
+
+    /// The configured DNS servers that the hook pins through the tunnel, i.e.
+    /// the addresses a probe can actually judge. Names and IPv6 servers are
+    /// advertised but never measured, so they are never withdrawn.
+    fn pinned_ipv4_dns(&self) -> Vec<Ipv4Addr> {
         self.params
             .dns_servers
             .iter()
@@ -397,24 +419,66 @@ impl RouteManager {
                 IpAddr::V4(v4) => Some(v4),
                 IpAddr::V6(_) => None,
             })
-            .next()
+            .collect()
     }
 
-    /// Record one DNS liveness observation, returning `true` when the gate
-    /// state changed. A change rewrites the env file and re-runs the hook so
-    /// the system resolver is handed the tunnel servers (open) or restored to
-    /// the host's own (closed) within one probe round; unchanged observations
+    /// The advertisement this configuration would hand the system resolver if
+    /// exactly `alive` responders answered: every configured server except the
+    /// pinned IPv4 ones that stayed silent.
+    fn advertisement_for(&self, alive: &[Ipv4Addr]) -> Vec<String> {
+        let measured: Vec<Ipv4Addr> = if self.dns_probe_targets().is_empty() {
+            self.params
+                .dns_servers
+                .iter()
+                .filter_map(|server| server.parse::<IpAddr>().ok())
+                .filter_map(|addr| match addr {
+                    IpAddr::V4(v4) => Some(v4),
+                    IpAddr::V6(_) => None,
+                })
+                .collect()
+        } else {
+            self.dns_probe_targets()
+        };
+        self.params
+            .dns_servers
+            .iter()
+            .filter(|server| !matches!(server.parse::<IpAddr>(), Ok(IpAddr::V4(v4)) if measured.contains(&v4) && !alive.contains(&v4)))
+            .cloned()
+            .collect()
+    }
+
+    /// Record which pinned DNS responders answered, returning `true` when the
+    /// published routing state changed. A change rewrites the env file and
+    /// re-runs the hook, so the system resolver is handed the live tunnel
+    /// resolvers, the host's own resolvers (when nothing answered), or a
+    /// narrowed advertisement within one probe round. Unchanged observations
     /// are free, so a healthy tunnel sees no hook churn every interval.
-    pub fn observe_dns_health(&mut self, responder_alive: bool) -> bool {
-        let want_open = responder_alive;
-        if want_open == self.dns_gate_open {
+    ///
+    /// The gate opens on *any* answering responder: withdrawing DNS because the
+    /// first configured address is silent would discard a tunnel that resolves
+    /// perfectly well through a later one.
+    /// BUG: specs/bugs/BUG-tunnel-dns-single-probe-target.md
+    pub fn observe_dns_health(&mut self, alive: &[Ipv4Addr]) -> bool {
+        let want_open = !alive.is_empty();
+        let want_advertise = if want_open {
+            self.advertisement_for(alive)
+        } else {
+            // Closed means nothing is advertised at all, so the list the hook
+            // would use is irrelevant until the gate opens again.
+            self.dns_advertise.clone()
+        };
+        if want_open == self.dns_gate_open && want_advertise == self.dns_advertise {
             return false;
         }
         self.dns_gate_open = want_open;
+        self.dns_advertise = want_advertise.clone();
         if want_open {
-            tracing::info!("tunnel DNS responder alive: re-advertising tunnel resolvers");
+            tracing::info!(
+                advertised = %want_advertise.join(" "),
+                "tunnel DNS responder alive: advertising the responding tunnel resolvers"
+            );
         } else {
-            tracing::warn!("tunnel DNS responder unreachable: keeping the host's own resolver instead of a black hole");
+            tracing::warn!("no tunnel DNS responder answered: keeping the host's own resolver instead of a black hole");
         }
         if self.is_up {
             if let Err(e) = self.write_env_file() {
@@ -530,6 +594,7 @@ PRRR_SERVER_IP={server_ip}
 PRRR_SERVER_ENDPOINT={server_endpoint}
 PRRR_ALL_TRAFFIC={all_traffic}
 PRRR_DNS_SERVERS=\"{dns}\"
+PRRR_DNS_ADVERTISE_SERVERS=\"{advertise}\"
 PRRR_ALLOWED_IPS=\"{allowed}\"
 PRRR_EXCLUDED_IPS=\"{excluded}\"
 PRRR_RESOURCE_IPS=\"{resource_ips}\"
@@ -544,6 +609,7 @@ PRRR_FWMARK={fwmark}
             server_endpoint = self.params.server_endpoint,
             all_traffic = self.params.all_traffic,
             dns = dns,
+            advertise = self.dns_advertise.join(" "),
             allowed = allowed,
             excluded = excluded,
             resource_ips = resource_ips,
@@ -995,14 +1061,17 @@ mod tests {
         let env = mgr.render_env();
         assert!(env.contains("PRRR_DNS_GATE=on"), "{env}");
 
-        assert!(mgr.observe_dns_health(false), "open -> closed is a change");
+        assert!(mgr.observe_dns_health(&[]), "no responder answering is a change");
         let env = mgr.render_env();
         assert!(
             env.contains("PRRR_DNS_GATE=off"),
             "closed gate must withhold the advertisement: {env}"
         );
 
-        assert!(mgr.observe_dns_health(true), "closed -> open is a change");
+        assert!(
+            mgr.observe_dns_health(&[std::net::Ipv4Addr::new(1, 1, 1, 1)]),
+            "a responder answering again is a change"
+        );
         assert!(mgr.render_env().contains("PRRR_DNS_GATE=on"));
     }
 
@@ -1024,11 +1093,12 @@ mod tests {
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("chmod hook");
         let read_log = || fs::read_to_string(&log).unwrap_or_default();
 
+        let responder = Ipv4Addr::new(1, 1, 1, 1);
         let mut mgr = RouteManager::new(gate_params(true, vec!["1.1.1.1".to_string()], vec![]), hook.display().to_string())
             .with_env_file(dir.path().join("env"));
 
         // Down + an unchanged verdict: nothing to do at all.
-        assert!(!mgr.observe_dns_health(true), "the gate starts open, so this is no change");
+        assert!(!mgr.observe_dns_health(&[responder]), "the gate starts open, so this is no change");
         assert!(!log.exists(), "no hook may run while routing is down");
 
         mgr.up();
@@ -1037,7 +1107,10 @@ mod tests {
         assert!(text.contains("PRRR_DNS_GATE=on"), "{text}");
 
         // Healthy probe: gate already open, so the hook must stay quiet.
-        assert!(!mgr.observe_dns_health(true), "healthy verdict on an open gate is no change");
+        assert!(
+            !mgr.observe_dns_health(&[responder]),
+            "healthy verdict on an open gate is no change"
+        );
         assert_eq!(
             read_log().matches("action=up").count(),
             1,
@@ -1045,16 +1118,16 @@ mod tests {
         );
 
         // Dead resolver: one hook run that hands resolution back to the host.
-        assert!(mgr.observe_dns_health(false), "open -> closed is a change");
+        assert!(mgr.observe_dns_health(&[]), "open -> closed is a change");
         let text = read_log();
         assert_eq!(text.matches("action=up").count(), 2, "closed gate must re-run the hook: {text}");
         assert!(text.contains("PRRR_DNS_GATE=off"), "{text}");
 
-        assert!(!mgr.observe_dns_health(false), "repeated failure is no change");
+        assert!(!mgr.observe_dns_health(&[]), "repeated failure is no change");
         assert_eq!(read_log().matches("action=up").count(), 2, "no hook churn every probe round");
 
         // Recovery re-advertises without operator action.
-        assert!(mgr.observe_dns_health(true), "closed -> open is a change");
+        assert!(mgr.observe_dns_health(&[responder]), "closed -> open is a change");
         let text = read_log();
         assert_eq!(text.matches("action=up").count(), 3, "recovery must re-run the hook: {text}");
         assert_eq!(text.matches("PRRR_DNS_GATE=on").count(), 2, "{text}");
@@ -1062,7 +1135,7 @@ mod tests {
         // While down, the gate still tracks the verdict but never touches the hook.
         mgr.down();
         let ups_after_down = read_log().matches("action=up").count();
-        assert!(mgr.observe_dns_health(false), "state must track verdicts while down too");
+        assert!(mgr.observe_dns_health(&[]), "state must track verdicts while down too");
         assert!(!mgr.dns_gate_open());
         assert_eq!(
             read_log().matches("action=up").count(),
@@ -1072,41 +1145,44 @@ mod tests {
     }
 
     #[test]
-    fn dns_probe_target_exists_only_when_dns_is_pinned_through_the_tunnel() {
-        let v4 = vec!["1.1.1.1".to_string()];
+    fn dns_probe_targets_are_every_dns_server_pinned_through_the_tunnel() {
+        let v4 = vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()];
         let resource = Ipv4Addr::new(203, 0, 113, 10);
         let cloudflare_v6: Vec<String> = vec!["2606:4700:4700::1111".to_string()];
 
         let full = RouteManager::new(gate_params(true, v4.clone(), vec![]), "/nonexistent/script".to_string());
-        assert_eq!(full.dns_probe_target(), Some(Ipv4Addr::new(1, 1, 1, 1)), "full tunnel pins DNS");
+        assert_eq!(
+            full.dns_probe_targets(),
+            vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)],
+            "a first responder that never answers must not hide a working second one"
+        );
 
         let split = RouteManager::new(gate_params(false, v4.clone(), vec![resource]), "/nonexistent/script".to_string());
         assert_eq!(
-            split.dns_probe_target(),
-            Some(Ipv4Addr::new(1, 1, 1, 1)),
+            split.dns_probe_targets(),
+            vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)],
             "split + resources pins DNS"
         );
 
         let bare = RouteManager::new(gate_params(false, v4.clone(), vec![]), "/nonexistent/script".to_string());
-        assert_eq!(bare.dns_probe_target(), None, "bare split mode never advertises DNS");
+        assert!(bare.dns_probe_targets().is_empty(), "bare split mode never advertises DNS");
 
         let no_dns = RouteManager::new(gate_params(true, vec![], vec![]), "/nonexistent/script".to_string());
-        assert_eq!(no_dns.dns_probe_target(), None, "nothing configured, nothing to probe");
+        assert!(no_dns.dns_probe_targets().is_empty(), "nothing configured, nothing to probe");
 
         let mixed = RouteManager::new(
             gate_params(true, vec!["2606:4700:4700::1111".to_string(), "9.9.9.9".to_string()], vec![]),
             "/nonexistent/script".to_string(),
         );
         assert_eq!(
-            mixed.dns_probe_target(),
-            Some(Ipv4Addr::new(9, 9, 9, 9)),
-            "the first IPv4 responder is probed even behind an IPv6 one"
+            mixed.dns_probe_targets(),
+            vec![Ipv4Addr::new(9, 9, 9, 9)],
+            "every IPv4 responder is probed even behind an IPv6 one"
         );
 
         let only_v6 = RouteManager::new(gate_params(true, cloudflare_v6, vec![]), "/nonexistent/script".to_string());
-        assert_eq!(
-            only_v6.dns_probe_target(),
-            None,
+        assert!(
+            only_v6.dns_probe_targets().is_empty(),
             "the TUN is IPv4-only, so v6 servers are never pinned"
         );
 
@@ -1114,7 +1190,61 @@ mod tests {
             gate_params(true, vec!["dns.example".to_string()], vec![]),
             "/nonexistent/script".to_string(),
         );
-        assert_eq!(hostname.dns_probe_target(), None, "a non-literal server name cannot be probed");
+        assert!(
+            hostname.dns_probe_targets().is_empty(),
+            "a non-literal server name cannot be probed"
+        );
+    }
+
+    // BUG: specs/bugs/BUG-tunnel-dns-single-probe-target.md
+    #[test]
+    fn dns_gate_advertises_only_the_responders_that_answered() {
+        let servers = vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()];
+        let mut mgr = RouteManager::new(gate_params(true, servers, vec![]), "/nonexistent/script".to_string());
+        let dead = Ipv4Addr::new(1, 1, 1, 1);
+        let live = Ipv4Addr::new(8, 8, 8, 8);
+
+        assert!(
+            mgr.observe_dns_health(&[live]),
+            "dropping a dead responder from the advertisement is a change"
+        );
+        let env = mgr.render_env();
+        assert!(
+            env.contains("PRRR_DNS_GATE=on"),
+            "one live responder keeps DNS in the tunnel: {env}"
+        );
+        assert!(
+            env.contains("PRRR_DNS_ADVERTISE_SERVERS=\"8.8.8.8\""),
+            "the unresponsive server must not be handed to the system resolver: {env}"
+        );
+        assert!(
+            env.contains("PRRR_DNS_SERVERS=\"1.1.1.1 8.8.8.8\""),
+            "both servers stay pinned so the probe keeps measuring the tunnel: {env}"
+        );
+
+        assert!(!mgr.observe_dns_health(&[live]), "the same live set is not a change");
+
+        assert!(mgr.observe_dns_health(&[]), "losing the last responder closes the gate");
+        assert!(mgr.render_env().contains("PRRR_DNS_GATE=off"));
+
+        assert!(mgr.observe_dns_health(&[dead, live]), "a recovered responder is a change");
+        assert!(
+            mgr.render_env().contains("PRRR_DNS_ADVERTISE_SERVERS=\"1.1.1.1 8.8.8.8\""),
+            "an advertised server returns as soon as it answers again"
+        );
+    }
+
+    #[test]
+    fn dns_gate_never_withdraws_an_ipv6_server_it_cannot_probe() {
+        let servers = vec!["2606:4700:4700::1111".to_string(), "1.1.1.1".to_string(), "8.8.8.8".to_string()];
+        let mut mgr = RouteManager::new(gate_params(true, servers, vec![]), "/nonexistent/script".to_string());
+
+        mgr.observe_dns_health(&[Ipv4Addr::new(8, 8, 8, 8)]);
+        let env = mgr.render_env();
+        assert!(
+            env.contains("PRRR_DNS_ADVERTISE_SERVERS=\"2606:4700:4700::1111 8.8.8.8\""),
+            "only probed IPv4 servers can be judged dead: {env}"
+        );
     }
 
     #[test]

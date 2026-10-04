@@ -162,6 +162,25 @@ impl HookSandbox {
         output
     }
 
+    /// Replace the configured DNS servers in the env fixture.
+    /// BUG: specs/bugs/BUG-tunnel-dns-single-probe-target.md
+    fn set_dns_servers(&self, servers: &[&str]) {
+        let raw = fs::read_to_string(&self.env_file).expect("env");
+        let replaced = raw.replace(
+            "PRRR_DNS_SERVERS=\"1.1.1.1\"",
+            &format!("PRRR_DNS_SERVERS=\"{}\"", servers.join(" ")),
+        );
+        assert!(replaced != raw, "the fixture's DNS line was not found");
+        fs::write(&self.env_file, replaced).expect("rewrite servers");
+    }
+
+    /// Publish the binary's verdict about which responders actually answered.
+    fn set_dns_advertise(&self, servers: &[&str]) {
+        let raw = fs::read_to_string(&self.env_file).expect("env");
+        let with_advertise = format!("{raw}PRRR_DNS_ADVERTISE_SERVERS=\"{}\"\n", servers.join(" "));
+        fs::write(&self.env_file, with_advertise).expect("add advertise line");
+    }
+
     /// Move the binary's DNS gate to another state in the env fixture.
     fn set_dns_gate(&self, gate: &str) {
         let raw = fs::read_to_string(&self.env_file).expect("env");
@@ -563,6 +582,40 @@ fn route_hook_without_gate_variable_advertises_like_older_binaries() {
         &calls,
         &format!("ip -4 route replace 1.1.1.1/32 dev prrr0 table {FWMARK}"),
         "absent gate still pins",
+    );
+}
+
+#[test]
+fn route_hook_advertises_only_the_dns_responders_that_answered() {
+    // BUG: specs/bugs/BUG-tunnel-dns-single-probe-target.md
+    let sandbox = HookSandbox::new(true, &[]);
+    sandbox.set_dns_servers(&["1.1.1.1", "8.8.8.8"]);
+    sandbox.set_dns_advertise(&["8.8.8.8"]);
+    sandbox.run("up");
+    let calls = sandbox.calls();
+
+    assert_contains(
+        &calls,
+        "resolvectl dns prrr0 8.8.8.8",
+        "up: the system resolver gets only the responder that answered",
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.contains("1.1.1.1") && call.starts_with("resolvectl dns")),
+        "a responder the probe found dead must not be handed to the resolver: {}",
+        calls.join("\n")
+    );
+    // Both /32 pins remain: they define the path the probe measures.
+    assert_contains(
+        &calls,
+        "ip -4 route replace 1.1.1.1/32 dev prrr0 table 51820",
+        "up: unresponsive server stays pinned",
+    );
+    assert_contains(
+        &calls,
+        "ip -4 route replace 8.8.8.8/32 dev prrr0 table 51820",
+        "up: responsive server pinned",
     );
 }
 

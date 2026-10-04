@@ -103,14 +103,18 @@ independent watchdogs watch a tunnel that reports itself healthy:
   strike count.
 - **DNS liveness gate** (`dns_probe` + `RouteManager`). The `[interface].dns`
   servers are pinned through the tunnel and handed to the system resolver, so if
-  that path dies, every lookup on the host hangs with it. The client asks the
-  pinned server one question per `dns_check` (default 15 s, 2 s timeout) from the
-  blocking pool. A failure publishes `PRRR_DNS_GATE=off`, and the hook reverts
-  the system resolver to the host's own while keeping the `/32` pins: those pins
-  define the path being measured, so dropping them would let the probe answer
-  from the host's egress and the gate would oscillate. The next successful probe
-  re-advertises the tunnel resolvers, so recovery needs no operator action, and
-  the hook only re-runs on a gate *change*, not on every probe.
+  that path dies, every lookup on the host hangs with it. The client asks **each**
+  pinned server one question per `dns_check` (default 15 s, 2 s timeout each) from
+  the blocking pool and publishes the responders that answered as
+  `PRRR_DNS_ADVERTISE_SERVERS`; the hook gives the system resolver exactly that
+  subset. The gate closes — `PRRR_DNS_GATE=off`, host resolver restored — only
+  when nothing answered, and the `/32` pins of every configured server stay
+  installed either way: those pins define the path being measured, so dropping
+  them would let the probe answer from the host's egress and the gate would
+  oscillate. Addresses the IPv4-only probe cannot measure (IPv6 servers) are
+  advertised but never judged. The next successful probe re-advertises, so
+  recovery needs no operator action, and the hook only re-runs on a *change*, not
+  on every probe (specs/bugs/BUG-tunnel-dns-single-probe-target.md).
 
 ## Modules
 
