@@ -13,7 +13,8 @@
 
 use std::{
     net::{IpAddr, Ipv4Addr, ToSocketAddrs},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use ipnet::Ipv4Net;
@@ -33,6 +34,101 @@ pub struct InterfaceCidr(pub String);
 pub trait ResourceResolver {
     /// Resolve `host`, returning all addresses known by the resolver.
     fn resolve(&self, host: &str) -> std::io::Result<Vec<IpAddr>>;
+}
+
+/// Number of consecutive observation cycles a resolved resource IP stays in
+/// the active route set after it stops appearing in fresh DNS answers.
+///
+/// CDN front-ends rotate A records per query; a zero-window replace would
+/// pull routes out from under connections that just started, while a pure
+/// union would accumulate addresses forever. The grace window bounds the set
+/// while tolerating normal rotation.
+/// Defaults to 8 one-minute refresh rounds (~8 minutes), sized so that
+/// per-query-rotating CDN answer pools are covered in steady state.
+pub const RESOURCE_RETAIN_CYCLES: u64 = 8;
+
+/// Upper bound on simultaneously routed resource addresses. Answer-order
+/// tails beyond the cap are evicted; re-sighting an evicted address re-admits
+/// it. Bounds route-table growth for large rotating pools.
+pub const RESOURCE_MAX_ADDRESSES: usize = 256;
+
+/// Tracks which resolved resource IPs are currently routed.
+///
+/// [`Self::observe`] folds one fresh resolution round into the active set:
+/// newly seen addresses first (in answer order), then previously active
+/// addresses last seen within the retention window. Addresses that stop being
+/// seen leave the set once they fall out of the window, so the route table
+/// cannot grow without bound on fast-rotating CDNs.
+#[derive(Debug)]
+pub struct ResourceTracker {
+    cycle: u64,
+    last_seen: std::collections::HashMap<Ipv4Addr, u64>,
+    active: Vec<Ipv4Addr>,
+    retain_cycles: u64,
+    max_active: usize,
+}
+
+impl Default for ResourceTracker {
+    fn default() -> Self {
+        Self {
+            cycle: 0,
+            last_seen: std::collections::HashMap::new(),
+            active: Vec::new(),
+            retain_cycles: RESOURCE_RETAIN_CYCLES,
+            max_active: RESOURCE_MAX_ADDRESSES,
+        }
+    }
+}
+
+impl ResourceTracker {
+    /// Tracker with an explicit retention window and active-set cap (black-box
+    /// tests; production uses [`Self::default`]).
+    fn with_limits(retain_cycles: u64, max_active: usize) -> Self {
+        Self {
+            cycle: 0,
+            last_seen: std::collections::HashMap::new(),
+            active: Vec::new(),
+            retain_cycles,
+            max_active,
+        }
+    }
+
+    /// Record one fresh DNS answer (exactly what the resolver returned) and
+    /// return the new active set.
+    ///
+    /// Addresses in the answer are sighted this round; previously active
+    /// addresses within the retention window are kept behind them; addresses
+    /// whose absence spans `RESOURCE_RETAIN_CYCLES` consecutive answers are
+    /// dropped for good.
+    pub fn observe(&mut self, answer: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
+        self.cycle += 1;
+        for address in answer {
+            self.last_seen.insert(*address, self.cycle);
+        }
+
+        let mut out: Vec<Ipv4Addr> = Vec::new();
+        for address in answer {
+            if !out.contains(address) {
+                out.push(*address);
+            }
+        }
+        for address in &self.active {
+            let recently_seen = self
+                .last_seen
+                .get(address)
+                .is_some_and(|seen| self.cycle - *seen < self.retain_cycles);
+            if recently_seen && !out.contains(address) {
+                out.push(*address);
+            }
+        }
+        out.truncate(self.max_active);
+        let kept = out.clone();
+        self.last_seen
+            .retain(|address, seen| kept.contains(address) && self.cycle - *seen < self.retain_cycles);
+
+        self.active = kept.clone();
+        kept
+    }
 }
 
 /// Production resolver backed by the operating system resolver.
@@ -64,7 +160,7 @@ pub fn normalize_resource(resource: &str) -> anyhow::Result<String> {
 }
 
 /// Resolve configured resources to unique IPv4 route destinations.
-pub fn resolve_resource_ips(resources: &[String], resolver: &impl ResourceResolver) -> anyhow::Result<Vec<Ipv4Addr>> {
+pub fn resolve_resource_ips(resources: &[String], resolver: &dyn ResourceResolver) -> anyhow::Result<Vec<Ipv4Addr>> {
     let mut normalized_resources = Vec::new();
     for resource in resources {
         let normalized = normalize_resource(resource)?;
@@ -156,9 +252,6 @@ pub fn compute_excluded_ips(user_excluded: &[String], interfaces: &[InterfaceCid
 /// Default path for the routing hook script.
 pub const DEFAULT_ROUTE_HOOK_SCRIPT: &str = "/usr/local/bin/prrr-route";
 
-/// Runtime state directory for env file and routing state.
-const STATE_DIR: &str = "/run/prrr";
-
 /// Environment file path written by the binary for the hook script.
 const ENV_FILE: &str = "/run/prrr/env";
 
@@ -206,6 +299,8 @@ pub struct RouteParams {
     pub allowed_ips: Vec<String>,
     /// Excluded destination CIDRs.
     pub excluded_ips: Vec<String>,
+    /// Normalized resource hostnames (or IPv4 literals) kept re-resolved while running.
+    pub resources: Vec<String>,
     /// Exact IPv4 destinations resolved from configured resources.
     pub resource_ips: Vec<Ipv4Addr>,
     /// Firewall mark for VPN transport sockets.
@@ -221,16 +316,154 @@ pub struct RouteManager {
     params: RouteParams,
     hook_script: String,
     is_up: bool,
+    tracker: ResourceTracker,
+    env_file: PathBuf,
+    pending_stale: Vec<Ipv4Addr>,
+    resolver: Arc<dyn ResourceResolver + Send + Sync>,
+    /// Whether the tunnel's DNS servers may currently be handed to the system
+    /// resolver. Starts open; a failed [`crate::dns_probe`] closes it so a
+    /// broken tunnel never starves host resolution. The tunnel `/32` pins stay
+    /// installed either way — they define the path the probe measures.
+    /// BUG: specs/bugs/BUG-network-manager-tun-address-loss.md
+    dns_gate_open: bool,
 }
 
 impl RouteManager {
     /// Create a new route manager with the given parameters and hook script path.
     pub fn new(params: RouteParams, hook_script: String) -> Self {
+        let mut tracker = ResourceTracker::default();
+        tracker.observe(&params.resource_ips);
         Self {
             params,
             hook_script,
             is_up: false,
+            tracker,
+            env_file: PathBuf::from(ENV_FILE),
+            pending_stale: Vec::new(),
+            resolver: Arc::new(SystemResourceResolver),
+            dns_gate_open: true,
         }
+    }
+
+    /// Point the env file at an alternate path (black-box tests; production
+    /// keeps `/run/prrr/env`). The hook receives the location via
+    /// `PRRR_ENV_FILE`, which the hook honors by design.
+    #[must_use]
+    pub fn with_env_file(mut self, env_file: impl Into<PathBuf>) -> Self {
+        self.env_file = env_file.into();
+        self
+    }
+
+    /// Override the resource retention window (black-box tests).
+    #[must_use]
+    pub fn with_resource_retention(mut self, retain_cycles: u64) -> Self {
+        let max_active = self.tracker.max_active;
+        let seeded = self.tracker.observe(&[]);
+        self.tracker = ResourceTracker::with_limits(retain_cycles, max_active);
+        self.tracker.observe(&seeded);
+        self
+    }
+
+    /// Override the resolver used for background refresh rounds (tests).
+    #[must_use]
+    pub fn with_resolver(mut self, resolver: Arc<dyn ResourceResolver + Send + Sync>) -> Self {
+        self.resolver = resolver;
+        self
+    }
+
+    /// Hostnames and resolver handle to feed a background re-resolution
+    /// round, or `None` when no hostname resources are configured.
+    pub fn resource_refresh_inputs(&self) -> Option<(Vec<String>, Arc<dyn ResourceResolver + Send + Sync>)> {
+        if self.params.resources.is_empty() {
+            return None;
+        }
+        Some((self.params.resources.clone(), self.resolver.clone()))
+    }
+
+    /// Which resolver address (if any) the caller should probe to decide the
+    /// DNS gate. `Some` exactly when this configuration makes the hook pin DNS
+    /// servers through the tunnel: an IPv4 server plus a mode that installs
+    /// tunnel routes. IPv6 servers are never pinned (the TUN is IPv4-only).
+    #[must_use]
+    pub fn dns_probe_target(&self) -> Option<Ipv4Addr> {
+        if !self.params.all_traffic && self.params.resource_ips.is_empty() {
+            return None;
+        }
+        self.params
+            .dns_servers
+            .iter()
+            .filter_map(|server| server.parse::<IpAddr>().ok())
+            .filter_map(|addr| match addr {
+                IpAddr::V4(v4) => Some(v4),
+                IpAddr::V6(_) => None,
+            })
+            .next()
+    }
+
+    /// Record one DNS liveness observation, returning `true` when the gate
+    /// state changed. A change rewrites the env file and re-runs the hook so
+    /// the system resolver is handed the tunnel servers (open) or restored to
+    /// the host's own (closed) within one probe round; unchanged observations
+    /// are free, so a healthy tunnel sees no hook churn every interval.
+    pub fn observe_dns_health(&mut self, responder_alive: bool) -> bool {
+        let want_open = responder_alive;
+        if want_open == self.dns_gate_open {
+            return false;
+        }
+        self.dns_gate_open = want_open;
+        if want_open {
+            tracing::info!("tunnel DNS responder alive: re-advertising tunnel resolvers");
+        } else {
+            tracing::warn!("tunnel DNS responder unreachable: keeping the host's own resolver instead of a black hole");
+        }
+        if self.is_up {
+            if let Err(e) = self.write_env_file() {
+                tracing::warn!(error = %e, "failed to rewrite routing env file after DNS gate change");
+            }
+            self.run_hook("up");
+        }
+        true
+    }
+
+    /// Current DNS gate state (tests, `doctor`).
+    #[must_use]
+    pub fn dns_gate_open(&self) -> bool {
+        self.dns_gate_open
+    }
+
+    /// Fold a fresh resolution round into the routed resource set.
+    ///
+    /// When the active set (see [`ResourceTracker`]) changed and routing is
+    /// up, the env file is rewritten — now also carrying the IPs that aged
+    /// out of the retention window as `PRRR_STALE_RESOURCE_IPS` — and the
+    /// hook's idempotent `up` runs again. While down, only the pending set
+    /// updates; the next `up` installs it.
+    pub fn apply_resource_ips(&mut self, fresh: Vec<Ipv4Addr>) {
+        let active = self.tracker.observe(&fresh);
+        if active == self.params.resource_ips {
+            return;
+        }
+        let removed: Vec<Ipv4Addr> = self
+            .params
+            .resource_ips
+            .iter()
+            .copied()
+            .filter(|address| !active.contains(address))
+            .collect();
+        self.params.resource_ips = active;
+        if !self.is_up {
+            return;
+        }
+        for address in removed {
+            if !self.pending_stale.contains(&address) {
+                self.pending_stale.push(address);
+            }
+        }
+        if let Err(e) = self.write_env_file() {
+            tracing::warn!(error = %e, "failed to write routing env file");
+        }
+        self.run_hook("up");
+        self.pending_stale.clear();
     }
 
     /// Set up routing: write env file, then execute hook script `up`.
@@ -260,16 +493,19 @@ impl RouteManager {
 
         self.run_hook("down");
         self.is_up = false;
+        self.pending_stale.clear();
 
         // Clean up env file
-        let _ = std::fs::remove_file(ENV_FILE);
+        let _ = std::fs::remove_file(&self.env_file);
     }
 
     /// Write routing parameters to `/run/prrr/env` as shell variables.
     fn write_env_file(&self) -> std::io::Result<()> {
-        std::fs::create_dir_all(STATE_DIR)?;
+        if let Some(parent) = self.env_file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
 
-        std::fs::write(ENV_FILE, self.render_env())
+        std::fs::write(&self.env_file, self.render_env())
     }
 
     fn render_env(&self) -> String {
@@ -283,6 +519,7 @@ impl RouteManager {
             .map(Ipv4Addr::to_string)
             .collect::<Vec<_>>()
             .join(" ");
+        let stale_resource_ips = self.pending_stale.iter().map(Ipv4Addr::to_string).collect::<Vec<_>>().join(" ");
 
         let content = format!(
             "\
@@ -296,6 +533,8 @@ PRRR_DNS_SERVERS=\"{dns}\"
 PRRR_ALLOWED_IPS=\"{allowed}\"
 PRRR_EXCLUDED_IPS=\"{excluded}\"
 PRRR_RESOURCE_IPS=\"{resource_ips}\"
+PRRR_STALE_RESOURCE_IPS=\"{stale_resource_ips}\"
+PRRR_DNS_GATE={dns_gate}
 PRRR_FWMARK={fwmark}
 ",
             device = self.params.tun_device,
@@ -308,6 +547,8 @@ PRRR_FWMARK={fwmark}
             allowed = allowed,
             excluded = excluded,
             resource_ips = resource_ips,
+            stale_resource_ips = stale_resource_ips,
+            dns_gate = if self.dns_gate_open { "on" } else { "off" },
             fwmark = self.params.fwmark,
         );
 
@@ -325,7 +566,11 @@ PRRR_FWMARK={fwmark}
 
         tracing::info!(script, action, "executing routing hook");
 
-        match std::process::Command::new(script).arg(action).status() {
+        match std::process::Command::new(script)
+            .arg(action)
+            .env("PRRR_ENV_FILE", &self.env_file)
+            .status()
+        {
             Ok(status) if status.success() => {
                 tracing::info!(action, "routing hook completed successfully");
             }
@@ -544,6 +789,133 @@ mod tests {
         );
     }
 
+    // FRD: specs/frds/FRD-resource-routing.md
+    // BUG: specs/bugs/BUG-resource-ip-staleness.md
+    #[test]
+    fn resource_tracker_keeps_recently_seen_and_drops_rotated_out_ips() {
+        let a = Ipv4Addr::new(203, 0, 113, 1);
+        let b = Ipv4Addr::new(203, 0, 113, 2);
+        let c = Ipv4Addr::new(203, 0, 113, 3);
+
+        let mut tracker = ResourceTracker::with_limits(3, 64);
+        assert_eq!(tracker.observe(&[a, b]), vec![a, b], "first answer is the fresh set");
+        assert_eq!(tracker.observe(&[b, c]), vec![b, c, a], "rotated-out peer inside grace window");
+        assert_eq!(tracker.observe(&[c]), vec![c, b, a], "one answer without a sighting still retained");
+        assert_eq!(tracker.observe(&[c]), vec![c, b], "two answers without a sighting still retained");
+        assert_eq!(tracker.observe(&[c]), vec![c], "third absent answer drops the oldest for good");
+    }
+
+    #[test]
+    fn resource_tracker_deduplicates_fresh_answers() {
+        let a = Ipv4Addr::new(203, 0, 113, 1);
+        let mut tracker = ResourceTracker::default();
+        assert_eq!(tracker.observe(&[a, a, a]), vec![a]);
+        assert_eq!(tracker.observe(&[a]), vec![a]);
+    }
+
+    #[test]
+    fn resource_tracker_caps_active_set_keeping_freshest() {
+        let ip = |last| Ipv4Addr::new(203, 0, 113, last);
+        let (a, b, c, d, e) = (ip(1), ip(2), ip(3), ip(4), ip(5));
+
+        let mut tracker = ResourceTracker::with_limits(4, 3);
+        assert_eq!(
+            tracker.observe(&[a, b, c, d]),
+            vec![a, b, c],
+            "answer order kept, tail over cap evicted"
+        );
+        assert_eq!(
+            tracker.observe(&[e]),
+            vec![e, a, b],
+            "evicted d never returns; freshest two retained"
+        );
+        // Re-sighting an evicted address re-admits it.
+        assert_eq!(tracker.observe(&[d]), vec![d, e, a]);
+    }
+
+    // BUG: specs/bugs/BUG-resource-ip-staleness.md
+    #[test]
+    fn apply_resource_ips_refreshes_hook_only_while_up_and_only_on_change() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let ip = |last| Ipv4Addr::new(203, 0, 113, last);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("hook.log");
+        let hook = dir.path().join("hook.sh");
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/bash\necho \"action=$1\" >> '{log}'\nwhile IFS= read -r line; do case \"$line\" in PRRR_RESOURCE_IPS=*|PRRR_STALE_RESOURCE_IPS=*) echo \"$line\" >> '{log}';; esac; done < \"$PRRR_ENV_FILE\"\n",
+                log = log.display()
+            ),
+        )
+        .expect("write hook");
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("chmod hook");
+
+        let params = RouteParams {
+            tun_device: "prrr0".to_string(),
+            client_ip: Ipv4Addr::new(10, 66, 66, 2),
+            gateway_ip: Ipv4Addr::new(10, 66, 66, 1),
+            server_ip: IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            server_endpoint: "test.example.com".to_string(),
+            all_traffic: false,
+            dns_servers: vec![],
+            allowed_ips: vec![],
+            excluded_ips: vec![],
+            resources: vec!["chatgpt.com".to_string()],
+            resource_ips: vec![ip(1)],
+            fwmark: DEFAULT_FWMARK,
+        };
+        let mut mgr = RouteManager::new(params, hook.display().to_string())
+            .with_env_file(dir.path().join("env"))
+            .with_resource_retention(3);
+
+        // While routing is down, refresh only updates the set: no hook, no env file.
+        mgr.apply_resource_ips(vec![ip(2)]);
+        assert!(!log.exists(), "hook must not run while routing is down");
+        assert!(!dir.path().join("env").exists(), "env file must not be written while down");
+
+        mgr.up();
+        let mut text = fs::read_to_string(&log).expect("hook log");
+        assert!(text.contains("action=up"), "{text}");
+        assert!(
+            text.contains("PRRR_RESOURCE_IPS=\"203.0.113.2 203.0.113.1\""),
+            "fresh first, seeded IP still in grace window: {text}"
+        );
+        assert!(text.contains("PRRR_STALE_RESOURCE_IPS=\"\""), "{text}");
+
+        // Identical resolution result: nothing changed, the hook must stay quiet.
+        mgr.apply_resource_ips(vec![ip(2)]);
+        text = fs::read_to_string(&log).expect("hook log");
+        assert_eq!(text.matches("action=up").count(), 1, "no-change refresh must not re-run the hook");
+
+        // Rotation while up. Timeline of DNS answers (observed rounds):
+        // seed [1] = r1; pre-up [2] = r2; no-change [2] = r3; the next answer
+        // [3] = r4 drops the seeded IP (absent from r2..r4) as stale, while
+        // ip(2) (last seen at r3) stays in the grace window.
+        mgr.apply_resource_ips(vec![ip(3)]);
+        text = fs::read_to_string(&log).expect("hook log");
+        assert_eq!(text.matches("action=up").count(), 2, "changed set must re-run hook");
+        assert!(
+            text.contains("PRRR_RESOURCE_IPS=\"203.0.113.3 203.0.113.2\"") && text.contains("PRRR_STALE_RESOURCE_IPS=\"203.0.113.1\""),
+            "rotated-out IP handed to the hook as stale: {text}"
+        );
+
+        // Repeated identical answer: unchanged set, hook stays quiet.
+        mgr.apply_resource_ips(vec![ip(3)]);
+        text = fs::read_to_string(&log).expect("hook log");
+        assert_eq!(text.matches("action=up").count(), 2, "no-change refresh must not re-run the hook");
+
+        // Next rotation ages ip(2) out (absent from the two newest answers).
+        mgr.apply_resource_ips(vec![ip(4)]);
+        text = fs::read_to_string(&log).expect("hook log");
+        assert_eq!(text.matches("action=up").count(), 3, "second rotation must re-run hook");
+        assert!(
+            text.contains("PRRR_RESOURCE_IPS=\"203.0.113.4 203.0.113.3\"") && text.contains("PRRR_STALE_RESOURCE_IPS=\"203.0.113.2\""),
+            "{text}"
+        );
+    }
+
     #[test]
     fn route_params_env_format() {
         let params = RouteParams {
@@ -556,6 +928,7 @@ mod tests {
             dns_servers: vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
             allowed_ips: vec![],
             excluded_ips: vec![],
+            resources: vec![],
             resource_ips: vec![],
             fwmark: DEFAULT_FWMARK,
         };
@@ -581,11 +954,167 @@ mod tests {
             dns_servers: vec![],
             allowed_ips: vec![],
             excluded_ips: vec![],
+            resources: vec![],
             resource_ips: vec![Ipv4Addr::new(203, 0, 113, 10)],
             fwmark: DEFAULT_FWMARK,
         };
         let manager = RouteManager::new(params, "/nonexistent/script".to_string());
         assert!(manager.render_env().contains("PRRR_RESOURCE_IPS=\"203.0.113.10\""));
+    }
+
+    // BUG: specs/bugs/BUG-network-manager-tun-address-loss.md
+    /// Params for the DNS-gate tests: the two modes that make the hook pin DNS
+    /// servers through the tunnel are `all_traffic` and a non-empty resource set.
+    fn gate_params(all_traffic: bool, dns_servers: Vec<String>, resource_ips: Vec<Ipv4Addr>) -> RouteParams {
+        RouteParams {
+            tun_device: "prrr0".to_string(),
+            client_ip: Ipv4Addr::new(10, 66, 66, 2),
+            gateway_ip: Ipv4Addr::new(10, 66, 66, 1),
+            server_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 79)),
+            server_endpoint: "vpn.example".to_string(),
+            all_traffic,
+            dns_servers,
+            allowed_ips: vec![],
+            excluded_ips: vec![],
+            resources: vec![],
+            resource_ips,
+            fwmark: DEFAULT_FWMARK,
+        }
+    }
+
+    #[test]
+    fn dns_gate_state_is_published_to_the_hook_env() {
+        let mut mgr = RouteManager::new(
+            gate_params(true, vec!["1.1.1.1".to_string()], vec![]),
+            "/nonexistent/script".to_string(),
+        );
+
+        // A start must not black-hole the host: DNS is advertised optimistically
+        // and withdrawn by the first failed probe, not the other way round.
+        assert!(mgr.dns_gate_open(), "the gate starts open");
+        let env = mgr.render_env();
+        assert!(env.contains("PRRR_DNS_GATE=on"), "{env}");
+
+        assert!(mgr.observe_dns_health(false), "open -> closed is a change");
+        let env = mgr.render_env();
+        assert!(
+            env.contains("PRRR_DNS_GATE=off"),
+            "closed gate must withhold the advertisement: {env}"
+        );
+
+        assert!(mgr.observe_dns_health(true), "closed -> open is a change");
+        assert!(mgr.render_env().contains("PRRR_DNS_GATE=on"));
+    }
+
+    #[test]
+    fn dns_gate_change_reruns_hook_only_while_up_and_only_on_change() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("hook.log");
+        let hook = dir.path().join("hook.sh");
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/bash\necho \"action=$1\" >> '{log}'\nwhile IFS= read -r line; do case \"$line\" in PRRR_DNS_GATE=*) echo \"$line\" >> '{log}';; esac; done < \"$PRRR_ENV_FILE\"\n",
+                log = log.display()
+            ),
+        )
+        .expect("write hook");
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("chmod hook");
+        let read_log = || fs::read_to_string(&log).unwrap_or_default();
+
+        let mut mgr = RouteManager::new(gate_params(true, vec!["1.1.1.1".to_string()], vec![]), hook.display().to_string())
+            .with_env_file(dir.path().join("env"));
+
+        // Down + an unchanged verdict: nothing to do at all.
+        assert!(!mgr.observe_dns_health(true), "the gate starts open, so this is no change");
+        assert!(!log.exists(), "no hook may run while routing is down");
+
+        mgr.up();
+        let text = read_log();
+        assert_eq!(text.matches("action=up").count(), 1, "{text}");
+        assert!(text.contains("PRRR_DNS_GATE=on"), "{text}");
+
+        // Healthy probe: gate already open, so the hook must stay quiet.
+        assert!(!mgr.observe_dns_health(true), "healthy verdict on an open gate is no change");
+        assert_eq!(
+            read_log().matches("action=up").count(),
+            1,
+            "unchanged gate must not re-run the hook"
+        );
+
+        // Dead resolver: one hook run that hands resolution back to the host.
+        assert!(mgr.observe_dns_health(false), "open -> closed is a change");
+        let text = read_log();
+        assert_eq!(text.matches("action=up").count(), 2, "closed gate must re-run the hook: {text}");
+        assert!(text.contains("PRRR_DNS_GATE=off"), "{text}");
+
+        assert!(!mgr.observe_dns_health(false), "repeated failure is no change");
+        assert_eq!(read_log().matches("action=up").count(), 2, "no hook churn every probe round");
+
+        // Recovery re-advertises without operator action.
+        assert!(mgr.observe_dns_health(true), "closed -> open is a change");
+        let text = read_log();
+        assert_eq!(text.matches("action=up").count(), 3, "recovery must re-run the hook: {text}");
+        assert_eq!(text.matches("PRRR_DNS_GATE=on").count(), 2, "{text}");
+
+        // While down, the gate still tracks the verdict but never touches the hook.
+        mgr.down();
+        let ups_after_down = read_log().matches("action=up").count();
+        assert!(mgr.observe_dns_health(false), "state must track verdicts while down too");
+        assert!(!mgr.dns_gate_open());
+        assert_eq!(
+            read_log().matches("action=up").count(),
+            ups_after_down,
+            "the hook must not be re-run while routing is down"
+        );
+    }
+
+    #[test]
+    fn dns_probe_target_exists_only_when_dns_is_pinned_through_the_tunnel() {
+        let v4 = vec!["1.1.1.1".to_string()];
+        let resource = Ipv4Addr::new(203, 0, 113, 10);
+        let cloudflare_v6: Vec<String> = vec!["2606:4700:4700::1111".to_string()];
+
+        let full = RouteManager::new(gate_params(true, v4.clone(), vec![]), "/nonexistent/script".to_string());
+        assert_eq!(full.dns_probe_target(), Some(Ipv4Addr::new(1, 1, 1, 1)), "full tunnel pins DNS");
+
+        let split = RouteManager::new(gate_params(false, v4.clone(), vec![resource]), "/nonexistent/script".to_string());
+        assert_eq!(
+            split.dns_probe_target(),
+            Some(Ipv4Addr::new(1, 1, 1, 1)),
+            "split + resources pins DNS"
+        );
+
+        let bare = RouteManager::new(gate_params(false, v4.clone(), vec![]), "/nonexistent/script".to_string());
+        assert_eq!(bare.dns_probe_target(), None, "bare split mode never advertises DNS");
+
+        let no_dns = RouteManager::new(gate_params(true, vec![], vec![]), "/nonexistent/script".to_string());
+        assert_eq!(no_dns.dns_probe_target(), None, "nothing configured, nothing to probe");
+
+        let mixed = RouteManager::new(
+            gate_params(true, vec!["2606:4700:4700::1111".to_string(), "9.9.9.9".to_string()], vec![]),
+            "/nonexistent/script".to_string(),
+        );
+        assert_eq!(
+            mixed.dns_probe_target(),
+            Some(Ipv4Addr::new(9, 9, 9, 9)),
+            "the first IPv4 responder is probed even behind an IPv6 one"
+        );
+
+        let only_v6 = RouteManager::new(gate_params(true, cloudflare_v6, vec![]), "/nonexistent/script".to_string());
+        assert_eq!(
+            only_v6.dns_probe_target(),
+            None,
+            "the TUN is IPv4-only, so v6 servers are never pinned"
+        );
+
+        let hostname = RouteManager::new(
+            gate_params(true, vec!["dns.example".to_string()], vec![]),
+            "/nonexistent/script".to_string(),
+        );
+        assert_eq!(hostname.dns_probe_target(), None, "a non-literal server name cannot be probed");
     }
 
     #[test]
@@ -612,6 +1141,7 @@ mod tests {
             dns_servers: vec![],
             allowed_ips: vec![],
             excluded_ips: vec![],
+            resources: vec![],
             resource_ips: vec![],
             fwmark: DEFAULT_FWMARK,
         };

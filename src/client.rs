@@ -1122,6 +1122,9 @@ use crate::transport::traits::{ClientConnectParams, ClientTransport, TransportCo
 /// Human-readable name for the MASQUE transport.
 const MASQUE_TRANSPORT_NAME: &str = "masque";
 
+/// Bound QUIC, CONNECT-UDP and hybrid setup so silent peers reach the reconnect loop.
+const MASQUE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// MASQUE client transport implementing [`ClientTransport`].
 ///
 /// Wraps the existing QUIC/MASQUE connection flow (endpoint creation,
@@ -1173,36 +1176,42 @@ impl ClientTransport for MasqueClientTransport {
         params: ClientConnectParams<'a>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<TransportConnection>> + Send + 'a>> {
         Box::pin(async move {
-            if self.insecure {
-                tracing::warn!("TLS certificate verification disabled (--insecure). Do NOT use in production.");
+            let connect = async {
+                if self.insecure {
+                    tracing::warn!("TLS certificate verification disabled (--insecure). Do NOT use in production.");
+                }
+
+                let client_config = build_masque_client_config(self.keep_alive_interval, self.max_idle_timeout, self.insecure)?;
+
+                // Create UDP socket with fwmark for policy routing
+                let udp_socket = crate::routing::create_marked_udp_socket(self.fwmark)
+                    .map_err(|e| anyhow::anyhow!("failed to create marked UDP socket: {e}"))?;
+                let runtime = Arc::new(quinn::TokioRuntime);
+                let mut endpoint = quinn::Endpoint::new(quinn::EndpointConfig::default(), None, udp_socket, runtime)?;
+                endpoint.set_default_client_config(client_config);
+
+                tracing::info!("connecting to {}", self.server_addr);
+                let connection = endpoint.connect(self.server_addr, &self.server_name)?.await?;
+                tracing::info!("QUIC connection established to {}", self.server_addr);
+
+                let masque_client = MasqueClient::connect(connection).await?;
+                tracing::info!("MASQUE tunnel established");
+
+                let init_result =
+                    handshake_as_client(params.noise_keypair, params.server_noise_pub, params.server_kem_pub, &masque_client).await?;
+                tracing::info!("hybrid handshake complete");
+
+                let masque_client = Arc::new(masque_client);
+                Ok(TransportConnection {
+                    sender: Box::new(Arc::clone(&masque_client)),
+                    receiver: Box::new(masque_client),
+                    session_keys: init_result.session_keys,
+                })
+            };
+            tokio::select! {
+                () = params.cancel.cancelled() => Err(anyhow::anyhow!("MASQUE connection cancelled")),
+                result = tokio::time::timeout(MASQUE_CONNECT_TIMEOUT, connect) => result.map_err(|_| anyhow::anyhow!("MASQUE connection timed out"))?,
             }
-
-            let client_config = build_masque_client_config(self.keep_alive_interval, self.max_idle_timeout, self.insecure)?;
-
-            // Create UDP socket with fwmark for policy routing
-            let udp_socket = crate::routing::create_marked_udp_socket(self.fwmark)
-                .map_err(|e| anyhow::anyhow!("failed to create marked UDP socket: {e}"))?;
-            let runtime = Arc::new(quinn::TokioRuntime);
-            let mut endpoint = quinn::Endpoint::new(quinn::EndpointConfig::default(), None, udp_socket, runtime)?;
-            endpoint.set_default_client_config(client_config);
-
-            tracing::info!("connecting to {}", self.server_addr);
-            let connection = endpoint.connect(self.server_addr, &self.server_name)?.await?;
-            tracing::info!("QUIC connection established to {}", self.server_addr);
-
-            let masque_client = MasqueClient::connect(connection).await?;
-            tracing::info!("MASQUE tunnel established");
-
-            let init_result =
-                handshake_as_client(params.noise_keypair, params.server_noise_pub, params.server_kem_pub, &masque_client).await?;
-            tracing::info!("hybrid handshake complete");
-
-            let masque_client = Arc::new(masque_client);
-            Ok(TransportConnection {
-                sender: Box::new(Arc::clone(&masque_client)),
-                receiver: Box::new(masque_client),
-                session_keys: init_result.session_keys,
-            })
         })
     }
 }
@@ -2457,7 +2466,7 @@ mod tests {
             cancel: cancel.child_token(),
         };
 
-        let conn = transport.connect(params).await.expect("connect should succeed");
+        let conn = transport.connect(params.clone()).await.expect("connect should succeed");
 
         // Verify sender/receiver are functional
         let test_payload = b"trait-test-payload";
@@ -2465,6 +2474,39 @@ mod tests {
 
         cancel.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server_task).await;
+        // BUG: specs/bugs/BUG-client-primary-connection-recovery.md
+        const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(16);
+        const CANCEL_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+        let silent_peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("silent peer");
+        let transport = MasqueClientTransport::new(silent_peer.local_addr().expect("addr"), "localhost".into(), 25, 300, true, None);
+        let params = ClientConnectParams {
+            cancel: CancellationToken::new(),
+            ..params
+        };
+        let stalled = tokio::time::timeout(PROBE_BUDGET, transport.connect(params.clone())).await;
+        assert!(
+            stalled.is_ok(),
+            "MASQUE connect must fail within its deadline when the peer is silent"
+        );
+        assert!(
+            stalled
+                .expect("bounded connect")
+                .err()
+                .expect("silent peer fails")
+                .to_string()
+                .contains("MASQUE connection timed out")
+        );
+        params.cancel.cancel();
+        let cancelled = tokio::time::timeout(CANCEL_PROBE_BUDGET, transport.connect(params)).await;
+        assert!(cancelled.is_ok(), "cancellation must interrupt MASQUE setup");
+        assert!(
+            cancelled
+                .expect("prompt cancellation")
+                .err()
+                .expect("cancelled")
+                .to_string()
+                .contains("MASQUE connection cancelled")
+        );
     }
 
     /// AC-1: MasqueClientTransport can be used as Box<dyn ClientTransport>.

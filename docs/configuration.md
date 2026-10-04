@@ -173,6 +173,26 @@ Client network interface settings.
 | `dns` | Array of String | DNS servers |
 | `mtu` | u16 | Tunnel MTU |
 
+#### DNS through the tunnel
+
+Every IPv4 server listed under `[interface].dns` is reached **through the
+tunnel**: the routing hook installs an exact `/32` route for each one in the VPN
+policy table and hands the addresses to the system resolver. While
+`[routing].all_traffic` is `false` this only happens once `[routing].resources`
+(or `allowed_ips`) actually puts traffic into the tunnel — otherwise prrr leaves
+the host's own resolver alone.
+
+The advertisement is guarded by a liveness probe: every 15 s the client asks the
+pinned server one DNS question. If it stops answering, the client withdraws the
+advertisement (the system resolver goes back to the host's own servers) while
+keeping the `/32` pins, and re-advertises as soon as the server answers again.
+A broken tunnel can therefore never hang name resolution on your machine
+(specs/bugs/BUG-network-manager-tun-address-loss.md).
+
+On systemd systems the resolver is configured with `resolvectl` (or
+`resolvconf`) for the tunnel link only, and `resolvectl revert` restores it on
+teardown — other interfaces, including an existing VPN tunnel, are untouched.
+
 ### `[routing]`
 
 Traffic routing rules.
@@ -190,7 +210,10 @@ Traffic routing rules.
 `resources` provides selective split tunneling. Each entry is a hostname or
 IPv4 literal. The client resolves hostnames when it starts and installs an
 exact IPv4 `/32` route for every returned address in the VPN policy table.
-Resources are therefore re-resolved by restarting the client after DNS changes.
+Hostnames are refreshed every 60 seconds. Previous answers remain routed for
+eight refresh rounds, with at most 256 active resource addresses, so rotating
+CDN answers do not immediately interrupt existing connections. A failed refresh
+keeps the previous routes; the initial resolution must succeed before startup.
 Wildcards, URLs, CIDRs, and IPv6-only resources are rejected. The current
 client TUN is IPv4-only; an IPv6 connection to a service is not covered by
 this setting.
@@ -208,9 +231,29 @@ resources = [
 ]
 ```
 
-Use one entry for each hostname a service needs. Resource routes are active
+Use one entry for each hostname a service needs. Entries select exact resolved
+addresses: `googlevideo.com` does not cover `*.googlevideo.com`, and
+`telegram.org` does not cover Telegram's datacenter IP connections. Resource routes are active
 only while the tunnel is up and do not change the existing LAN auto-exclusion
 or full-tunnel settings.
+
+#### Primary internet connection
+
+For a primary connection that also carries API calls, video CDNs and Telegram
+datacenter connections, route all IPv4 traffic instead of maintaining a hostname
+list:
+
+```toml
+[routing]
+all_traffic = true
+resources = []
+```
+
+An empty resource list avoids requiring selected domains to resolve before the
+tunnel starts. Local-LAN exclusion still applies. This configuration covers
+IPv4; the current client TUN does not carry IPv6. See
+[isolated client verification](client-recovery.md) before replacing a working
+connection.
 
 #### Local-LAN auto-exclusion (default)
 

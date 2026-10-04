@@ -44,6 +44,40 @@ wait_for_tun() {
     done
 }
 
+# Keep NetworkManager away from the tunnel device.
+#
+# NM adopts foreign TUN devices and auto-activates a profile for them; a later
+# deactivation flushes the tunnel address while the client still owns the
+# device fd. Packets then leave the TUN sourced with a LAN address, the server
+# stops masquerading them (its rule is scoped to the tunnel subnet) and no
+# reply ever comes back — a one-way black hole with routing reported UP.
+# See specs/bugs/BUG-network-manager-tun-address-loss.md. Scoped to this one
+# device, so other tunnels (e.g. tun0) are untouched.
+detach_from_network_manager() {
+    command -v nmcli &>/dev/null || return 0
+    nmcli device set "$PRRR_DEVICE" managed no 2>/dev/null ||
+        echo "Warning: NetworkManager still manages $PRRR_DEVICE" >&2
+}
+
+# Re-assert the tunnel IPv4 address on every "up".
+#
+# The kernel sources injected packets with this address, so if anything (NM, an
+# operator, a device re-register) removed it the tunnel stops working entirely.
+# Re-running on each refresh cycle makes external address loss self-heal within
+# one cycle instead of persisting until the next restart.
+ensure_tunnel_address() {
+    local addr="$PRRR_CLIENT_IP"
+    if ip -4 addr show dev "$PRRR_DEVICE" 2>/dev/null | grep -qE "inet ${addr}(/| )"; then
+        return 0
+    fi
+    if ip -4 addr add "${addr}/32" dev "$PRRR_DEVICE" 2>/dev/null; then
+        echo "Re-asserted tunnel address ${addr}/32 on ${PRRR_DEVICE}"
+    else
+        echo "Error: ${addr}/32 missing from ${PRRR_DEVICE} and could not be added" >&2
+        return 1
+    fi
+}
+
 do_up() {
     load_env
 
@@ -55,6 +89,10 @@ do_up() {
     # Routes pointing at a DOWN device are inert; an interrupted restart can
     # leave the TUN administratively down. Idempotent bring-up.
     ip link set "$PRRR_DEVICE" up
+
+    # Address ownership must be ours before any route points at the device.
+    detach_from_network_manager
+    ensure_tunnel_address
 
     if [[ "${PRRR_ALL_TRAFFIC}" == "true" ]]; then
         echo "Setting up full-tunnel routing (fwmark=$fwmark)..."
@@ -68,6 +106,7 @@ do_up() {
         # Only the VPN subnet is routed through the tunnel (default from TUN setup)
     fi
 
+    remove_stale_resource_routes
     install_resource_routes
 
     if [[ "${PRRR_ALL_TRAFFIC}" == "true" || -n "${PRRR_RESOURCE_IPS:-}" ]]; then
@@ -77,10 +116,14 @@ do_up() {
         # Suppress the host default route so resource routes win while other
         # split-tunnel traffic still falls through to the host's main table.
         ip -4 rule add table main suppress_prefixlength 0 priority 32764 2>/dev/null || true
-    fi
 
-    # Set up DNS
-    setup_dns
+        # Advertise tunnel DNS only along with a live path through the tunnel.
+        apply_dns_policy
+    else
+        # Nothing reaches the tunnel in this mode, so advertising its DNS
+        # servers would point every system query at a device with no route.
+        echo "No tunnel traffic configured; host resolver left unchanged"
+    fi
 
     echo "prrr VPN routing is UP"
 }
@@ -103,6 +146,7 @@ do_down() {
     ip -4 rule del table main suppress_prefixlength 0 2>/dev/null || true
     ip -4 route del default dev "$device" table "$route_table" 2>/dev/null || true
     remove_resource_routes
+    remove_dns_routes
 
     # Reset DNS
     teardown_dns
@@ -118,6 +162,64 @@ install_resource_routes() {
     # shellcheck disable=SC2086
     for resource_ip in ${PRRR_RESOURCE_IPS:-}; do
         ip -4 route replace "${resource_ip}/32" dev "$PRRR_DEVICE" table "${PRRR_FWMARK:-51820}"
+    done
+}
+
+install_dns_routes() {
+    # IPv4 DNS servers as exact /32s into the policy table. IPv6 servers are
+    # skipped: the client TUN is IPv4-only (same scope as resource routes).
+    local dns_ip
+    # shellcheck disable=SC2086
+    for dns_ip in ${PRRR_DNS_SERVERS:-}; do
+        if [[ "$dns_ip" != *:* ]]; then
+            ip -4 route replace "${dns_ip}/32" dev "$PRRR_DEVICE" table "${PRRR_FWMARK:-51820}"
+        fi
+    done
+}
+
+# Apply the DNS policy for this round: hand the tunnel's DNS servers to the
+# system resolver, or leave the host's own resolvers in charge if the binary's
+# probe found the tunnel resolver unresponsive.
+#
+# The /32 pins make the configured servers reachable THROUGH the tunnel (without
+# them answers come from the host's egress and rotating CDN answers never match
+# the pinned resource /32s — BUG-resource-ip-staleness). They are installed in
+# both gate states on purpose: they define the path the probe measures, so
+# withdrawing them would let the probe answer from the host's egress and the
+# gate would oscillate. What the closed gate withholds is the *advertisement* —
+# advertising a dead resolver would leave every lookup on the host hanging,
+# which is strictly worse than an uncensored-but-working one.
+# BUG: specs/bugs/BUG-network-manager-tun-address-loss.md
+apply_dns_policy() {
+    install_dns_routes
+    if [[ "${PRRR_DNS_GATE:-on}" == "off" ]]; then
+        if [[ -n "${PRRR_DNS_SERVERS:-}" ]]; then
+            echo "DNS gate closed: tunnel resolver unresponsive, host resolver left in charge"
+        fi
+        teardown_dns
+    else
+        setup_dns
+    fi
+}
+
+remove_dns_routes() {
+    local dns_ip
+    # shellcheck disable=SC2086
+    for dns_ip in ${PRRR_DNS_SERVERS:-}; do
+        if [[ "$dns_ip" != *:* ]]; then
+            ip -4 route del "${dns_ip}/32" dev "${PRRR_DEVICE:-prrr0}" table "${PRRR_FWMARK:-51820}" 2>/dev/null || true
+        fi
+    done
+}
+
+remove_stale_resource_routes() {
+    # Resource IPs that left the retention window (written by the binary on
+    # refresh). Removed before the fresh set is installed so a rotated-out
+    # address never lingers in the policy table.
+    local stale_ip
+    # shellcheck disable=SC2086
+    for stale_ip in ${PRRR_STALE_RESOURCE_IPS:-}; do
+        ip -4 route del "${stale_ip}/32" dev "$PRRR_DEVICE" table "${PRRR_FWMARK:-51820}" 2>/dev/null || true
     done
 }
 

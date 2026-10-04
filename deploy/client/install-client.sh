@@ -48,6 +48,16 @@ install -m 644 "$SCRIPT_DIR/prrr-client.service" /etc/systemd/system/prrr-client
 systemctl daemon-reload
 echo "  Service: prrr-client.service"
 
+# Keep NetworkManager away from the tunnel interface. An NM profile adopted for
+# the TUN can be deactivated later and flush the tunnel address, which silently
+# black-holes the tunnel (specs/bugs/BUG-network-manager-tun-address-loss.md).
+if NM_CONF_FILE=$(bash "$SCRIPT_DIR/nm-unmanaged.sh"); then
+    echo "  NetworkManager: ${NM_CONF_FILE}"
+    if command -v nmcli &>/dev/null && systemctl is-active --quiet NetworkManager; then
+        nmcli general reload CONFIG &>/dev/null || nmcli general reload &>/dev/null || true
+    fi
+fi
+
 # Install config if provided
 if [[ -n "$CONFIG_SRC" ]]; then
     mkdir -p /etc/prrr

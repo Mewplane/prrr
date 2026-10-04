@@ -62,4 +62,16 @@ pub enum TunnelError {
     /// Pipeline was cancelled via cancellation token.
     #[error("pipeline cancelled")]
     Cancelled,
+
+    /// Data plane went one-way: our packets keep leaving the tunnel while the
+    /// server delivers nothing back. Happens when the TUN loses its address
+    /// (e.g. NetworkManager flushing it) or the peer's relay dies while QUIC
+    /// keeps answering — transport-level errors never fire, so liveness of the
+    /// data plane must be watched separately.
+    /// BUG: specs/bugs/BUG-network-manager-tun-address-loss.md
+    #[error("tunnel black-holed: outbound traffic for {deadline_secs}s with no inbound packets")]
+    BlackHoled {
+        /// Sending-without-receiving window that was exceeded.
+        deadline_secs: u64,
+    },
 }

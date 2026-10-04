@@ -58,6 +58,9 @@ pub const ALPN_H3: &[u8] = b"h3";
 /// Default datagram receive buffer size in bytes.
 const DEFAULT_DATAGRAM_RECV_BUFFER_SIZE: usize = 65_536;
 
+/// IPv6 minimum MTU minus IP/UDP headers; fits the hybrid handshake before discovery.
+const INITIAL_UDP_PAYLOAD_SIZE: u16 = 1232;
+
 /// Minimum encoded size for an HTTP Datagram frame (1-byte quarter stream id + 1-byte context id).
 const MIN_HTTP_DATAGRAM_HEADER_SIZE: usize = 2;
 
@@ -403,6 +406,7 @@ impl MasqueProxy {
 /// This is needed for both client and server endpoints that use MASQUE.
 pub fn datagram_transport_config(keep_alive_interval: u64, max_idle_timeout: u64) -> quinn::TransportConfig {
     let mut config = quinn::TransportConfig::default();
+    config.initial_mtu(INITIAL_UDP_PAYLOAD_SIZE);
     config.datagram_receive_buffer_size(Some(DEFAULT_DATAGRAM_RECV_BUFFER_SIZE));
 
     if keep_alive_interval > 0 {
@@ -721,7 +725,10 @@ mod tests {
         let server_endpoint = quinn::Endpoint::server(server_config, TEST_BIND_ADDR.parse().expect("valid addr")).expect("server bind");
         let server_addr = server_endpoint.local_addr().expect("local addr");
 
-        let client_config = build_masque_client_config(25, 300, true).expect("client config");
+        let mut client_config = build_masque_client_config(25, 300, true).expect("client config");
+        let mut transport = datagram_transport_config(25, 300);
+        transport.mtu_discovery_config(None);
+        client_config.transport_config(Arc::new(transport));
         let mut client_endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().expect("valid addr")).expect("client bind");
         client_endpoint.set_default_client_config(client_config);
 
@@ -752,6 +759,15 @@ mod tests {
 
         let (_server_endpoint, proxy) = server_handle.await.expect("server task");
         assert!(proxy.max_datagram_size().is_some(), "proxy datagrams should be enabled");
+        // BUG: specs/bugs/BUG-client-primary-connection-recovery.md
+        let client_key = crate::handshake::noise_ik::KeyPair::generate().expect("client key");
+        let server_key = crate::handshake::noise_ik::KeyPair::generate().expect("server key");
+        let kem = crate::crypto::hybrid_kex::KemKeyPair::generate();
+        let (_, msg1) =
+            crate::handshake::hybrid::HybridInitiator::new(&client_key, server_key.public_key(), &kem.encapsulation_key_bytes())
+                .expect("hybrid message");
+        client.send_datagram(&msg1).expect("hybrid message must fit before MTU discovery");
+        assert_eq!(proxy.recv_datagram().await.expect("receive hybrid message"), msg1);
     }
 
     // -----------------------------------------------------------------------
