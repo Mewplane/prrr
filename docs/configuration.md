@@ -110,17 +110,6 @@ Web administration panel. Disabled by default.
 | `cover_page_enabled` | bool | `true` | Serve cover landing page at `/` for DPI camouflage. When `false`, `/` serves the admin SPA directly. |
 | `trust_proxy_headers` | bool | `false` | Trust CDN proxy headers (`CF-Connecting-IP`, `X-Forwarded-For`) for real client IP extraction. Enable when behind Cloudflare or another trusted reverse proxy. |
 
-### `[messaging]`
-
-Whisper messaging subsystem. Disabled by default.
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `enabled` | bool | `false` | Enable Whisper messaging |
-| `relay_mode` | String | `"server"` | Relay mode |
-| `max_message_size` | u64 | `10485760` | Maximum message size in bytes (10 MiB) |
-| `retention_days` | u32 | `30` | Message retention period in days |
-
 ### `[monitoring]`
 
 Prometheus metrics and logging. Disabled by default.
@@ -310,14 +299,6 @@ Client obfuscation settings.
 |-------|------|-------------|
 | `enabled` | bool | Enable traffic obfuscation |
 
-### `[messaging]`
-
-Client messaging settings.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `enabled` | bool | Enable Whisper messaging |
-
 ---
 
 ## Environment Variables
@@ -396,12 +377,6 @@ admin_password_hash = "$argon2id$v=19$m=65536,t=3,p=4$..."
 session_timeout = 3600
 # trust_proxy_headers = true  # Enable when behind Cloudflare CDN
 
-[messaging]
-enabled = true
-relay_mode = "server"
-max_message_size = 10485760
-retention_days = 30
-
 [monitoring]
 metrics_enabled = true
 prometheus_port = 9090
@@ -448,6 +423,4 @@ protocol = "harp"   # or "masque" for QUIC-based transport
 [obfuscation]
 enabled = true
 
-[messaging]
-enabled = true
 ```

@@ -21,21 +21,6 @@ members = ["."]
 debug = 1
 
 [[bin]]
-name = "fuzz_wire_message"
-path = "fuzz_targets/fuzz_wire_message.rs"
-doc = false
-
-[[bin]]
-name = "fuzz_encrypted_envelope"
-path = "fuzz_targets/fuzz_encrypted_envelope.rs"
-doc = false
-
-[[bin]]
-name = "fuzz_message_header"
-path = "fuzz_targets/fuzz_message_header.rs"
-doc = false
-
-[[bin]]
 name = "fuzz_encrypted_channel_recv"
 path = "fuzz_targets/fuzz_encrypted_channel_recv.rs"
 doc = false

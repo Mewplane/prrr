@@ -154,9 +154,6 @@ assert_eq!(client_result.session_keys.tx_key, server_result.session_keys.tx_key)
 assert_eq!(client_result.session_keys.rx_key, server_result.session_keys.rx_key);
 assert_eq!(client_result.session_keys.header_key, server_result.session_keys.header_key);
 
-// Noise transport is also available for encrypted messaging
-let ct = client_result.transport.write_message(b"hello").unwrap();
-// ...
 ```
 
 **Types:**

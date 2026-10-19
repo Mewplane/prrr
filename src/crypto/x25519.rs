@@ -26,14 +26,6 @@ impl KeyPair {
         self.public.to_bytes()
     }
 
-    /// Return the secret (private) key bytes.
-    ///
-    /// Required by PQXDH prekey signing (keyed BLAKE2s MAC with identity
-    /// key as the MAC key).
-    pub fn secret_key_bytes(&self) -> [u8; KEY_LEN] {
-        self.secret.to_bytes()
-    }
-
     /// Perform Diffie-Hellman with the given remote public key, returning
     /// the shared secret.
     pub fn diffie_hellman(&self, their_public: &[u8; KEY_LEN]) -> DhOutput {
@@ -93,15 +85,6 @@ mod tests {
         let bob_shared = bob.diffie_hellman(&alice.public_key_bytes());
 
         assert_eq!(alice_shared.as_bytes(), bob_shared.as_bytes());
-    }
-
-    // T-extra: secret_key_bytes returns 32 non-zero bytes
-    #[test]
-    fn secret_key_bytes_returns_32_bytes() {
-        let kp = KeyPair::generate();
-        let sk = kp.secret_key_bytes();
-        assert_eq!(sk.len(), KEY_LEN);
-        assert_ne!(sk, [0u8; KEY_LEN]);
     }
 
     // T-3: X25519 DH: different keypairs produce different secrets

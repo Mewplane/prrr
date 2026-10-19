@@ -126,7 +126,7 @@ Body: explain why, not what.
 
 Types: `feat`, `fix`, `refactor`, `test`, `docs`, `chore`
 
-Scopes match module names: `crypto`, `handshake`, `transport`, `tunnel`, `server`, `client`, `registry`, `web`, `obfuscation`, `messaging`, `metrics`, `diagnostics`, `cli`, `config`, `distribution`
+Scopes match module names: `crypto`, `handshake`, `transport`, `tunnel`, `server`, `client`, `registry`, `web`, `obfuscation`, `metrics`, `diagnostics`, `cli`, `config`, `distribution`
 
 Examples:
 
@@ -167,7 +167,6 @@ src/                   # Library and binary source
   transport/           # QUIC, MASQUE, encrypted channels
   tunnel/              # TUN device, pipeline
   obfuscation/         # TLS mimicry, padding, probe resistance
-  messaging/           # Whisper messaging
   web/                 # REST API, auth, SPA frontend
 prrr-mobile/           # UniFFI mobile library (iOS/Android FFI bindings)
 prrr-android/          # Android app (Kotlin/Jetpack Compose)

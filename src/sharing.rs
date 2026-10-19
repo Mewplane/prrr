@@ -19,8 +19,7 @@
 //! prrr ships no Ed25519 key material of its own (SPEC §7 attributes Ed25519 to
 //! syauth). prrr's job is only to *verify* the per-use biometric signature
 //! carried in the relayed request. We reuse prrr's existing keyed-MAC scheme
-//! (the same `blake3::Hasher::new_keyed` + constant-time `subtle` compare used
-//! for prekey signatures in [`crate::messaging::keys`]) behind the
+//! (a keyed-BLAKE3 MAC with a constant-time comparison) behind the
 //! [`BiometricVerifier`] trait, so a future asymmetric verifier is a drop-in.
 
 use std::path::{Path, PathBuf};
