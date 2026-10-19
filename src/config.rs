@@ -94,15 +94,6 @@ pub const DEFAULT_WEB_ADMIN_ADDR: &str = "0.0.0.0:8443";
 /// Default web admin session timeout in seconds.
 pub const DEFAULT_SESSION_TIMEOUT: u64 = 3600;
 
-/// Default messaging relay mode.
-pub const DEFAULT_RELAY_MODE: &str = "server";
-
-/// Default maximum message size in bytes (10 MiB).
-pub const DEFAULT_MAX_MESSAGE_SIZE: u64 = 10_485_760;
-
-/// Default message retention in days.
-pub const DEFAULT_RETENTION_DAYS: u32 = 30;
-
 /// Default Prometheus metrics port.
 pub const DEFAULT_PROMETHEUS_PORT: u16 = 9090;
 
@@ -334,8 +325,6 @@ pub struct ServerConfig {
     pub obfuscation: Option<ObfuscationSection>,
     /// Web administration interface settings.
     pub web_admin: Option<WebAdminSection>,
-    /// Whisper messaging service settings.
-    pub messaging: Option<MessagingSection>,
     /// Monitoring and observability settings.
     pub monitoring: Option<MonitoringSection>,
 }
@@ -477,19 +466,6 @@ pub struct WebAdminSection {
     pub trust_proxy_headers: Option<bool>,
 }
 
-/// `[messaging]` section — Whisper messaging service.
-#[derive(Debug, Deserialize, Default, PartialEq)]
-pub struct MessagingSection {
-    /// Whether messaging is enabled.
-    pub enabled: Option<bool>,
-    /// Relay mode: `"server"`, `"distributed"`, `"hybrid"`.
-    pub relay_mode: Option<String>,
-    /// Maximum message size in bytes.
-    pub max_message_size: Option<u64>,
-    /// Message retention in days.
-    pub retention_days: Option<u32>,
-}
-
 /// `[monitoring]` section — Prometheus metrics and logging.
 #[derive(Debug, Deserialize, Default, PartialEq)]
 pub struct MonitoringSection {
@@ -526,8 +502,6 @@ pub struct ClientConfigFile {
     pub transport: Option<ClientTransportSection>,
     /// Obfuscation settings.
     pub obfuscation: Option<ClientObfuscationSection>,
-    /// Messaging settings.
-    pub messaging: Option<ClientMessagingSection>,
 }
 
 /// `[client]` section — client identity.
@@ -631,13 +605,6 @@ pub struct ClientTransportSection {
 #[derive(Debug, Deserialize, Default, PartialEq)]
 pub struct ClientObfuscationSection {
     /// Whether obfuscation is enabled.
-    pub enabled: Option<bool>,
-}
-
-/// `[messaging]` section in client config.
-#[derive(Debug, Deserialize, Default, PartialEq)]
-pub struct ClientMessagingSection {
-    /// Whether Whisper messaging is enabled.
     pub enabled: Option<bool>,
 }
 
@@ -1360,12 +1327,6 @@ tls_key = "/etc/prrr/tls/server.key"
 admin_password_hash = "$argon2id$..."
 session_timeout = 3600
 
-[messaging]
-enabled = true
-relay_mode = "server"
-max_message_size = 10485760
-retention_days = 30
-
 [monitoring]
 metrics_enabled = true
 prometheus_port = 9090
@@ -1429,12 +1390,6 @@ log_retention_days = 7
         assert_eq!(web.admin_password_hash.as_deref(), Some("$argon2id$..."));
         assert_eq!(web.session_timeout, Some(DEFAULT_SESSION_TIMEOUT));
 
-        let msg = config.messaging.expect("messaging section");
-        assert_eq!(msg.enabled, Some(true));
-        assert_eq!(msg.relay_mode.as_deref(), Some(DEFAULT_RELAY_MODE));
-        assert_eq!(msg.max_message_size, Some(DEFAULT_MAX_MESSAGE_SIZE));
-        assert_eq!(msg.retention_days, Some(DEFAULT_RETENTION_DAYS));
-
         let mon = config.monitoring.expect("monitoring section");
         assert_eq!(mon.metrics_enabled, Some(true));
         assert_eq!(mon.prometheus_port, Some(DEFAULT_PROMETHEUS_PORT));
@@ -1459,7 +1414,6 @@ max_clients = 50
         assert!(config.transports.is_none());
         assert!(config.obfuscation.is_none());
         assert!(config.web_admin.is_none());
-        assert!(config.messaging.is_none());
         assert!(config.monitoring.is_none());
     }
 
@@ -1578,8 +1532,6 @@ keep_alive = 25
 [obfuscation]
 enabled = true
 
-[messaging]
-enabled = true
 "#;
         let config: ClientConfigFile = toml::from_str(toml_str).expect("parse full client toml");
 
@@ -1620,9 +1572,6 @@ enabled = true
 
         let obfs = config.obfuscation.expect("obfuscation section");
         assert_eq!(obfs.enabled, Some(true));
-
-        let msg = config.messaging.expect("messaging section");
-        assert_eq!(msg.enabled, Some(true));
     }
 
     // AC-7b: Partial client TOML
@@ -1950,9 +1899,6 @@ name = "harp"
         assert_eq!(DEFAULT_PROBE_RESIST_BURST, 5);
         assert_eq!(DEFAULT_WEB_ADMIN_ADDR, "0.0.0.0:8443");
         assert_eq!(DEFAULT_SESSION_TIMEOUT, 3600);
-        assert_eq!(DEFAULT_RELAY_MODE, "server");
-        assert_eq!(DEFAULT_MAX_MESSAGE_SIZE, 10_485_760);
-        assert_eq!(DEFAULT_RETENTION_DAYS, 30);
         assert_eq!(DEFAULT_PROMETHEUS_PORT, 9090);
         assert_eq!(DEFAULT_LOG_ROTATION, "daily");
         assert_eq!(DEFAULT_LOG_RETENTION_DAYS, 7);

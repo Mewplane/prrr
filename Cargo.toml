@@ -6,7 +6,7 @@ name = "prrr"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Censorship-resistant VPN protocol with integrated messaging"
+description = "Censorship-resistant VPN protocol"
 license = "MIT"
 
 [[bin]]
@@ -103,10 +103,6 @@ harness = false
 
 [[bench]]
 name = "transport_benchmarks"
-harness = false
-
-[[bench]]
-name = "messaging_benchmarks"
 harness = false
 
 [lints.rust]

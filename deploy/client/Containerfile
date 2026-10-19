@@ -33,7 +33,6 @@ RUN mkdir -p src prrr-mobile/src benches tests \
     && echo 'fn main() {}' > benches/crypto_benchmarks.rs \
     && echo 'fn main() {}' > benches/handshake_benchmarks.rs \
     && echo 'fn main() {}' > benches/transport_benchmarks.rs \
-    && echo 'fn main() {}' > benches/messaging_benchmarks.rs \
     && cargo build --release --bin prrr 2>/dev/null || true
 
 # Copy real source and rebuild

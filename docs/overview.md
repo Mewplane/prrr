@@ -106,7 +106,6 @@ The codebase is organized into focused modules:
 | `transport` | HARP framing, QUIC (legacy), MASQUE (legacy), encrypted channels |
 | `tunnel` | TUN device abstraction and packet pipeline |
 | `obfuscation` | TLS mimicry, traffic padding, probe resistance |
-| `messaging` | Whisper: PQXDH, double ratchet, relay |
 | `web` | REST API, JWT auth, embedded SPA frontend, HARP session management |
 | `metrics` | Prometheus metrics and health endpoint |
 | `diagnostics` | Server and client diagnostic checks |
@@ -175,15 +174,6 @@ Three obfuscation layers work together:
 | Traffic Morphing | Pads packets, adds timing jitter, injects dummy traffic | Defeats statistical traffic analysis |
 | Probe Resistance | HMAC-BLAKE2s cookie authentication with rate limiting and decoy responses | Defeats active probing attacks |
 
-### Whisper Messaging
-
-Whisper provides end-to-end encrypted messaging over the VPN tunnel:
-
-- **Key Agreement:** PQXDH (Post-Quantum Extended Diffie-Hellman) for initial sessions
-- **Ratcheting:** Double Ratchet with SPQR (Sparse Post-Quantum Ratchet) for forward secrecy
-- **Delivery:** Server-side store-and-forward relay for offline recipients
-- **Transport:** Messages are sent as datagrams over the VPN tunnel
-
 ## Connection Lifecycle
 
 ### HARP (Default)
@@ -245,10 +235,7 @@ The SPA is embedded in the binary via `include_str!`, so the web admin works wit
 | **ML-KEM-768** | Module-Lattice-based Key Encapsulation, NIST standard (formerly Kyber) |
 | **MTU** | Maximum Transmission Unit (default: 1280 bytes for tunnel) |
 | **Noise IK** | Noise protocol pattern with known initiator and responder keys |
-| **PQXDH** | Post-Quantum Extended Diffie-Hellman key agreement |
 | **QUIC** | UDP-based transport protocol (RFC 9000) |
 | **SNI** | Server Name Indication -- TLS extension identifying the target hostname |
-| **SPQR** | Sparse Post-Quantum Ratchet -- periodic KEM ratchet steps in double ratchet |
 | **TUN** | Virtual network tunnel device operating at IP layer |
-| **Whisper** | prrr's integrated end-to-end encrypted messaging system |
 | **X25519** | Elliptic curve Diffie-Hellman on Curve25519 |

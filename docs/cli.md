@@ -299,12 +299,6 @@ tls_key = "/etc/prrr/tls/server.key"
 admin_password_hash = ""
 session_timeout = 3600
 
-[messaging]
-enabled = false
-relay_mode = "server"
-max_message_size = 10485760
-retention_days = 30
-
 [monitoring]
 metrics_enabled = false
 prometheus_port = 9090
@@ -347,8 +341,6 @@ keep_alive = 25
 [obfuscation]
 enabled = true
 
-[messaging]
-enabled = true
 ```
 
 Unknown fields in TOML files are silently ignored for forward compatibility.

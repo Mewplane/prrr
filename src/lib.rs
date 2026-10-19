@@ -26,9 +26,6 @@ pub mod handshake;
 /// Persistent key management for server identity keys.
 pub mod keys;
 
-/// Messaging layer: PQXDH key agreement and end-to-end encryption.
-pub mod messaging;
-
 /// Obfuscation and anti-censorship techniques.
 pub mod obfuscation;
 

@@ -1,12 +1,12 @@
 # prrr
 
-**Censorship-resistant VPN protocol with integrated messaging.**
+**Censorship-resistant VPN protocol.**
 
 prrr combines post-quantum cryptography, traffic obfuscation, and pluggable transports (HARP over HTTPS and MASQUE over QUIC) to provide a VPN that is indistinguishable from regular web traffic. It resists deep packet inspection, active probing, and traffic analysis attacks while maintaining high throughput on standard port 443.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-edition%202024-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/Tests-774%20passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/Tests-1006%20passing-brightgreen.svg)](#testing)
 
 ---
 
@@ -17,7 +17,6 @@ prrr combines post-quantum cryptography, traffic obfuscation, and pluggable tran
 - **Active Probing Resistance** -- HMAC-BLAKE2s token authentication with decoy responses prevents server fingerprinting.
 - **HARP Transport** -- Tunnels over HTTPS/WebSocket on TCP port 443, indistinguishable from regular web traffic and resistant to UDP blocking.
 - **MASQUE/QUIC Transport (Default)** -- Alternative transport over HTTP/3 on UDP port 443 for environments where QUIC performs better.
-- **Integrated Messaging** -- End-to-end encrypted messaging (Whisper) with PQXDH and double-ratchet protocol.
 - **Web Admin Panel** -- Single-page application for server management, client provisioning, and real-time monitoring.
 - **Client Distribution** -- QR codes, shareable URLs, and TOML config export for easy client onboarding.
 - **Diagnostics** -- Built-in `doctor` command checks configuration, keys, connectivity, and system resources.
@@ -119,7 +118,6 @@ See [Architecture Overview](docs/overview.md) for a detailed breakdown.
 | [Transport Layer](docs/transport.md) | QUIC, MASQUE framing, encrypted channels |
 | [Obfuscation](docs/obfuscation.md) | TLS mimicry, padding, probe resistance |
 | [Tunneling](docs/tunnel.md) | TUN device abstraction, packet pipeline |
-| [Messaging](docs/messaging.md) | Whisper: PQXDH, double ratchet, relay |
 | [Security](docs/security.md) | Threat model, key zeroization, fuzzing |
 
 ---
@@ -176,7 +174,7 @@ NDK_HOME=/path/to/ndk make android-debug
 
 ## Testing
 
-prrr has 774+ tests covering the full protocol stack, including end-to-end data flow tests that verify packets traverse the complete encrypted pipeline across both HARP and MASQUE transports.
+prrr has 1,000+ tests covering the full protocol stack, including end-to-end data flow tests that verify packets traverse the complete encrypted pipeline across both HARP and MASQUE transports.
 
 ```bash
 make test          # Run all tests

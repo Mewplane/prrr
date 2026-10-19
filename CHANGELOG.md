@@ -18,6 +18,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   carry everything. Binaries that do not publish the variable keep the old
   catch-all behaviour.
 
+### Removed
+
+- **Whisper integrated messaging** (`feat/remove-messaging`). The built-in
+  end-to-end encrypted messaging layer — PQXDH key agreement, double ratchet
+  with SPQR, store-and-forward relay, and the messaging client — is removed
+  (`src/messaging/`, 8 modules). Nothing in the runtime ever referenced it: no
+  CLI subcommand started it, the server never spawned the relay, and the mobile
+  apps never called it, so it was library-only surface. Also removed: the
+  dormant `[messaging]` server and client config sections and their defaults,
+  the `messaging_benchmarks` bench, the three messaging fuzz targets
+  (`fuzz_wire_message`, `fuzz_message_header`, `fuzz_encrypted_envelope`), and
+  the messaging documentation. The wire format, handshake, transports, tunnel,
+  admin panel, and mobile APIs are unchanged. Existing config files that still
+  contain a `[messaging]` section keep working — unknown TOML fields are
+  silently ignored.
+
 ### Fixed
 
 - **A slow DNS round froze the whole tunnel**
