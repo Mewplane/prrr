@@ -6,6 +6,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- Update the locked rustls dependency from 0.23.45 to 0.23.46, resolving
+  RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348, and RUSTSEC-2026-0349.
+
 ### Changed
 
 - **Split mode no longer asks the tunnel to resolve every name on the host**
@@ -78,6 +83,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   pins stay in both gate states so the probe always measures the tunnel.
 
 ### Added
+
+- Cat-themed MkDocs documentation with 22 illustrated handshake, packet-flow,
+  and routing/recovery chapters, source-checked guides, browser/example checks,
+  and deployment to GitHub Pages. The live README links the canonical site.
 
 - `[routing].resources` selective resource routing: config-driven hostnames
   resolved to `/32` VPN routes, with `prrr client ... route add|remove|list`

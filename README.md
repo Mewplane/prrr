@@ -1,228 +1,101 @@
 # prrr
 
-**Censorship-resistant VPN protocol.**
+<img src="assets/logo_app.png" width="180" alt="prrr pixel cat carrying a gold key">
 
-prrr combines post-quantum cryptography, traffic obfuscation, and pluggable transports (HARP over HTTPS and MASQUE over QUIC) to provide a VPN that is indistinguishable from regular web traffic. It resists deep packet inspection, active probing, and traffic analysis attacks while maintaining high throughput on standard port 443.
+An encrypted VPN tunnel with a hybrid Noise IK + ML-KEM-768 handshake and a choice of HTTPS-based HARP or QUIC-based MASQUE transports. prrr includes Linux routing/recovery, an Android companion, client provisioning, and web administration.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-edition%202024-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/Tests-1006%20passing-brightgreen.svg)](#testing)
+[Documentation](https://mewplane.github.io/prrr/) · [Animated mechanics](https://mewplane.github.io/prrr/explanation/mechanics/) · [Security boundaries](https://mewplane.github.io/prrr/explanation/security/) · [Source](https://github.com/Mewplane/prrr)
 
----
+## Install
 
-## Features
+Build the current source with a toolchain compatible with `Cargo.lock`:
 
-- **Post-Quantum Security** -- Hybrid X25519 + ML-KEM-768 key exchange protects against both classical and quantum attacks.
-- **Traffic Obfuscation** -- TLS fingerprint mimicry (Chrome/Firefox profiles), adaptive padding, and timing jitter make VPN traffic indistinguishable from regular HTTPS.
-- **Active Probing Resistance** -- HMAC-BLAKE2s token authentication with decoy responses prevents server fingerprinting.
-- **HARP Transport** -- Tunnels over HTTPS/WebSocket on TCP port 443, indistinguishable from regular web traffic and resistant to UDP blocking.
-- **MASQUE/QUIC Transport (Default)** -- Alternative transport over HTTP/3 on UDP port 443 for environments where QUIC performs better.
-- **Web Admin Panel** -- Single-page application for server management, client provisioning, and real-time monitoring.
-- **Client Distribution** -- QR codes, shareable URLs, and TOML config export for easy client onboarding.
-- **Diagnostics** -- Built-in `doctor` command checks configuration, keys, connectivity, and system resources.
-- **One-Click Deployment** -- Installation scripts for Ubuntu/Debian/Fedora and a Terraform module for DigitalOcean.
-- **Zero Unsafe Code** -- `#![deny(unsafe_code)]` enforced project-wide.
-
----
-
-## Quick Start
-
-### Server
-
-```bash
-# Option 1: Installation script (Ubuntu/Debian/Fedora)
-curl -fsSL https://install.prrr.dev/server | sudo bash
-
-# Option 2: Build from source
-cargo install --path .
-prrr server --listen 0.0.0.0:443 --server-name vpn.example.com
+```sh
+git clone https://github.com/Mewplane/prrr.git
+cd prrr
+cargo build --locked --release --bin prrr
+target/release/prrr --help
 ```
 
-### Register a Client
+Linux clients need TUN support and privileges for socket marks and routing. The documented service uses systemd. Servers need their selected TCP/UDP endpoint, a matching trusted TLS certificate, forwarding, and NAT configured by their administrator.
 
-```bash
-prrr server --config /etc/prrr/server.toml client add my-laptop
-# Outputs: name, IP address, public key, private key
-# SAVE THE PRIVATE KEY -- it is shown only once.
+For a service installation, first [provision a complete client configuration](https://mewplane.github.io/prrr/how-to/provision-client/), then run:
 
-prrr server --config /etc/prrr/server.toml client export my-laptop > my-laptop.toml
+```sh
+sudo ./deploy/client/install-client.sh ./my-laptop.toml
+sudo systemctl start prrr-client
 ```
 
-### Client
+The service runs `/usr/local/bin/prrr` with `/usr/local/bin/prrr-route`; `cargo install` into `~/.cargo/bin` does not update those paths. See [installation](https://mewplane.github.io/prrr/how-to/install/) for server setup and service updates.
 
-```bash
-# Save the private key from the "client add" output
-mkdir -p ~/.local/share/prrr/keys
-echo -n "THE_PRIVATE_KEY_BASE64" | base64 -d > ~/.local/share/prrr/keys/client.key
-chmod 600 ~/.local/share/prrr/keys/client.key
-echo -e "\nprivate_key_path = \"$HOME/.local/share/prrr/keys/client.key\"" >> my-laptop.toml
+## Use
 
-# Import and connect
-prrr client import my-laptop.toml
-sudo $(which prrr) client --config ~/.config/prrr/client.toml
+Configure transports explicitly on both ends. An implicit server transport resolves to HARP, while an unqualified client and provisioning fallback use MASQUE. Generated configuration records the selected transport; avoid relying on conflicting defaults.
+
+On a configured server:
+
+```sh
+umask 077
+sudo prrr server --config /etc/prrr/server.toml \
+  --listen 0.0.0.0:443 --server-name vpn.example.net \
+  client add my-laptop > my-laptop.toml
 ```
 
-See [Getting Started](docs/getting-started.md) for a complete walkthrough with troubleshooting.
+Replace the example domain with your real server name. The first output includes the client private key; transfer it privately and save it securely. Later exports do not recover that key.
 
----
+For inspection and diagnostics:
 
-## Architecture
-
-```text
-Application (IP packets from TUN device)
-     |
-TunnelPipeline: TUN <-> encrypt <-> transport
-     |
-EncryptedChannel: ChaCha20-Poly1305 + replay protection
-     |
-     ├── HARP (default): 4-byte frame header + WebSocket/HTTP polling
-     │        |
-     │   TLS 1.3: indistinguishable from HTTPS
-     │        |
-     │   TCP/IP: standard port 443 traffic
-     │
-     └── MASQUE (legacy): HTTP Datagram framing
-              |
-         QUIC DATAGRAMs: quinn native datagram API
-              |
-         TLS 1.3 (ALPN=h3): indistinguishable from HTTP/3
-              |
-         UDP/IP: standard port 443 traffic
+```sh
+prrr client --config /etc/prrr/client.toml doctor
+prrr client --config /etc/prrr/client.toml route list
+sudo prrr server --config /etc/prrr/server.toml client list
 ```
 
-### Cryptographic Stack
-
-| Layer | Algorithm | Purpose |
-|-------|-----------|---------|
-| Key Exchange | X25519 + ML-KEM-768 | Hybrid classical + post-quantum |
-| Handshake | Noise IK | Mutual authentication |
-| Packet Encryption | ChaCha20-Poly1305 | AEAD with replay protection |
-| Key Derivation | HKDF-BLAKE2s | Session key derivation |
-| Probing Resistance | HMAC-BLAKE2s | Token-based authentication |
-
-See [Architecture Overview](docs/overview.md) for a detailed breakdown.
-
----
+Follow [your first tunnel](https://mewplane.github.io/prrr/tutorials/first-tunnel/) to select a routing policy, verify real packet egress, and disconnect cleanly.
 
 ## Documentation
 
-| Document | Description |
-|----------|-------------|
-| [Getting Started](docs/getting-started.md) | Installation, first connection, troubleshooting |
-| [Architecture Overview](docs/overview.md) | System design, concepts, glossary |
-| [Configuration Reference](docs/configuration.md) | All config options with defaults |
-| [CLI Reference](docs/cli.md) | Commands, flags, and usage examples |
-| [REST API Reference](docs/api.md) | Web admin endpoints and authentication |
-| [Cryptography](docs/crypto.md) | Primitives, key derivation, hybrid KEX |
-| [Handshake Protocol](docs/handshake.md) | Noise IK, hybrid handshake flow |
-| [Transport Layer](docs/transport.md) | QUIC, MASQUE framing, encrypted channels |
-| [Obfuscation](docs/obfuscation.md) | TLS mimicry, padding, probe resistance |
-| [Tunneling](docs/tunnel.md) | TUN device abstraction, packet pipeline |
-| [Security](docs/security.md) | Threat model, key zeroization, fuzzing |
+The [browsable documentation](https://mewplane.github.io/prrr/) uses prrr's cat/key artwork and includes three illustrated walkthroughs with **22 chapters**:
 
----
+- **Handshake:** pinned identities, outer transport, Noise IK and ML-KEM exchange, authorization, and directional session keys.
+- **Packets:** TUN capture, counter/ciphertext/tag anatomy, HARP or MASQUE framing, forwarding, replies, and replay rejection.
+- **Routing and recovery:** resource routes, server/LAN bypasses, DNS gating, black-hole detection, backoff, and a fresh session on the same TUN.
 
-## Building from Source
+Animations support Play/Pause, Previous/Next, chapter seeking, speed selection, keyboard access, reduced motion, mobile portrait layouts, and complete text transcripts.
 
-**Prerequisites:** Rust 1.85+ (edition 2024), Git
+| Need | Guide |
+| --- | --- |
+| Connect one client | [First tunnel tutorial](docs/tutorials/first-tunnel.md) |
+| Set up the components | [Install](docs/how-to/install.md), [provision](docs/how-to/provision-client.md), [Android](docs/how-to/android.md) |
+| Diagnose the path | [Recover a connection](docs/how-to/recover.md) |
+| Look up exact behavior | [CLI](docs/reference/cli.md), [configuration](docs/reference/configuration.md), [protocol](docs/reference/protocol.md), [admin API](docs/reference/api.md) |
+| Understand the boundaries | [Mechanics](docs/explanation/mechanics.md), [security](docs/explanation/security.md), [glossary](docs/reference/glossary.md) |
 
-```bash
-git clone https://github.com/prrr-vpn/prrr.git
-cd prrr
-cargo build --release
+The canonical guides pin their source observations to the inspected revision. Older flat documentation remains in the repository as historical material.
+
+## Security expectations
+
+Tunnel encryption does not hide the server address, packet timing, or volume. Browser-like TLS profiles are approximate; HTTPS carriage does not prove indistinguishability from a browser. The VPN server is a trust boundary, and normal application HTTPS remains useful beyond it.
+
+Routing and DNS recovery can restore ordinary host egress when the tunnel fails. This is not a kill switch or proof of IPv6 capture. Keep the separate HTTP admin listener private or behind a controlled TLS proxy. Read the [security guide](https://mewplane.github.io/prrr/explanation/security/) before deployment.
+
+## Development and contributing
+
+```sh
+make test
+make lint
+make shellcheck
+python3 scripts/docs-examples-check.py
 ```
 
-The binary is at `target/release/prrr`.
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [documentation development](docs/contributing/documentation.md). Open an [issue](https://github.com/Mewplane/prrr/issues) with reproduction steps and sanitized diagnostics, or a pull request with the relevant tests. Keep private keys, client TOML, QR credentials, and unreviewed logs out of reports.
 
----
+For Android, `make android-debug` builds the native library and debug app; `make android-debug-apk` builds only the Kotlin app and requires a current native library. See [the Android guide](docs/how-to/android.md).
 
-## Android App
+## Maintainers
 
-The Prrr Android app is in `prrr-android/`. Building requires the Android NDK and Rust cross-compilation targets.
-
-### Prerequisites
-
-```bash
-# Install Android NDK via SDK Manager or https://developer.android.com/ndk/downloads
-# Install Rust cross-compilation targets
-rustup target add aarch64-linux-android x86_64-linux-android armv7-linux-androideabi i686-linux-android
-```
-
-### Building
-
-```bash
-# Full build: compile Rust native library + Gradle APK
-make android-debug
-
-# Install on connected device
-make android-install
-
-# Gradle-only build (skip native rebuild when only editing Kotlin)
-make android-debug-apk
-
-# Release build
-make android-release
-```
-
-Set `NDK_HOME` if auto-detection fails:
-
-```bash
-NDK_HOME=/path/to/ndk make android-debug
-```
-
----
-
-## Testing
-
-prrr has 1,000+ tests covering the full protocol stack, including end-to-end data flow tests that verify packets traverse the complete encrypted pipeline across both HARP and MASQUE transports.
-
-```bash
-make test          # Run all tests
-make lint          # Clippy + format check
-make bench         # Performance benchmarks
-make shellcheck    # Lint installation scripts
-make android-test  # Android unit tests
-```
-
-Coverage targets: 90% for critical paths, 85% overall.
-
----
-
-## Deployment
-
-### Installation Scripts
-
-```bash
-# Server (requires root)
-curl -fsSL https://install.prrr.dev/server | sudo bash -s -- \
-  --admin-pass "your-password" \
-  --domain vpn.example.com
-
-# Client
-curl -fsSL https://install.prrr.dev/client | bash
-```
-
-Supported: Ubuntu 22.04+, Debian 11+, Fedora 38+. See [docs/getting-started.md](docs/getting-started.md).
-
-### Terraform (DigitalOcean)
-
-```bash
-cd deploy/terraform
-cp terraform.tfvars.example terraform.tfvars
-# Edit with your DigitalOcean token and SSH key
-terraform init && terraform apply
-```
-
-See [deploy/terraform/README.md](deploy/terraform/README.md) for details.
-
----
-
-## Contributing
-
-Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, coding standards, and the PR process.
-
----
+Maintained by [Mewplane](https://github.com/Mewplane) and contributors.
 
 ## License
 
-prrr is released under the [MIT License](LICENSE).
+[MIT](LICENSE).

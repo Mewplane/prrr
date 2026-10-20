@@ -1,0 +1,82 @@
+site_name: prrr
+site_url: https://mewplane.github.io/prrr/
+site_description: Understand, deploy, and operate the prrr encrypted tunnel.
+docs_dir: docs
+site_dir: target/docs-site
+strict: true
+exclude_docs: |
+  /api.md
+  /book.md
+  /cli.md
+  /client-recovery.md
+  /configuration.md
+  /crypto.md
+  /deployment.md
+  /ecosystem.md
+  /getting-started.md
+  /handshake.md
+  /ios-build-options.md
+  /messaging.md
+  /mobile-api.md
+  /mobile-build.md
+  /obfuscation.md
+  /overview.md
+  /security.md
+  /transport.md
+  /tunnel.md
+theme:
+  name: material
+  language: en
+  logo: assets/prrr.png
+  favicon: assets/prrr.png
+  font: false
+  palette:
+    scheme: prrr
+  features:
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - toc.follow
+plugins:
+  - search
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+extra_css:
+  - stylesheets/prrr.css
+extra_javascript:
+  - javascripts/mechanics.js
+extra:
+  generator: false
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/Mewplane/prrr
+      name: prrr on GitHub
+nav:
+  - Start here: index.md
+  - Tutorial:
+      - Your first tunnel: tutorials/first-tunnel.md
+  - How-to:
+      - Install: how-to/install.md
+      - Provision a client: how-to/provision-client.md
+      - Connect on Android: how-to/android.md
+      - Recover a connection: how-to/recover.md
+  - Reference:
+      - CLI: reference/cli.md
+      - Configuration: reference/configuration.md
+      - Protocol: reference/protocol.md
+      - REST API: reference/api.md
+      - Glossary: reference/glossary.md
+  - Explanation:
+      - How it works: explanation/mechanics.md
+      - Security: explanation/security.md
+  - Contributing:
+      - Documentation: contributing/documentation.md

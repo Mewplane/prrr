@@ -23,3 +23,7 @@ prrr-android/local.properties
 .terraform/
 .terraform.lock.hcl
 terraform.tfvars
+
+# Python documentation check caches
+__pycache__/
+*.pyc
